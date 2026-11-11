@@ -17,6 +17,14 @@ tmp/
 .stack/
 .review/
 
+# Local-only build workflow scaffolding (kept on disk, not part of the product repo)
+plan/
+AGENT_HANDOFF.md
+PROJECT_PLAN.md
+stack.config.json
+.opencode/
+.github/workflows/stack-order.yml
+
 # Editor / OS noise
 .DS_Store
 .idea/
