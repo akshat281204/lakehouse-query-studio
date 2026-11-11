@@ -1906,22 +1906,36 @@ not optional hardening.
   requests have no side effects and are covered by the Host/Origin/fetch-site
   checks above plus same-origin CORS; they are not exempt from the Host check.
 
-- **Deployment token (optional hardening)**: the API MAY additionally be
-  configured with a single static deployment token (`API_TOKEN`, supplied via
-  environment/secret). When set, every request must present it as a bearer
-  credential; a missing or invalid token returns `401 unauthorized`. Because the
-  token is carried in the `Authorization` header (or an equivalent
-  same-origin-only credential store), a cross-site page cannot learn or attach
-  it, so it independently defeats cross-origin mutations. This is one shared
-  operator credential, not per-user identity.
+- **Deployment token (optional hardening, non-browser clients only)**: the API
+  MAY additionally be configured with a single static deployment token
+  (`API_TOKEN`, supplied via environment/secret). When set, every request must
+  present it as a bearer credential; a missing or invalid token returns `401
+  unauthorized`. The token is carried in the `Authorization` header by
+  **non-browser clients** — the operator's CLI, scripts, and integration
+  tooling. The bundled React dashboard does **not** hold or send this token: it
+  is a static browser bundle and cannot keep a server-side secret. Therefore
+  token authentication and the direct-from-browser dashboard are mutually
+  exclusive unless a server-side proxy is added:
+  - **Default Compose deployment** (`API_TOKEN` unset): the dashboard calls the
+    API directly, same-origin, and is protected by the mandatory
+    Host/Origin/fetch-site checks and CSRF proof above — not by a token.
+  - **Token enabled for browser use**: the operator fronts the API with a
+    same-origin server-side proxy/BFF (for example an nginx route or the API's
+    own server-rendered login handler) that holds `API_TOKEN` in server memory,
+    authenticates the operator's browser session with its own same-origin
+    cookie, and attaches the bearer token to upstream API calls. The browser
+    never receives the token; the proxy enforces the same Host/Origin/CSRF
+    rules. Without such a proxy, enabling `API_TOKEN` is supported only for
+    non-browser clients and the dashboard is not published.
+  This is one shared operator credential, not per-user identity; it never
+  appears in the browser bundle, page source, or client storage.
 
 - The token is never embedded in the static dashboard bundle. In the default
   single-host Compose deployment the dashboard is served same-origin and relies
   on the Host/Origin/fetch-site checks plus CSRF protection (not on loopback
-  alone); if token authentication is enabled, the token is provided to the
-  operator's browser session at runtime (for example, via a same-origin
-  login/session route that keeps the credential server-side), never baked into
-  client-visible data.
+  alone); where token authentication is enabled for browser access, it is
+  terminated at the same-origin proxy described above, never in client-visible
+  data.
 
 ### 15.3 Authorization
 
@@ -1956,8 +1970,11 @@ not optional hardening.
   change; the same request with valid proof succeeds. A companion test issues a
   state-changing request from a simulated cross-site page (foreign `Origin` plus
   no CSRF proof) and asserts it is rejected with no side effect.
-- With token authentication enabled, requests without a token return `401`, and
-  requests with a wrong token return `401`.
+- With token authentication enabled, requests from non-browser clients without a
+  token return `401`, and requests with a wrong token return `401`; a
+  token-enabled browser deployment is exercised through the same-origin proxy,
+  which attaches the token server-side, and a test asserts the token string never
+  appears in any HTML/JS bundle or browser-visible response.
 - A policy-gated operation (e.g., archive with in-flight jobs) returns `403`
   with a stable code, proving the authorization path exists independently of
   caller identity.
