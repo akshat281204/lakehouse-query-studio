@@ -24,6 +24,9 @@ permissions:
   - action: edit
     resource: ".stack/*"
     effect: deny
+  - action: websearch
+    resource: "*"
+    effect: deny
 ---
 
 # Builder agent (model X)

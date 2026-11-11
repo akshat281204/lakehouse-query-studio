@@ -24,6 +24,9 @@ permissions:
   - action: shell
     resource: "gh *"
     effect: deny
+  - action: websearch
+    resource: "*"
+    effect: deny
 ---
 
 # Reviewer agent (model Y)
