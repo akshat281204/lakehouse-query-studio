@@ -35,6 +35,7 @@ later):
 | query job | Durable, asynchronous unit of work that executes one validated read-only SQL statement. |
 | object store | MinIO (local) or S3-compatible remote. Source of Parquet data. |
 | catalog | PostgreSQL: durable metadata and job state. Never stores result payloads or credentials. |
+| write fence | A **server-enforced** property of the object store that, once armed for a prefix, guarantees no write to that prefix can take effect afterward — neither a new request nor an already-accepted in-flight one. Realized by one of two documented-and-verified store capabilities: a native fence/abort primitive, or a documented maximum write-completion latency (`MAX_WRITE_COMPLETION`) such that a `PutObject` accepted at time `t` has no effect after `t + MAX_WRITE_COMPLETION`. A store with neither is *unfenced* and offers no in-flight-write bound (§4 rule 8). |
 
 ## 3. Durable entities
 
@@ -63,13 +64,19 @@ claim, and `fencing_token` is a random value regenerated on every claim. Only th
 holder of a job's current `fencing_token` may transition it or publish its
 output. `write_credential_expires_at` (ingestion jobs only) is the expiry of the
 attempt-scoped, short-lived object-store write credential that authorizes writes
-to `staging/` and `lake/`; it is the single authority for the write-quiescence
-guarantee in §4 rule 8 and §6.1. It is NULL until the attempt's credential is
-actually issued, and then records the credential's true expiry, which is never
-earlier than the attempt's current `lease_expires_at` (§6.1) — the credential
-always covers the entire lease window; a NULL value means no
-credential was ever issued for that attempt, so there is no write capability to
-quiesce and the sweeper treats the prefix as already quiescent (§4 rule 8).
+to `staging/` and `lake/`; it is the authority this codebase controls for the
+write-quiescence bound in §4 rule 8 and §6.1 — it bounds **new** writes
+(anything attempted after this time is rejected by the store). It does **not**
+bound *in-flight* writes: an already-accepted `PutObject` can still commit after
+its credential expires, and no client-side deadline can prevent that. In-flight
+writes are bounded only by a server-enforced write fence when the configured
+store provides one (§4 rule 8), never by a writer-side deadline. It is NULL
+until the attempt's credential is actually issued, and then records the
+credential's true expiry, which is never earlier than the attempt's current
+`lease_expires_at` (§6.1) — the credential always covers the entire lease
+window; a NULL value means no credential was ever issued for that attempt, so
+there is no write capability to quiesce and the sweeper treats the prefix as
+having no *new*-write capability (§4 rule 8).
 `write_credential_session_ids` (ingestion jobs
 only) is the set of provider session/credential IDs issued for this attempt —
 the initial credential plus every renewal credential. An attempt can hold several
@@ -286,56 +293,124 @@ Rules:
    already-deleted prefix is a no-op) and may run on any schedule; each pass
    recomputes the abandoned set from the catalog, so a crashed sweeper re-runs
    safely.
-8. **Cleanup waits for write-quiescence (no writes after delete)**: the sweeper
-   deletes an abandoned attempt prefix only after it can prove that no credential
-   remains that could write to it. Ingestion writes to `lake/` and `staging/` are
-   authorized solely by an attempt-scoped, short-lived STS credential whose TTL
-   is the full lease window plus a slack margin at issuance time, so its expiry
-   is never earlier than the attempt's current `lease_expires_at` (§6.1); the
-   credential always covers the entire lease window. There is no long-lived,
-   deployment-wide `lake/` write credential on the ingestion path. The worker
-   stores that credential's actual expiry in
-   `write_credential_expires_at` (§3.1), and persists a conservative
-   `write_credential_reserved_until` **before** requesting any credential. The
-   sweeper deletes an abandoned attempt prefix only when
+8. **Cleanup waits for write-quiescence — and write-quiescence is conditional on
+   a server-enforced write fence.** The sweeper deletes an abandoned attempt
+   prefix only after establishing that no write can still land on it. Ingestion
+   writes to `lake/` and `staging/` are authorized solely by an attempt-scoped,
+   short-lived STS credential (§3.1, §6.1); there is no long-lived,
+   deployment-wide `lake/` write credential on the ingestion path. Quiescence
+   decomposes into two sources of writes, and the contract states explicitly
+   which bound is enforceable and which is not:
+
+   - **Credential expiry bounds *new* writes (enforceable, provider-enforced,
+     unconditional).** After
+     `max(write_credential_expires_at, write_credential_reserved_until)`, the
+     store rejects every *new* authenticated write to the prefix: the credential
+     is expired and no reservation remains that could have yielded a later
+     credential. This bound is provider-enforced and testable (a request signed
+     with an expired credential fails authorization).
+
+   - **In-flight writes are bounded only by a server-enforced write fence
+     (enforceable only when the store provides it).** Credential expiry cannot
+     stop a request that was authenticated before expiry but whose body is still
+     streaming after it: the store may commit an already-accepted `PutObject`
+     after the credential expires, and aborting the client connection does not
+     cancel a request the store has already accepted. No supported S3-compatible
+     store documents a maximum write-completion time, so this codebase does not
+     assume one and does not pretend a client-side deadline establishes it. A
+     writer-side abort of an over-running `PutObject` is retained only as a
+     best-effort courtesy that reduces the number of writes still in flight at
+     expiry; it proves nothing and is never part of the guarantee.
+
+   The no-writes-after-delete guarantee is therefore **conditional on the
+   configured object store providing a server-enforced write fence** — a
+   documented-and-verified store capability, not something this codebase can
+   synthesize. The two supported capabilities are (a) a native fence/abort
+   primitive that voids in-flight writes to a fenced prefix, or (b) a documented
+   maximum write-completion latency `MAX_WRITE_COMPLETION` such that a
+   `PutObject` accepted at time `t` has no effect after
+   `t + MAX_WRITE_COMPLETION`. Either must be **documented by the store vendor
+   and verified by an adversarial test in this codebase** before the system may
+   rely on it; a store with neither is *unfenced*. The sweeper's behavior
+   branches on that capability:
+
+   - **Fenced store.** Before deleting an abandoned attempt prefix the sweeper
+     first arms the store's fence for that prefix — or, for a documented
+     `MAX_WRITE_COMPLETION`, waits `MAX_WRITE_COMPLETION + CLEANUP_GRACE` after
+     the last possible write authorization (i.e. after
+     `max(write_credential_expires_at, write_credential_reserved_until)`). Once
+     the fence is armed/verified, no write — new or in-flight — can take effect,
+     so the delete-then-verify loop below observes a permanently empty prefix
+     and the no-writes-after-delete invariant holds. The guarantee is enforced
+     by the store, not by an assumed client/server round-trip time.
+
+   - **Unfenced store (the default: stock MinIO or a generic S3-compatible
+     endpoint).** The no-writes-after-delete invariant is **not claimed**.
+     Reclamation is a *convergent* process: the sweeper deletes the prefix,
+     waits `CLEANUP_GRACE`, re-lists it, and repeats until it observes an empty
+     prefix on a full pass, and it re-runs on a schedule so any object that
+     lands after an earlier pass is re-collected on a later pass. Because every
+     attempt-scoped write is a single-part `PutObject` (multipart is disabled;
+     see "Write modes are bounded" below) and the worker has at most one such
+     PUT in flight per attempt prefix, the set of possible late-arriving objects
+     is bounded in *number* by the short-lived credential and the part count —
+     but its arrival is **not bounded in time**, so this mode documents that the
+     last orphan may persist for an unbounded interval and must never be
+     described as a hard no-writes-after-delete bound.
+
+   **Correctness is unaffected in either mode.** A stale or losing attempt's
+   objects are never referenced: reads bind only to the committed
+   `object_prefix` (§4 rule 1, §7.3–§7.4), so a late-arriving orphan can never
+   be observed by a query regardless of when cleanup removes it. The quiescence
+   guarantee governs *when garbage is reclaimed*, not whether stale data can be
+   read.
+
+   The sweeper deletes an abandoned attempt prefix only when
    `now() > max(write_credential_expires_at, write_credential_reserved_until) +
-   CLEANUP_GRACE`, where `CLEANUP_GRACE` (default 15 minutes) strictly exceeds
-   the object store's
-   documented maximum time to complete an already-accepted write for the write
-   modes below. After the credential has expired the object store rejects any
-   further authenticated write to that prefix, so a delayed (fenced) worker
-   cannot write after the sweeper's delete.
+   CLEANUP_GRACE`. `CLEANUP_GRACE` (default 60s) is a safety margin that is
+   **not** a proxy for an undocumented provider write time: it covers the
+   clock-skew measurement error (`MAX_CLOCK_SKEW`) and provides the observation
+   window for the delete-then-verify loop below; in a fenced store it also
+   covers the store's fence-arm latency. In an unfenced store the *new*-write
+   bound is still enforced by credential expiry (the first bullet above), so the
+   sweeper never deletes while a still-credentialed writer can authorize a new
+   write; only the in-flight tail is unbounded, and only in unfenced mode.
+   Startup validation requires `CLEANUP_GRACE ≥ 1s`.
    - **Write modes are bounded.** Attempt-scoped writes to `staging/` and
      `lake/` use single-part `PutObject` only; multipart uploads are disabled
      for these prefixes and large inputs are split into part files of at most
-     64 MiB each. A single-part PUT accepted before credential expiry therefore
-     completes within the provider's documented request bound, which
-     `CLEANUP_GRACE` exceeds. If multipart writes are ever introduced, the
-     contract requires the writer to record the upload IDs, the sweeper to abort
-     every listed upload, and the sweeper to wait for abort completion before
-     deleting; until then multipart on attempt prefixes is a protocol violation
-     the object-store policy denies.
+     64 MiB each. This bounds the *number* of in-flight writes per attempt
+     prefix (at most one) and therefore the size of the orphan set in unfenced
+     mode. If multipart writes are ever introduced, the contract requires the
+     writer to record the upload IDs, the sweeper to abort every listed upload,
+     and the sweeper to wait for abort completion before deleting; until then
+     multipart on attempt prefixes is a protocol violation the object-store
+     policy denies.
    - **Delete-then-verify loop.** The sweeper deletes the prefix, waits
-     `CLEANUP_GRACE`, and re-lists it. If any object is present (only possible
-     for a write accepted before credential expiry), it re-applies the rule-6
-     decision and deletes again; it declares the prefix quiescent only after two
-     consecutive empty listings. It never reports cleanup complete on a single
-     delete, and a prefix that fails to quiesce raises an operational alert
-     rather than being silently abandoned.
-   Fencing governs *publication* (the token check in §6.1); credential expiry is
-   what governs *writes*. Because each renewal issues a new credential while the
-   previous one remains valid until its own expiry, `write_credential_expires_at`
-   is the **maximum** expiry across every credential in
-   `write_credential_session_ids`, never lowered by a newer issuance. Revocation
-   is optional hardening that shortens the window: only if the STS provider
-   confirms revocation of **every** session in `write_credential_session_ids`
-   does the fencing transaction record `write_credential_revoked=true` and set
-   `write_credential_expires_at = now()`; if any session is unrevoked or
-   unconfirmed, it **keeps the maximum expiry and the reservation unchanged**
-   (never lowers either to `now()`), and the sweeper waits for that bound plus
-   `CLEANUP_GRACE`. A version in `PENDING`/`BUILDING` has no
-   expired-credential abandoned prefix and is never
-   swept (rule 6). The sweeper's bound is always
+     `CLEANUP_GRACE`, and re-lists it. If any object is present, it re-applies
+     the rule-6 decision and deletes again; it declares the prefix reclaimed
+     only after two consecutive empty listings. It never reports cleanup
+     complete on a single delete, and a prefix that fails to quiesce raises an
+     operational alert rather than being silently abandoned. In a **fenced**
+     store two consecutive empty listings prove the prefix is permanently empty
+     (the fence has voided in-flight writes). In an **unfenced** store they
+     prove only that the prefix is empty *at that moment*; the loop is the
+     convergence mechanism, and a later orphan is re-collected on the next
+     scheduled pass.
+   Fencing governs *publication* (the token check in §6.1); credential expiry
+   plus the store's fence capability govern *writes*. Because each renewal
+   issues a new credential while the previous one remains valid until its own
+   expiry, `write_credential_expires_at` is the **maximum** expiry across every
+   credential in `write_credential_session_ids`, never lowered by a newer
+   issuance. Revocation is optional hardening that shortens the *new*-write
+   window: only if the STS provider confirms revocation of **every** session in
+   `write_credential_session_ids` does the fencing transaction record
+   `write_credential_revoked=true` and set `write_credential_expires_at = now()`;
+   if any session is unrevoked or unconfirmed, it **keeps the maximum expiry and
+   the reservation unchanged** (never lowers either to `now()`), and the sweeper
+   waits for that bound plus `CLEANUP_GRACE`. A version in `PENDING`/`BUILDING`
+   has no expired-credential abandoned prefix and is never swept (rule 6). The
+   sweeper's bound is always
    `max(write_credential_expires_at, write_credential_reserved_until)`, so a
    credential issued by a renewal that lost the fence is covered by the
    reservation even though its actual expiry was never persisted.
@@ -500,6 +575,21 @@ have been issued (including one whose expiry was never persisted) has expired,
 plus `CLEANUP_GRACE` (§4 rule 8). The worker also best-effort revokes a
 credential it obtained but could not persist.
 
+**Write modes are bounded (single-part `PutObject` only).** Holding a valid
+attempt credential is necessary but not sufficient to write: every `staging/`
+and `lake/` write is a single-part `PutObject` (multipart disabled), and the
+worker never has more than one such PUT in flight per attempt prefix, writing
+parts sequentially. This bounds the *number* of in-flight writes per attempt
+prefix to one and therefore bounds the size of the orphan set in an unfenced
+store (§4 rule 8). A single-part PUT commits the object only after the store
+receives the full declared `Content-Length` body, so a request whose body was
+not fully delivered commits nothing. The worker additionally best-effort aborts
+a PUT that over-runs its expected completion window; this is a courtesy that
+reduces in-flight writes at expiry, **not** a guarantee — an already-accepted
+PUT can still commit after the credential expires, and quiescence of in-flight
+writes is established only by a server-enforced write fence when the store
+provides one (§4 rule 8), never by worker code.
+
 **Renewal re-issues the credential with every lease extension (commit-last).**
 The lease is a sliding window renewed by heartbeat (§12.1), and each renewal
 re-issues the attempt write credential because that credential must keep covering
@@ -582,7 +672,7 @@ recovery pass re-claims its job, before it can commit a stale result.
 | RUNNING | all Parquet written to `lake/…/version=<n>/attempt=<n>/` + schema captured, then commit | SUCCEEDED | one conditional transaction sets the version `READY` with `object_prefix` = this attempt's prefix and the job `SUCCEEDED`, both `WHERE … fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort (rules 6 and 8 sweep any straggler after write-credential expiry) |
 | RUNNING | cancel accepted | CANCELLED | conditional on token; version → `FAILED` with `error_summary = "cancelled"`. No object deletion here: cancellation occurs while the attempt write credential may still authorize writes, so staging/lake reclamation is deferred to the stale-attempt sweeper, which deletes only after write-quiescence — `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
 | RUNNING | unrecoverable error | FAILED | conditional on token; `failure_reason` + `error_summary` set; version → `FAILED`. No object deletion here: staging/lake reclamation is deferred to the stale-attempt sweeper after write-quiescence — `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
-| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token (increments `attempt`, clears `fencing_token`) **and atomically marks the target version `FAILED`** in one transaction; `write_credential_expires_at` is set to `now()` and `write_credential_revoked=true` **only when** the STS provider confirms revocation of **every** session in `write_credential_session_ids`; otherwise recovery sets `write_credential_expires_at = max(recorded expiry, write_credential_reserved_until)` and keeps the reservation, so a credential issued by a renewal that lost the fence is still covered (§4 rule 8); the old worker is fenced by the token change and can no longer write once every possible credential has expired |
+| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token (increments `attempt`, clears `fencing_token`) **and atomically marks the target version `FAILED`** in one transaction; `write_credential_expires_at` is set to `now()` and `write_credential_revoked=true` **only when** the STS provider confirms revocation of **every** session in `write_credential_session_ids`; otherwise recovery sets `write_credential_expires_at = max(recorded expiry, write_credential_reserved_until)` and keeps the reservation, so a credential issued by a renewal that lost the fence is still covered (§4 rule 8); the old worker is fenced by the token change and can no longer *authorize new* writes once every possible credential has expired; any in-flight write is bounded only by the store's write fence (§4 rule 8) |
 
 - `QUEUED` jobs survive worker restart: state lives in PostgreSQL and the queue
   is reconstructed by scanning for `QUEUED` rows.
@@ -641,12 +731,29 @@ recovery pass re-claims its job, before it can commit a stale result.
   (invalidates the token, marks the version `FAILED`, sets
   `write_credential_expires_at` in the past and/or revokes the credential), keeps
   the "stale" worker alive and issuing `PutObject` to its old attempt prefix,
-  runs the sweeper, and asserts that (1) every post-fence write is rejected by
-  the object store with an authorization error, (2) the sweeper's delete leaves
-  the prefix empty and no new object appears afterward, and (3) no orphan object
-  is observable after the sweeper completes. A companion test asserts that a live
-  (`BUILDING`) attempt's prefix is never deleted while its credential is
+  runs the sweeper, and asserts that (1) every post-expiry write is rejected by
+  the object store with an authorization error (the *new*-write bound), and (2)
+  in a **fenced** store, once the fence is armed the prefix is permanently empty
+  — no new or in-flight write appears afterward — while in an **unfenced** store
+  the prefix is empty at the end of the delete-then-verify pass and any object
+  that lands later is re-collected by a subsequent scheduled pass, with no such
+  orphan ever observed by a query (§4 rule 8). A companion test asserts that a
+  live (`BUILDING`) attempt's prefix is never deleted while its credential is
   unexpired.
+- **Write-fence / write-quiescence test (conditional on store capability)**:
+  a worker holds a still-valid attempt credential and drives a deliberately slow
+  single-part `PutObject` that would not complete before the credential expires.
+  In a **fenced** store, the test arms the store's fence (or waits the documented
+  `MAX_WRITE_COMPLETION`) after credential expiry and asserts the store rejects
+  the in-flight write — no object is committed under the attempt prefix after
+  the fence, and the sweeper's delete-then-verify loop observes a permanently
+  empty prefix, proving quiescence is enforced by the store, not by a client
+  deadline (§4 rule 8). In an **unfenced** store, the test instead asserts the
+  convergent behavior: the sweeper's repeated delete/re-list passes eventually
+  leave the prefix empty, and any object that arrives after a pass is
+  re-collected on a later pass, with no such orphan ever observed by a query —
+  and the test explicitly asserts that **no** no-writes-after-delete guarantee is
+  claimed in this mode.
 - **Lease/heartbeat test**: a long ingestion whose worker heartbeats across
   several `LEASE_DURATION`s never loses its write credential: after the claim
   and after every renewal the test asserts the invariant
@@ -1112,9 +1219,12 @@ never observe.
     covers the entire lease window (the actual expiry is recorded as
     `write_credential_expires_at`, §3.1). There is **no** long-lived,
     deployment-wide `lake/` or `staging/` write credential on the ingestion path;
-    this is what lets the sweeper guarantee "no writes after delete" (§4 rule 8,
-    §6.1) — a fenced/delayed worker loses the ability to write the moment its
-    attempt credential expires or is revoked.
+    this is what lets the sweeper bound *new* writes after delete (§4 rule 8,
+    §6.1) — a fenced/delayed worker loses the ability to *authorize new* writes
+    the moment its attempt credential expires or is revoked. The
+    no-writes-after-delete guarantee additionally requires a server-enforced
+    write fence from the store and is therefore conditional (§4 rule 8); it is
+    not established by credential expiry alone.
   - **Query (read)** (per query, short-lived, prefix-scoped): before execution
     the worker obtains an STS credential whose policy allows read of **exactly
     the committed attempt prefixes
@@ -1185,60 +1295,65 @@ never observe.
   not bound payload or spool size: a permitted row may hold an arbitrarily large
   scalar, list, struct, or map value, so one page or export could still produce
   an unbounded payload and spool. Every result path is therefore bounded in
-  bytes as well as rows, and every bound is enforced on the **serialized** size
-  of what is actually written or streamed — never on an estimate from column
-  types. The limits are `MAX_RESULT_BYTES` (total encoded size of the spooled
-  `result.parquet`; default 256 MiB, hard max 1 GiB), `MAX_ROW_BYTES` (encoded
-  size of a single materialized row; default 1 MiB, hard max 16 MiB),
-  `MAX_PAGE_BYTES` (serialized size of one paged response's row array; default
-  4 MiB, hard max 64 MiB), and `MAX_EXPORT_BYTES` (CSV payload bytes of one
-  export response; default 64 MiB, hard max 512 MiB). The invariant
-  `MAX_ROW_BYTES ≤ MIN(MAX_PAGE_BYTES, MAX_EXPORT_BYTES, MAX_RESULT_BYTES)` is
-  validated at startup (a violating configuration is rejected) and guarantees a
-  non-empty result always yields at least one whole row on every path: no page
-  or export is ever empty, and no row is ever split across a page or cut
-  mid-cell.
+  bytes as well as rows. Crucially, each representation is measured **in its own
+  encoding**: a row's Parquet contribution is *not* treated as an upper bound on
+  its JSON or CSV encoding (the encodings expand independently under
+  quoting/escaping and base64/BLOB formatting, and Parquet adds
+  container/footer overhead). The limits are:
+  - `MAX_RESULT_BYTES` — the **finalized** size of the `result.parquet` spool
+    object as written to object storage, including container/footer overhead
+    (default 256 MiB, hard max 1 GiB);
+  - `MAX_ROW_BYTES` — the actual encoded size of a single row **in the
+    representation currently being produced** (Parquet contribution, JSON
+    element, or CSV line, each measured after encoding); default 1 MiB, hard max
+    16 MiB;
+  - `MAX_PAGE_BYTES` — the actual serialized JSON row-array size of one paged
+    response (default 4 MiB, hard max 64 MiB);
+  - `MAX_EXPORT_BYTES` — the actual CSV response payload size (default 64 MiB,
+    hard max 512 MiB).
 
-  - **Materialization is byte-bounded and streamed.** The worker streams rows
-    from the engine in bounded chunks and counts both rows and encoded bytes as
-    it writes `result.parquet`. A row's encoded size is the size of its
-    contribution to the spool — the serialized columnar bytes the worker's own
-    encoder produces for that row, including the full contents of any nested
-    list/struct/map cell — not a type-width estimate. The same per-row size is
-    measured conservatively so that it upper-bounds the row's JSON and CSV wire
-    encodings as well (worst-case quoting/escaping), which is what lets the
-    invariant below guarantee every page and export can emit a whole row.
-    Writing stops at the first
-    violated bound: more than `MAX_RESULT_ROWS` rows, or a row that would push
-    the spool past `MAX_RESULT_BYTES`, truncates the result to the largest
-    whole-row prefix that fits and records `truncated=true`; the crossing row is
-    the probe row and is never written, returned, or counted. The spool
-    therefore never exceeds `MAX_RESULT_BYTES`, and the worker's in-memory
-    footprint during materialization is bounded by the chunk size, not the full
-    result.
-  - **Oversized row (single row too large).** A row whose encoded size exceeds
-    `MAX_ROW_BYTES` cannot be returned within any page, export, or result bound;
-    it is a property of the data, not of the request. The worker terminates the
-    query and records `FAILED` with `failure_reason=resource_exceeded` (surfaced
-    as `resource_exhausted` per §11); no spool is published and `result_ref` is
-    not set, and the oversized row is never written to the spool. This is the
-    only case in which a byte bound fails the query instead of truncating: an
-    *aggregate* result that is too large is truncated to the largest fitting
-    whole-row prefix, while a result containing a single oversized row is
-    refused. Because `MAX_ROW_BYTES ≤ MAX_RESULT_BYTES`, every non-oversized row
-    fits the spool, so byte truncation can never make an otherwise-valid result
-    empty.
-  - **Paging is bounded in bytes and rows.** A page returns whole rows from the
-    spool until either `limit` rows or `MAX_PAGE_BYTES` (the serialized size of
-    the page's row array as the API encodes it) is reached. When the byte bound
-    stops a page before `limit` rows, the pagination cursor advances by the
-    number of whole rows actually emitted, so no row is split across pages and a
-    page is never empty while rows remain.
-  - **CSV export is bounded in bytes and rows.** Export streams whole rows only,
-    bounded by both the export row limit and `MAX_EXPORT_BYTES` measured on the
-    CSV text after quoting/escaping; the API stops before emitting a row whose
-    CSV-encoded size would exceed the remaining byte budget, so the streamed
-    payload never exceeds the bound and no CSV row is truncated mid-cell.
+  There is no cross-format invariant claiming one encoding upper-bounds another.
+  Each producer enforces its own bound on what it actually emits, and the policy
+  for a single row that cannot fit the representation is explicit
+  (`resource_exhausted`), never a silently empty or mid-row response.
+
+  - **Materialization (Parquet) is byte-bounded and streamed.** The worker
+    streams rows from the engine in bounded chunks and encodes to Parquet,
+    tracking the actual bytes produced plus a `PARQUET_OVERHEAD_RESERVE`
+    (default 1 MiB, validated to be well below `MAX_RESULT_BYTES`) for the
+    container/footer. A row whose own encoded Parquet contribution exceeds
+    `MAX_ROW_BYTES` fails the query (§ oversized row below). Its in-memory
+    footprint is bounded by the chunk size. After the finalize step the worker
+    measures the **actual object size**; if it exceeds `MAX_RESULT_BYTES`
+    (overhead larger than reserved), the worker truncates to the largest
+    whole-row prefix that finalizes within the limit, rewrites the spool once,
+    and records `truncated=true`. The published spool is therefore always ≤
+    `MAX_RESULT_BYTES`; the size check is on the finalized file, not an estimate.
+  - **Oversized row (single row too large for its representation).** A row whose
+    actual encoded size exceeds `MAX_ROW_BYTES` in the representation being
+    produced is a property of the data, not of the request. For materialization,
+    the worker terminates the query and records `FAILED` with
+    `failure_reason=resource_exceeded` (surfaced as `resource_exhausted` per
+    §11); no spool is published and `result_ref` is not set. For paging or
+    export, a first row that alone exceeds `MAX_PAGE_BYTES`/`MAX_EXPORT_BYTES`
+    makes that request fail with `resource_exhausted`; an empty 200 response is
+    never returned. An *aggregate* result that is too large in total is truncated
+    to the largest whole-row prefix that fits, while a result containing a single
+    oversized row is refused.
+  - **Paging is bounded in actual bytes and rows.** The API serializes rows from
+    the spool one at a time and measures each row's **actual JSON-serialized
+    size** as it builds the row array. It emits whole rows until `limit` rows or
+    `MAX_PAGE_BYTES` is reached. If the first row alone exceeds `MAX_PAGE_BYTES`,
+    the request returns `resource_exhausted` (no empty page). Otherwise the
+    cursor advances by the number of whole rows actually emitted, so no row is
+    split across pages and a page is never empty while rows remain.
+  - **CSV export is bounded in actual bytes and rows.** Export serializes each
+    row to CSV text (after quoting/escaping) and measures that text before
+    emitting it. It stops before a row whose actual CSV size would exceed the
+    remaining byte budget, so the streamed payload never exceeds
+    `MAX_EXPORT_BYTES` and no CSV row is cut mid-cell. If the first row alone
+    exceeds `MAX_EXPORT_BYTES`, the request fails with `resource_exhausted`
+    rather than emitting an empty or partial CSV.
 - CSV export streams a bounded CSV (default max 50,000 rows, capped by the
   result bound, and `MAX_EXPORT_BYTES` whole-row bytes) directly from the spool
   to the client; no separate `export.csv` object is written, so no export-write
@@ -1252,24 +1367,31 @@ never observe.
   fail with an authorization error and read no data. The same test asserts the
   API's result/export endpoints never receive a credential broader than that
   query's export prefix.
-- **Byte-limit tests.** (1) *Oversized row*: a dataset containing one row whose
-  encoded size exceeds `MAX_ROW_BYTES` (a generated `VARCHAR`/`BLOB` of
-  `MAX_ROW_BYTES + 1` bytes) makes the query `FAILED` with
-  `failure_reason=resource_exceeded` (surfaced as `resource_exhausted`), no
-  `result_ref`, and no spool object — while the same query against rows each
-  below the limit succeeds, proving the failure is per-row, not per-query. (2)
-  *Total-bytes truncation*: many rows each below `MAX_ROW_BYTES` whose aggregate
-  encoded size exceeds `MAX_RESULT_BYTES` yield `truncated=true`, a
-  `rows_returned` equal to the largest whole-row prefix that fits, and a spool
-  object whose size is ≤ `MAX_RESULT_BYTES`, with no row split. (3) *Page byte
-  bound*: with `limit` large enough that `MAX_PAGE_BYTES` binds first, a page's
-  serialized row array is ≤ `MAX_PAGE_BYTES`, the cursor advances by whole rows,
-  no row is split across pages, and a page is never empty while rows remain.
-  (4) *Export byte bound*: CSV export of rows whose quoted/escaped text exceeds
-  `MAX_EXPORT_BYTES` stops at a whole-row boundary, the streamed payload is ≤
-  `MAX_EXPORT_BYTES`, at least one row is exported, and the final emitted row is
-  complete, valid CSV. (5) *Invariant*: startup rejects any configuration with
-  `MAX_ROW_BYTES > MIN(MAX_PAGE_BYTES, MAX_EXPORT_BYTES, MAX_RESULT_BYTES)`.
+- **Byte-limit tests.** (1) *Oversized row (per representation)*: a dataset
+  containing one row whose actual encoded size exceeds `MAX_ROW_BYTES` (a
+  generated `VARCHAR`/`BLOB` of `MAX_ROW_BYTES + 1` bytes) makes the query
+  `FAILED` with `failure_reason=resource_exceeded` (surfaced as
+  `resource_exhausted`), no `result_ref`, and no spool object — while the same
+  query against rows each below the limit succeeds. (2) *Total-bytes
+  truncation*: many rows each below `MAX_ROW_BYTES` whose aggregate encoded size
+  plus finalized Parquet overhead exceeds `MAX_RESULT_BYTES` yield
+  `truncated=true`, a `rows_returned` equal to the largest whole-row prefix that
+  fits, and a **finalized** spool object whose measured size is ≤
+  `MAX_RESULT_BYTES`, with no row split. (3) *Page byte bound*: with `limit`
+  large enough that `MAX_PAGE_BYTES` binds first, a page's actual serialized row
+  array is ≤ `MAX_PAGE_BYTES`, the cursor advances by whole rows, no row is
+  split, and a page is never empty while rows remain. (4) *First row too large
+  for a page/export*: a row whose actual JSON or CSV encoding exceeds the
+  response byte bound makes that request return `resource_exhausted`, never an
+  empty or mid-row 200. (5) *Export byte bound*: CSV export of rows whose
+  quoted/escaped text exceeds `MAX_EXPORT_BYTES` stops at a whole-row boundary,
+  the streamed payload is ≤ `MAX_EXPORT_BYTES`, at least one row is exported, and
+  the final emitted row is complete, valid CSV. (6) *Cross-encoding divergence*:
+  a row whose Parquet contribution is below `MAX_ROW_BYTES` but whose CSV/JSON
+  encoding (heavy quoting, BLOB/base64) exceeds the corresponding bound is
+  handled per representation — the Parquet spool succeeds while the affected
+  page/export fails with `resource_exhausted` — proving the bounds are not
+  derived from one another.
 
 ## 10. Data retention policy
 
@@ -1484,7 +1606,9 @@ only pin a default where a test explicitly chooses to.
 | Lease renewal margin (`LEASE_RENEWAL_MARGIN`) | 30s | configurable |
 | Write-credential slack margin (`CREDENTIAL_SLACK`) | 30s | configurable, covers STS latency + clock skew |
 | Min write-credential TTL (`MIN_WRITE_CREDENTIAL_TTL`) | 30s | configurable |
-| Cleanup grace (`CLEANUP_GRACE`) | 15m | configurable |
+| Max clock skew (`MAX_CLOCK_SKEW`) | 30s | configurable; quantifies the clock-skew measurement error folded into `CLEANUP_GRACE` (§4 rule 8) |
+| Store write-completion bound (`MAX_WRITE_COMPLETION`) | unset | a documented-and-verified store property; only a fenced store may set it (§4 rule 8). Absence (default) means the store is unfenced and no-writes-after-delete is not claimed |
+| Cleanup grace (`CLEANUP_GRACE`) | 60s | configurable, ≥1s; not a proxy for a provider write time (§4 rule 8) |
 | Upload retention window (`UPLOAD_RETRY_WINDOW`) | 7 days | max 90 days |
 | Worker concurrency (queries) | 2 | configurable, ≥1, hard max 16 |
 | Worker concurrency (ingestion) | 1 | configurable, ≥1, hard max 8 |
@@ -1495,6 +1619,7 @@ only pin a default where a test explicitly chooses to.
 | Result rows | 10,000 | hard max 100,000 |
 | Result bytes (`MAX_RESULT_BYTES`) | 256 MiB | hard max 1 GiB |
 | Row bytes (`MAX_ROW_BYTES`) | 1 MiB | hard max 16 MiB |
+| Parquet overhead reserve (`PARQUET_OVERHEAD_RESERVE`) | 1 MiB | validated `< MAX_RESULT_BYTES` |
 | Page size | 1,000 | hard max 10,000 |
 | Page bytes (`MAX_PAGE_BYTES`) | 4 MiB | hard max 64 MiB |
 | Export rows | 50,000 | capped by result bound |

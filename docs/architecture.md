@@ -48,9 +48,12 @@ history. The first release runs entirely under Docker Compose.
    credential has expired plus a grace margin, serialized against the publish
    commit (`docs/design.md` §4 rules 6–8). On failure the version is marked
    `FAILED` with an error summary; staging and attempt-prefix objects are
-   reclaimed by the sweeper only after write-quiescence (the attempt's write
-   credential has expired or been revoked), never by a still-credentialed
-   delayed worker's race (`docs/design.md` §6.1). Staging of a successful
+   reclaimed by the sweeper only after the attempt's write credential has
+   expired (the *new*-write bound) and — when the store provides a
+   server-enforced write fence — after that fence is armed, never by a
+   still-credentialed delayed worker's race (`docs/design.md` §4 rule 8, §6.1).
+   In an unfenced store the no-writes-after-delete guarantee is not claimed and
+   reclamation is convergent. Staging of a successful
    attempt is reclaimed the same way if the worker crashes after the `READY`
    commit before deleting it, so successful staging is never stranded
    (`docs/design.md` §4 rule 9, §6.1).
@@ -127,8 +130,11 @@ history. The first release runs entirely under Docker Compose.
 - **Object access**: ingest uses a least-privilege worker credential to **read**
   uploads/source, and an **attempt-scoped, short-lived** write credential for
   `staging/`/`lake/` whose expiry is recorded as `write_credential_expires_at` so
-  the stale-attempt sweeper can guarantee no writes after delete (`docs/design.md`
-  §4 rule 8, §8); each query uses a short-lived credential
+  the stale-attempt sweeper can bound *new* writes after delete — credential
+  expiry bounds *new* writes, and the no-writes-after-delete guarantee for
+  *in-flight* writes holds only when the store provides a server-enforced write
+  fence (`docs/design.md` §4 rule 8, §8); each query uses a short-lived
+  credential
   scoped to exactly the committed attempt prefixes
   `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/` it references (read),
   registered as a prefix-scoped DuckDB secret with ambient
