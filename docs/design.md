@@ -50,7 +50,7 @@ storage (immutable data); in-memory state is always reconstructible.
 | dataset | PostgreSQL | id (UUID), namespace_id, name, source_prefix, format, status, retain_original (bool, default false), created_at, updated_at | ACTIVE, ARCHIVED |
 | dataset_version | PostgreSQL | id, dataset_id, version (monotonic int), object_prefix, format, partition_columns, status, schema_snapshot_id, error_summary, created_at | READY, FAILED |
 | schema_column | PostgreSQL | id, version_id, position, name, type, nullable, is_partition | — (rows) |
-| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps (created_at, started_at, finished_at), lease_owner, lease_expires_at, write_credential_expires_at, write_credential_revoked | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
+| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps (created_at, started_at, finished_at), lease_owner, lease_expires_at, write_credential_expires_at, write_credential_reserved_until, write_credential_revoked | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
 | query_job | PostgreSQL | id (UUID), statement (verbatim SQL text), statement_hash, dataset_version_ids, status, failure_reason, retryable, rows_returned, truncated, bytes_scanned, result_ref, plan_summary, attempt, fencing_token, timestamps (created_at, started_at, finished_at), lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED, TIMED_OUT (state model §13) |
 | object (Parquet) | object store | key under `lake/…` | — (immutable) |
 | spooled result | object store | key under `exports/…/attempt=<n>/…` | — (TTL-expired) |
@@ -71,6 +71,14 @@ quiesce and the sweeper treats the prefix as already quiescent (§4 rule 8).
 only) records whether the STS provider confirmed per-session revocation of that
 credential; it is set `true` only after a confirmed revocation, and only then is
 `write_credential_expires_at` advanced to the revocation instant (`now()`).
+`write_credential_reserved_until` (ingestion jobs only) is the conservative upper
+bound for a credential the worker is about to request. The worker persists it
+**before** calling STS, conditional on the current `fencing_token`; every
+credential it then requests is bounded by it. Because the reservation is durable
+before the credential exists, a renewal that issues a credential and then loses
+the fence cannot leave an unbounded credential behind: recovery and the sweeper
+wait on `max(write_credential_expires_at, write_credential_reserved_until)`, so
+even a credential issued during a fenced renewal is covered (§4 rule 8, §6.1).
 
 ### 3.2 Dataset lifecycle
 
@@ -242,9 +250,12 @@ Rules:
    than the attempt's current `lease_expires_at` (§6.1); there is no long-lived,
    deployment-wide `lake/` write credential on the ingestion path. The worker
    stores that credential's actual expiry in
-   `write_credential_expires_at` (§3.1). The sweeper deletes an abandoned attempt
-   prefix only when `now() > write_credential_expires_at + CLEANUP_GRACE`, where
-   `CLEANUP_GRACE` (default 15 minutes) strictly exceeds the object store's
+   `write_credential_expires_at` (§3.1), and persists a conservative
+   `write_credential_reserved_until` **before** requesting any credential. The
+   sweeper deletes an abandoned attempt prefix only when
+   `now() > max(write_credential_expires_at, write_credential_reserved_until) +
+   CLEANUP_GRACE`, where `CLEANUP_GRACE` (default 15 minutes) strictly exceeds
+   the object store's
    documented maximum time to complete an already-accepted write for the write
    modes below. After the credential has expired the object store rejects any
    further authenticated write to that prefix, so a delayed (fenced) worker
@@ -270,11 +281,15 @@ Rules:
    what governs *writes*. Revocation is optional hardening that shortens the
    window: if the STS provider supports per-session revocation **and confirms**
    it, the fencing transaction records `write_credential_revoked=true` and sets
-   `write_credential_expires_at = now()`; otherwise it **leaves the original
-   issuance-recorded expiry unchanged** (never overwrites it with `now()`), and the
+   `write_credential_expires_at = now()`; otherwise it **leaves the
+   issuance-recorded expiry and the reservation unchanged** (never overwrites
+   either with `now()`), and the
    sweeper waits for natural expiry plus `CLEANUP_GRACE`. A version in
    `PENDING`/`BUILDING` has no expired-credential abandoned prefix and is never
-   swept (rule 6).
+   swept (rule 6). The sweeper's bound is always
+   `max(write_credential_expires_at, write_credential_reserved_until)`, so a
+   credential issued by a renewal that lost the fence is covered by the
+   reservation even though its actual expiry was never persisted.
 
 ## 5. Catalog and version semantics
 
@@ -322,7 +337,7 @@ Common rules:
 - Failure never leaves a `READY` version; a partial version is never exposed as
   `READY`. Staging and `lake/…/version=<n>/attempt=<n>/` objects of a failed,
   cancelled, or crashed attempt are reclaimed **only** by the stale-attempt
-  sweeper after write-quiescence — `write_credential_expires_at + CLEANUP_GRACE`
+  sweeper after write-quiescence — `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE`
   (§4 rules 6 and 8) — never at the cancel/fail transition itself, which occurs
   while the attempt write credential may still authorize writes. (Staging of a
   *successful* attempt is removed by the transitioning worker after conversion
@@ -366,33 +381,51 @@ impossible; the write-credential fields make stale-worker *writes* impossible
   both fields keep their original values and the sweeper waits for natural
   expiry plus `CLEANUP_GRACE` (§4 rule 8).
 
-**Credential issuance (normative ordering).** The lease deadline is set by the
-claim — `lease_expires_at = claim_time + LEASE_DURATION` — and the write
-credential is derived from that deadline, never the reverse. After winning the
-claim the worker requests an attempt-scoped write credential whose TTL is the
-*remaining* lease duration at the moment of issuance: `lease_expires_at − now()`,
-minus a small `CREDENTIAL_SLACK` margin (default 30s, configurable) covering STS
-issuance latency and clock skew. The worker **verifies** the credential's actual
-expiry is `≤ lease_expires_at` before accepting it, then persists that actual
-expiry as `write_credential_expires_at` in a second conditional update keyed on
-the current token and `status='RUNNING'`:
-`UPDATE … SET write_credential_expires_at=? WHERE id=? AND fencing_token=? AND
-status='RUNNING'`. **No `staging/` or `lake/` write may occur before that commit
-succeeds.** Because the TTL is computed against the claim-time deadline (not the
-full `LEASE_DURATION`), the credential always expires at or before the lease no
-matter how long the STS call takes; `write_credential_expires_at` records the
-credential's true expiry, which is exactly what §4 rule 8 waits on.
+**Credential issuance (normative ordering: reserve → issue → persist).** The
+lease deadline is set by the claim — `lease_expires_at = claim_time +
+LEASE_DURATION` — and the write credential is derived from that deadline, never
+the reverse. Issuance is a three-step protocol whose first step is durable
+*before* any credential exists:
+
+1. **Reserve (conditional, must commit first).** The worker computes the bound
+   `reserved_until = lease_expires_at − CREDENTIAL_SLACK` (default slack 30s,
+   configurable, covering STS latency and clock skew) and persists it keyed on
+   the current token and `status='RUNNING'`:
+   `UPDATE … SET write_credential_reserved_until=? WHERE id=? AND fencing_token=?
+   AND status='RUNNING'`. A zero-row result means fenced — **no credential is
+   requested**.
+2. **Issue.** Only after the reservation commits does the worker request an
+   attempt-scoped write credential whose TTL is at most
+   `reserved_until − now()`. It **verifies** the provider's actual expiry is
+   `≤ reserved_until`; a later expiry is rejected (treated as an issuance
+   failure).
+3. **Persist actual expiry.** The worker records the credential's true expiry as
+   `write_credential_expires_at` and clears the reservation in one conditional
+   update keyed on the current token and `status='RUNNING'`:
+   `UPDATE … SET write_credential_expires_at=?, write_credential_reserved_until=NULL
+   WHERE id=? AND fencing_token=? AND status='RUNNING'`. **No `staging/` or
+   `lake/` write may occur before that commit succeeds.**
+
+The reservation is what closes the renewal race: if the job is fenced between
+steps 1 and 3 (for example, the old lease expires and recovery runs while the STS
+call is in flight), the conditional updates in steps 1 and 3 fail or the
+recovery pass runs, but the credential issued in step 2 is bounded by the
+already-durable `reserved_until`. Recovery never lowers that bound; it carries
+`max(write_credential_expires_at, write_credential_reserved_until)` forward, so
+the sweeper cannot delete the prefix until every credential that could possibly
+have been issued (including one whose expiry was never persisted) has expired,
+plus `CLEANUP_GRACE` (§4 rule 8). The worker also best-effort revokes a
+credential it obtained but could not persist.
 
 **Renewal re-issues the credential with every lease extension.** The lease is a
-sliding window renewed by heartbeat (§12.1). Each renewal repeats the issuance
-ordering above against the *extended* deadline, so the invariant
-`write_credential_expires_at ≤ lease_expires_at` holds continuously and an
-active ingestion never runs out of write capability mid-job. Renewal is
-all-or-nothing: the lease is extended and the credential re-issued (its TTL is
-the new remaining lease minus `CREDENTIAL_SLACK`) in the same conditional update
-keyed on the current token and `status='RUNNING'`; if the credential cannot be
-re-issued, the lease is not extended, and the worker retries the combined
-renewal or stops writing and fails retryably (§12.1).
+sliding window renewed by heartbeat (§12.1). Each renewal repeats the
+reserve → issue → persist ordering above against the *extended* deadline, so the
+invariant `write_credential_expires_at ≤ lease_expires_at` holds continuously and
+an active ingestion never runs out of write capability mid-job. Renewal is
+all-or-nothing: the reservation and the lease extension are committed together
+before STS is called, and if the credential cannot be re-issued the lease is not
+extended further, and the worker retries the combined renewal or stops writing
+and fails retryably (§12.1).
 
 **Credential-issuance failure.** If the credential cannot be issued with an
 expiry `≤ lease_expires_at` — the STS call fails, the remaining lease duration is
@@ -407,13 +440,16 @@ WHERE id=? AND fencing_token=? AND status='RUNNING'`,
 and in the same transaction marks the target version
 `FAILED WHERE id=<target_version> AND status='BUILDING'`.
 `write_credential_expires_at` stays NULL — no credential was ever issued for the
-attempt, so there is no write capability to quiesce and the sweeper may reclaim
-the (empty) attempt prefix immediately (§4 rule 8). A failed issuance therefore
-never leaves a credential that could outlive the lease. (The mirrored case — the
-credential is issued but the persist update is fenced — aborts with the same
-no-write rule: the worker discards the credential, best-effort revokes it, and
-never writes; because its TTL was the remaining lease duration, it expires no
-later than `lease_expires_at` regardless.)
+attempt — while any `write_credential_reserved_until` committed in step 1 is
+**retained, never lowered**, so the sweeper's bound is the reservation and it
+cannot delete before every credential that could have been issued is expired.
+The sweeper may reclaim the (empty) attempt prefix once that bound plus
+`CLEANUP_GRACE` has passed (§4 rule 8). A failed issuance therefore never leaves
+an unbounded credential. (The mirrored case — the credential is issued but the
+persist update is fenced — aborts with the same no-write rule: the worker
+discards the credential, best-effort revokes it, and never writes; the durable
+reservation from step 1 bounds its expiry, so it cannot outlive the sweep
+bound.)
 
 All worker-initiated transitions and the final commit are **conditional** on the
 token and the expected current status, for example
@@ -436,9 +472,9 @@ recovery pass re-claims its job, before it can commit a stale result.
 | (new) | ingestion requested (`register` or `convert`) | QUEUED | `ingestion_job` row created with `attempt = 0` and no token; target `dataset_version` created as `PENDING`; `retry_of` set when this is a retry |
 | QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=now()+LEASE_DURATION, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'`; exactly one winner. The claim sets the initial lease deadline (later renewed by heartbeat, §12.1) only — it does **not** set `write_credential_expires_at`, which stays NULL until the credential is actually issued. The worker then issues the attempt-scoped write credential against that deadline and persists its actual expiry before writing (see "Credential issuance" above); version `PENDING` → `BUILDING` |
 | RUNNING | all Parquet written to `lake/…/version=<n>/attempt=<n>/` + schema captured, then commit | SUCCEEDED | one conditional transaction sets the version `READY` with `object_prefix` = this attempt's prefix and the job `SUCCEEDED`, both `WHERE … fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort (rules 6 and 8 sweep any straggler after write-credential expiry) |
-| RUNNING | cancel accepted | CANCELLED | conditional on token; version → `FAILED` with `error_summary = "cancelled"`. No object deletion here: cancellation occurs while the attempt write credential may still authorize writes, so staging/lake reclamation is deferred to the stale-attempt sweeper, which deletes only after write-quiescence — `write_credential_expires_at + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
-| RUNNING | unrecoverable error | FAILED | conditional on token; `failure_reason` + `error_summary` set; version → `FAILED`. No object deletion here: staging/lake reclamation is deferred to the stale-attempt sweeper after write-quiescence — `write_credential_expires_at + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
-| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token (increments `attempt`, clears `fencing_token`) **and atomically marks the target version `FAILED`** in one transaction; `write_credential_expires_at` is set to `now()` and `write_credential_revoked=true` **only when** the STS provider confirms per-session revocation, otherwise the expiry recorded at issuance is left unchanged (§4 rule 8); the old worker is fenced by the token change and can no longer write (credential revoked/expired) |
+| RUNNING | cancel accepted | CANCELLED | conditional on token; version → `FAILED` with `error_summary = "cancelled"`. No object deletion here: cancellation occurs while the attempt write credential may still authorize writes, so staging/lake reclamation is deferred to the stale-attempt sweeper, which deletes only after write-quiescence — `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
+| RUNNING | unrecoverable error | FAILED | conditional on token; `failure_reason` + `error_summary` set; version → `FAILED`. No object deletion here: staging/lake reclamation is deferred to the stale-attempt sweeper after write-quiescence — `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
+| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token (increments `attempt`, clears `fencing_token`) **and atomically marks the target version `FAILED`** in one transaction; `write_credential_expires_at` is set to `now()` and `write_credential_revoked=true` **only when** the STS provider confirms per-session revocation; otherwise recovery sets `write_credential_expires_at = max(recorded expiry, write_credential_reserved_until)` and keeps the reservation, so a credential issued by a renewal that lost the fence is still covered (§4 rule 8); the old worker is fenced by the token change and can no longer write once every possible credential has expired |
 
 - `QUEUED` jobs survive worker restart: state lives in PostgreSQL and the queue
   is reconstructed by scanning for `QUEUED` rows.
@@ -461,23 +497,28 @@ recovery pass re-claims its job, before it can commit a stale result.
     attempt=attempt+1, fencing_token=NULL, lease_owner=NULL, lease_expires_at=NULL,
     write_credential_expires_at=now(), write_credential_revoked=true
     WHERE id=? AND status='RUNNING' AND lease_expires_at < now()`.
-  - **Revocation unsupported or unconfirmed** — the identical update without the
-    two write-credential columns:
+  - **Revocation unsupported or unconfirmed** — the same update without setting
+    `now()`, instead carrying the reservation forward:
     `UPDATE … SET status='FAILED', failure_reason='worker_crash', retryable=true,
-    attempt=attempt+1, fencing_token=NULL, lease_owner=NULL, lease_expires_at=NULL
+    attempt=attempt+1, fencing_token=NULL, lease_owner=NULL, lease_expires_at=NULL,
+    write_credential_expires_at = GREATEST(COALESCE(write_credential_expires_at,
+    'epoch'), COALESCE(write_credential_reserved_until, 'epoch'))
     WHERE id=? AND status='RUNNING' AND lease_expires_at < now()`,
-    which **leaves `write_credential_expires_at` at the expiry recorded at
-    issuance** and `write_credential_revoked` false.
+    which never lowers the expiry bound, keeps `write_credential_reserved_until`,
+    and leaves `write_credential_revoked` false.
 
   `now()` is recorded as the expiry only in the confirmed-revocation branch;
-  there is no code path that overwrites the issuance-recorded expiry with `now()`
-  without such confirmation, so the sweeper always waits for natural expiry plus
-  `CLEANUP_GRACE` when revocation was not confirmed (§4 rule 8). Job and
+  there is no code path that lowers or overwrites the issuance-recorded expiry
+  without such confirmation, so the sweeper always waits for
+  `max(write_credential_expires_at, write_credential_reserved_until) +
+  CLEANUP_GRACE` when revocation was not confirmed (§4 rule 8). This includes a
+  credential issued by a renewal that was fenced before persisting its expiry:
+  the durable reservation covers it. Job and
   version can therefore never diverge: a crashed attempt cannot leave a
   permanently `BUILDING` version. Deletion of the old attempt's `staging/` and
   `lake/…/version=<n>/attempt=<old>/` prefixes is **not** done by this pass; it
-  is deferred to the stale-attempt sweeper, which deletes only after
-  `write_credential_expires_at + CLEANUP_GRACE` (§4 rule 8). Fencing the token
+  is deferred to the stale-attempt sweeper, which deletes only after that
+  reservation/expiry bound plus `CLEANUP_GRACE` (§4 rule 8). Fencing the token
   stops the delayed worker from *publishing*; expiry/revocation of the
   attempt-scoped write credential is what stops it from *writing*, so the sweeper
   never deletes a prefix a still-credentialed writer can write to, and a delayed
@@ -505,7 +546,15 @@ recovery pass re-claims its job, before it can commit a stale result.
   succeeding until the job completes. A companion test stops the heartbeat and
   asserts that, after the lease expires, the recovery pass re-claims the job
   (`FAILED`, retryable), the old token no longer commits, and the sweeper deletes
-  the prefix only after `write_credential_expires_at + CLEANUP_GRACE` (§4 rule 8).
+  the prefix only after `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE` (§4 rule 8).
+- **Fenced-renewal reservation test**: a worker commits a renewal reservation,
+  obtains a credential, and is fenced before persisting the credential's actual
+  expiry. The test asserts that recovery carries the reservation bound forward,
+  that the sweeper deletes only after
+  `max(write_credential_expires_at, write_credential_reserved_until) +
+  CLEANUP_GRACE`, and that no delete occurs while the orphaned credential is
+  still valid — a write it issues before natural expiry is either rejected
+  (revocation confirmed) or occurs before the sweep bound, never after it.
 - **Renewal all-or-nothing test**: a renewal whose STS call fails does not
   extend the lease, and the worker either retries the combined renewal or stops
   writing and fails retryably — it never reaches the state "lease alive, write
@@ -947,7 +996,7 @@ never observe.
 |---|---|
 | `lake/` Parquet objects | Retained for the life of the deployment. Archive does **not** delete them (unarchive is reversible); no automatic deletion in v1. Hard delete/GC is out of scope. |
 | Original uploads | `retain_original=true`: retained for the life of the deployment (no auto-delete). `retain_original=false`: deleted promptly after the version reaches `READY`; on a terminal `FAILED`/`CANCELLED`/crash-recovered job, retained for `UPLOAD_RETRY_WINDOW` (default 7 days, max 90 days) so a retry can reuse the input, then deleted |
-| `staging/` objects | Successful attempt: removed by the transitioning worker after conversion completes. Failed/cancelled/crashed attempt: reclaimed only by the stale-attempt sweeper after `write_credential_expires_at + CLEANUP_GRACE` (§4 rules 6 and 8) — never at the cancel/fail transition itself |
+| `staging/` objects | Successful attempt: removed by the transitioning worker after conversion completes. Failed/cancelled/crashed attempt: reclaimed only by the stale-attempt sweeper after `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE` (§4 rules 6 and 8) — never at the cancel/fail transition itself |
 | `exports/` (results/exports) | TTL default 24h, swept |
 | query_job history rows | Bounded retention (default 30 days, configurable); the SQL statement is retained for the job's full lifetime and is never purged or overwritten before the job reaches a terminal state; after that the statement and its `statement_hash` are removed together with the row under the same retention window. There is no separate hash store, so no hash outlives its row |
 | Failed version error summaries | Retained with the version for its lifetime (archive does not delete version rows) |
@@ -1136,16 +1185,21 @@ liveness is carried entirely by the lease.
   round-trip; configuration validation rejects any combination that violates
   this precondition, and a test asserts it.
 - **Renewal and write credentials (ingestion only).** Ingestion renewal is
-  all-or-nothing: extending `lease_expires_at` and re-issuing the attempt-scoped
-  write credential happen together, so the invariant
-  `write_credential_expires_at ≤ lease_expires_at` holds at every instant. On
-  each renewal the worker (a) computes the target lease `new_lease = now() +
-  LEASE_DURATION`, (b) requests a write credential whose TTL is
-  `new_lease − now() − CREDENTIAL_SLACK` (so its actual expiry is ≤ `new_lease`),
-  and (c) persists both in one conditional update keyed on the current token and
-  `status='RUNNING'`:
-  `UPDATE … SET lease_expires_at = new_lease, write_credential_expires_at =
-  <credential-expiry> WHERE id=? AND fencing_token=? AND status='RUNNING'`.
+  all-or-nothing and follows the same reserve → issue → persist ordering as
+  initial issuance, so the invariant `write_credential_expires_at ≤
+  lease_expires_at` holds at every instant. On each renewal the worker (a)
+  computes the target lease `new_lease = now() + LEASE_DURATION`, (b) commits a
+  conditional update keyed on the current token and `status='RUNNING'` that sets
+  `lease_expires_at = new_lease` and
+  `write_credential_reserved_until = new_lease − CREDENTIAL_SLACK`, (c) requests
+  a write credential whose TTL is at most `reserved_until − now()` (so its
+  actual expiry is ≤ `reserved_until`), and (d) persists the credential's actual
+  expiry and clears the reservation in a second conditional update keyed on the
+  current token and `status='RUNNING'`. If the worker is fenced after (b) but
+  before (d), the durable reservation still bounds every credential it could have
+  obtained, so the sweeper waits on
+  `max(write_credential_expires_at, write_credential_reserved_until)` and never
+  deletes a prefix a fenced renewal's credential can still write to (§4 rule 8).
   If the credential cannot be re-issued (STS failure, or the remaining TTL would
   fall below `MIN_WRITE_CREDENTIAL_TTL`), the worker does **not** extend the
   lease — it keeps the existing credential and lease and retries the combined
@@ -1154,7 +1208,7 @@ liveness is carried entirely by the lease.
   worker that cannot complete a combined renewal before its current credential
   expires stops writing and fails the job retryably (the same path as
   credential-issuance failure, §6.1); the stale-attempt sweeper reclaims the
-  prefix after `write_credential_expires_at + CLEANUP_GRACE` (§4 rule 8). An
+  prefix after the reservation/expiry bound plus `CLEANUP_GRACE` (§4 rule 8). An
   active ingestion therefore never loses its write capability mid-job: its
   credential is re-issued at least as often as its lease is renewed and always
   expires no later than the lease.
