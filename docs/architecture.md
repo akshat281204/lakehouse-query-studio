@@ -20,7 +20,7 @@ history. The first release runs entirely under Docker Compose.
 |---|---|
 | Go API / control plane | Dataset registration, ingestion coordination, query submission/status/cancellation, result paging/export, health/readiness/metrics, configuration validation. Stateless; all durable state lives in PostgreSQL and the object store. Is the sole reader of result spools: it pages and exports results by reading `exports/<namespace>/<query-id>/…` under a per-query, prefix-scoped read credential (§9 of `docs/design.md`). |
 | Go query worker | Bounded asynchronous job execution. Runs DuckDB through a maintained Go binding behind `internal/query.Engine`; isolates engine-specific setup and S3 configuration behind that interface. Claims jobs under a per-claim `fencing_token`/`attempt` and writes result spools to an attempt-scoped export prefix so a stale worker cannot publish results or overwrite terminal state (§6.1, §13 of `docs/design.md`). |
-| DuckDB | Local, single-node analytical execution over Parquet via its S3/HTTPFS support. The worker parses/validates user SQL, re-binds the allowed catalog references to their registered prefixes, and executes the rewritten statement on a read-only connection whose S3 credential is scoped to exactly those prefixes (see `docs/design.md` §7.4). Never reachable from browser code. |
+| DuckDB | Local, single-node analytical execution over Parquet via its S3/HTTPFS support. The worker loads the pinned, checksum-verified `httpfs` extension by trusted code before sealing the connection (so user SQL cannot load extensions), parses/validates user SQL, re-binds the allowed catalog references to their registered prefixes, and executes the rewritten statement on a read-only connection whose S3 credential is scoped to exactly those prefixes (see `docs/design.md` §7.4). Never reachable from browser code. |
 | PostgreSQL | Durable catalog metadata, dataset versions, ingestion jobs, query jobs, and bounded query history. Never stores result payloads or credentials. |
 | MinIO (local) / S3-compatible (remote) | Immutable source and converted Parquet objects. Uses distinct prefixes for datasets, uploads, staging, and temporary query exports. |
 | React + TypeScript dashboard | Application UI: dataset catalog, SQL editor, result grid, charting, history, and operational summary. No object-store credentials or keys ever reach the browser. |
@@ -50,7 +50,10 @@ history. The first release runs entirely under Docker Compose.
    `FAILED` with an error summary; staging and attempt-prefix objects are
    reclaimed by the sweeper only after write-quiescence (the attempt's write
    credential has expired or been revoked), never by a still-credentialed
-   delayed worker's race (`docs/design.md` §6.1).
+   delayed worker's race (`docs/design.md` §6.1). Staging of a successful
+   attempt is reclaimed the same way if the worker crashes after the `READY`
+   commit before deleting it, so successful staging is never stranded
+   (`docs/design.md` §4 rule 9, §6.1).
 
 ### 3.2 Query execution
 
@@ -118,7 +121,9 @@ history. The first release runs entirely under Docker Compose.
   allowlist, deny-by-default, table-reference whitelist), server-side re-binding
   of allowed references to their registered prefixes, a per-query prefix-scoped
   S3 credential, and a read-only execution connection with the local filesystem
-  disabled and configuration locked (see `docs/design.md` §7).
+  disabled and configuration locked. The trusted, pinned `httpfs` extension is
+  loaded by worker code before the connection is sealed; user SQL cannot load or
+  install extensions (see `docs/design.md` §7.4).
 - **Object access**: ingest uses a least-privilege worker credential to **read**
   uploads/source, and an **attempt-scoped, short-lived** write credential for
   `staging/`/`lake/` whose expiry is recorded as `write_credential_expires_at` so

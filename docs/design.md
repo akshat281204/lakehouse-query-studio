@@ -50,9 +50,11 @@ storage (immutable data); in-memory state is always reconstructible.
 | dataset | PostgreSQL | id (UUID), namespace_id, name, source_prefix, format, status, retain_original (bool, default false), created_at, updated_at | ACTIVE, ARCHIVED |
 | dataset_version | PostgreSQL | id, dataset_id, version (monotonic int), object_prefix, format, partition_columns, status, schema_snapshot_id, error_summary, created_at | READY, FAILED |
 | schema_column | PostgreSQL | id, version_id, position, name, type, nullable, is_partition | — (rows) |
-| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps (created_at, started_at, finished_at), lease_owner, lease_expires_at, write_credential_expires_at, write_credential_reserved_until, write_credential_revoked | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
+| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps (created_at, started_at, finished_at), lease_owner, lease_expires_at, write_credential_expires_at, write_credential_reserved_until, write_credential_revoked, upload_released_at, source_upload_consumed_at | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
 | query_job | PostgreSQL | id (UUID), statement (verbatim SQL text), statement_hash, dataset_version_ids, status, failure_reason, retryable, rows_returned, truncated, bytes_scanned, result_ref, plan_summary, attempt, fencing_token, timestamps (created_at, started_at, finished_at), lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED, TIMED_OUT (state model §13) |
 | object (Parquet) | object store | key under `lake/…` | — (immutable) |
+| upload (original input) | object store | key under `uploads/<namespace>/<dataset>/<job-id>/<sanitized-original-name>` | retained-for-deployment (`retain_original=true`) or released/deleted (lifecycle §10) |
+| staging object | object store | key under `staging/<namespace>/<dataset>/<job-id>/attempt=<n>/…` | — (swept after job terminal + write-quiescence, §4 rule 9) |
 | spooled result | object store | key under `exports/…/attempt=<n>/…` | — (TTL-expired) |
 
 `attempt` and `fencing_token` are the lease-fencing fields defined in §6.1 and
@@ -64,7 +66,8 @@ attempt-scoped, short-lived object-store write credential that authorizes writes
 to `staging/` and `lake/`; it is the single authority for the write-quiescence
 guarantee in §4 rule 8 and §6.1. It is NULL until the attempt's credential is
 actually issued, and then records the credential's true expiry, which is never
-later than the attempt's current `lease_expires_at` (§6.1); a NULL value means no
+earlier than the attempt's current `lease_expires_at` (§6.1) — the credential
+always covers the entire lease window; a NULL value means no
 credential was ever issued for that attempt, so there is no write capability to
 quiesce and the sweeper treats the prefix as already quiescent (§4 rule 8).
 `write_credential_revoked` (ingestion jobs
@@ -79,6 +82,39 @@ before the credential exists, a renewal that issues a credential and then loses
 the fence cannot leave an unbounded credential behind: recovery and the sweeper
 wait on `max(write_credential_expires_at, write_credential_reserved_until)`, so
 even a credential issued during a fenced renewal is covered (§4 rule 8, §6.1).
+
+`upload_released_at` and `source_upload_consumed_at` (ingestion jobs only) are the
+two fields that make upload release and retry mutually exclusive (§10).
+`upload_released_at` is set, in a locked catalog transaction, when an upload
+prefix is declared due and handed to the object-store lifecycle rule; once set it
+is a durable barrier that prevents any later retry from referencing the source
+upload. `source_upload_consumed_at` is set by a retry the moment it has finished
+re-staging the source upload into its own staging prefix, after which it no
+longer reads the source; the sweeper may not delete the source while any
+dependent retry has not yet consumed it (§10).
+
+Two object-store entities are durable in their own right and are inventoried
+above rather than being subsumed under "object (Parquet)": the **upload
+(original input)** under `uploads/<namespace>/<dataset>/<job-id>/…` and the
+**staging object** under `staging/<namespace>/<dataset>/<job-id>/attempt=<n>/…`.
+Both survive process restarts and have distinct cleanup lifecycles, so each is
+listed with its owning catalog reference and lifecycle/terminal conditions:
+
+- `upload` is owned by the `ingestion_job` whose id appears in its key
+  (`uploads/<namespace>/<dataset>/<job-id>/`). Its terminal condition and
+  retention are fully determined by the job outcome and the dataset's
+  `retain_original` policy: deleted on `READY` when `retain_original=false`,
+  deleted after `UPLOAD_RETRY_WINDOW` following a terminal non-success when
+  `retain_original=false`, or retained for the life of the deployment when
+  `retain_original=true` (§10). It is released only by the serialized
+  release/retry exclusion protocol in §10, which sets `upload_released_at`, and
+  is never deleted while a dependent retry has not re-staged it.
+- `staging` objects are owned by the `ingestion_job` (job id) together with the
+  specific `attempt` (the `attempt=<n>` segment). Their terminal condition is
+  "the owning job is terminal (`SUCCEEDED`/`FAILED`/`CANCELLED`) **and** the
+  attempt's write credential has expired"; they are reclaimed by the
+  stale-attempt sweeper after write-quiescence (§4 rules 6, 8, and 9), never at
+  the terminal transition itself.
 
 ### 3.2 Dataset lifecycle
 
@@ -143,7 +179,7 @@ lake/<namespace>/<dataset>/version=<n>/attempt=<n>/[<enc-col>=<enc-value>/...]/p
 # retain_original=true)
 uploads/<namespace>/<dataset>/<job-id>/<sanitized-original-name>
 
-# Ingestion staging (temporary, attempt-scoped; removed on success, reclaimed by the sweeper after write-quiescence on failure/cancel/crash)
+# Ingestion staging (temporary, attempt-scoped; reclaimed by the sweeper after write-quiescence once the job is terminal — success included — with the worker's own success-time delete as a courtesy only)
 staging/<namespace>/<dataset>/<job-id>/attempt=<n>/part-<uuid>.parquet
 
 # Spooled query results (temporary; TTL; attempt-scoped)
@@ -246,8 +282,9 @@ Rules:
    deletes an abandoned attempt prefix only after it can prove that no credential
    remains that could write to it. Ingestion writes to `lake/` and `staging/` are
    authorized solely by an attempt-scoped, short-lived STS credential whose TTL
-   is the remaining lease duration at issuance time, so its expiry is never later
-   than the attempt's current `lease_expires_at` (§6.1); there is no long-lived,
+   is the full lease window plus a slack margin at issuance time, so its expiry
+   is never earlier than the attempt's current `lease_expires_at` (§6.1); the
+   credential always covers the entire lease window. There is no long-lived,
    deployment-wide `lake/` write credential on the ingestion path. The worker
    stores that credential's actual expiry in
    `write_credential_expires_at` (§3.1), and persists a conservative
@@ -290,6 +327,29 @@ Rules:
    `max(write_credential_expires_at, write_credential_reserved_until)`, so a
    credential issued by a renewal that lost the fence is covered by the
    reservation even though its actual expiry was never persisted.
+9. **Staging cleanup for terminal jobs (success included).** The
+   `staging/<namespace>/<dataset>/<job-id>/attempt=<n>/` prefix is *conclusively
+   abandoned* exactly when its `ingestion_job` is terminal — `SUCCEEDED`,
+   `FAILED`, or `CANCELLED` — because a terminal job can never write staging
+   again. The worker's own best-effort delete of a successful attempt's staging
+   (after the fenced `READY` commit) is a courtesy, **not** the retention
+   guarantee: the stale-attempt sweeper is the authoritative backstop for the
+   staging of **every** terminal job, success included, and deletes it under the
+   same two preconditions as `lake/` — serialized against the fenced
+   `BUILDING → READY` commit by the per-version lock (rule 7), and only after
+   write-quiescence
+   `now() > max(write_credential_expires_at, write_credential_reserved_until) +
+   CLEANUP_GRACE` (rule 8). Serialization runs in both directions: the sweeper
+   re-reads the job's `status` under the per-version lock and deletes a staging
+   prefix only if the job is already terminal in that read, so it can never
+   delete the staging of an attempt whose `RUNNING → SUCCEEDED` transition (the
+   fenced `READY` commit) has not yet landed. A worker that crashes after the
+   fenced `READY`/`SUCCEEDED` commit but before deleting its own staging
+   therefore strands nothing: once the job is `SUCCEEDED`, the sweeper reclaims
+   the staging prefix after write-quiescence exactly as it reclaims a failed
+   attempt's staging. The successful attempt's `lake/` prefix is the committed
+   `object_prefix` and is **never** swept (rules 6 and 7); only its `staging/`
+   prefix is.
 
 ## 5. Catalog and version semantics
 
@@ -339,10 +399,14 @@ Common rules:
   cancelled, or crashed attempt are reclaimed **only** by the stale-attempt
   sweeper after write-quiescence — `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE`
   (§4 rules 6 and 8) — never at the cancel/fail transition itself, which occurs
-  while the attempt write credential may still authorize writes. (Staging of a
-  *successful* attempt is removed by the transitioning worker after conversion
-  completes: it is the sole holder of the attempt credential and has stopped
-  writing, so no further staging write can occur.)
+  while the attempt write credential may still authorize writes. Staging of a
+  *successful* attempt is best-effort deleted by the transitioning worker after
+  the `READY` commit (it has stopped writing, so no further staging write can
+  occur), but that self-delete is a courtesy, not the guarantee: if the worker
+  crashes after the fenced `READY`/`SUCCEEDED` commit but before deleting its
+  staging, the stale-attempt sweeper reclaims the staging prefix once the job is
+  `SUCCEEDED` and write-quiescence has passed (§4 rule 9), so successful staging
+  is never left indefinitely.
 - Partition columns are explicit and user-selected with a safe default (no
   partitioning, or only low-cardinality columns); high-cardinality partitioning
   is not applied by default.
@@ -366,8 +430,10 @@ impossible; the write-credential fields make stale-worker *writes* impossible
 - `write_credential_expires_at` — the actual expiry of the attempt-scoped,
   short-lived write credential that authorizes this attempt's writes to
   `staging/` and `lake/`. It is NULL until the credential is actually issued;
-  once issued, the credential's TTL is the remaining lease duration at issuance
-  time, so its expiry is never later than the attempt's current `lease_expires_at`.
+  once issued, the credential's TTL is the full lease window plus a slack
+  margin at issuance time, so its expiry is never earlier than the attempt's
+  current `lease_expires_at` — the credential always covers the entire lease
+  window.
   The field records the true expiry returned by the provider, persisted before
   any write (see "Credential issuance" below). The stale-attempt sweeper deletes
   an abandoned attempt prefix only after this time plus `CLEANUP_GRACE` (§4 rule
@@ -383,22 +449,24 @@ impossible; the write-credential fields make stale-worker *writes* impossible
 
 **Credential issuance (normative ordering: reserve → issue → persist).** The
 lease deadline is set by the claim — `lease_expires_at = claim_time +
-LEASE_DURATION` — and the write credential is derived from that deadline, never
-the reverse. Issuance is a three-step protocol whose first step is durable
-*before* any credential exists:
+LEASE_DURATION` — and the write credential is sized to cover that full window
+plus a slack margin, never the reverse. Issuance is a three-step protocol whose
+first step is durable *before* any credential exists:
 
 1. **Reserve (conditional, must commit first).** The worker computes the bound
-   `reserved_until = lease_expires_at − CREDENTIAL_SLACK` (default slack 30s,
+   `reserved_until = lease_expires_at + CREDENTIAL_SLACK` (default slack 30s,
    configurable, covering STS latency and clock skew) and persists it keyed on
    the current token and `status='RUNNING'`:
    `UPDATE … SET write_credential_reserved_until=? WHERE id=? AND fencing_token=?
    AND status='RUNNING'`. A zero-row result means fenced — **no credential is
    requested**.
 2. **Issue.** Only after the reservation commits does the worker request an
-   attempt-scoped write credential whose TTL is at most
-   `reserved_until − now()`. It **verifies** the provider's actual expiry is
-   `≤ reserved_until`; a later expiry is rejected (treated as an issuance
-   failure).
+   attempt-scoped write credential whose TTL is
+   `reserved_until − now()` (so its nominal expiry is `reserved_until`). It
+   **verifies** the provider's actual expiry `E` satisfies both
+   `E ≥ lease_expires_at` (the credential covers the full lease window) and
+   `E ≤ reserved_until` (it does not outlive the durable reservation); an expiry
+   outside either bound is rejected (treated as an issuance failure).
 3. **Persist actual expiry.** The worker records the credential's true expiry as
    `write_credential_expires_at` and clears the reservation in one conditional
    update keyed on the current token and `status='RUNNING'`:
@@ -417,21 +485,40 @@ have been issued (including one whose expiry was never persisted) has expired,
 plus `CLEANUP_GRACE` (§4 rule 8). The worker also best-effort revokes a
 credential it obtained but could not persist.
 
-**Renewal re-issues the credential with every lease extension.** The lease is a
-sliding window renewed by heartbeat (§12.1). Each renewal repeats the
-reserve → issue → persist ordering above against the *extended* deadline, so the
-invariant `write_credential_expires_at ≤ lease_expires_at` holds continuously and
-an active ingestion never runs out of write capability mid-job. Renewal is
-all-or-nothing: the reservation and the lease extension are committed together
-before STS is called, and if the credential cannot be re-issued the lease is not
-extended further, and the worker retries the combined renewal or stops writing
-and fails retryably (§12.1).
+**Renewal re-issues the credential with every lease extension (commit-last).**
+The lease is a sliding window renewed by heartbeat (§12.1), and each renewal
+re-issues the attempt write credential because that credential must keep covering
+the extended lease window. Renewal repeats the reserve → issue → persist ordering
+above, with one normative difference: **the lease is extended only in the
+persist step, atomically with the replacement credential's expiry — never in the
+reserve step.** Step 1 computes the target new deadline
+`D = now() + LEASE_DURATION`, persists only
+`write_credential_reserved_until = D + CREDENTIAL_SLACK`, and leaves
+`lease_expires_at` unchanged; step 2 issues the credential; step 3 is a single
+conditional update (keyed on the current token and `status='RUNNING'`) that sets
+`lease_expires_at = D` **and**
+`write_credential_expires_at = <actual expiry>` (and clears the reservation)
+together, where the actual expiry satisfies
+`D ≤ write_credential_expires_at ≤ D + CREDENTIAL_SLACK`. Because only a
+committed step 3 extends the lease, the lease can never be extended without a
+replacement credential that already covers the new window: if the STS call
+fails or the provider returns an expiry outside `[D, D + CREDENTIAL_SLACK]`,
+step 3 is not committed and the lease is not extended, and the worker retries
+the combined renewal within the current window or stops writing and fails
+retryably (§12.1). An active
+ingestion therefore never reaches the state "lease alive, write credential
+expired" — the invariant `write_credential_expires_at ≥ lease_expires_at` holds
+at every instant a credential exists — and a renewal that loses the fence after
+step 2 leaves a credential bounded by the durable step-1 reservation, which the
+sweeper honors (§4 rule 8).
 
 **Credential-issuance failure.** If the credential cannot be issued with an
-expiry `≤ lease_expires_at` — the STS call fails, the remaining lease duration is
-below a minimum usable threshold `MIN_WRITE_CREDENTIAL_TTL` (default 30s,
-configurable), or the provider returns an expiry later than the lease — the
-worker performs **no write**. It releases the claim in one conditional
+expiry that covers the full lease window and respects the reservation —
+`lease_expires_at ≤ E ≤ reserved_until` at claim, or `D ≤ E ≤ D + CREDENTIAL_SLACK`
+at renewal — because the STS call fails, the requested TTL falls below a minimum
+usable threshold `MIN_WRITE_CREDENTIAL_TTL` (default 30s, configurable), or the
+provider returns an expiry outside those bounds — the worker performs **no
+write**. It releases the claim in one conditional
 transaction keyed on the current token and `status='RUNNING'`:
 `UPDATE … SET status='FAILED', failure_reason='credential_issue_failed',
 retryable=true, attempt=attempt+1, fencing_token=NULL, lease_owner=NULL,
@@ -479,11 +566,12 @@ recovery pass re-claims its job, before it can commit a stale result.
 - `QUEUED` jobs survive worker restart: state lives in PostgreSQL and the queue
   is reconstructed by scanning for `QUEUED` rows.
 - A `RUNNING` job's lease is a sliding window renewed by the holding worker's
-  heartbeat (§12.1): while the worker is alive it extends `lease_expires_at`
-  and, in the same conditional update, re-issues the attempt write credential,
-  preserving `write_credential_expires_at ≤ lease_expires_at` and ensuring the
+  heartbeat (§12.1). Ingestion renewal is commit-last: the worker first
+  refreshes the attempt write credential and then, in the **same** conditional
+  update that persists the credential's new expiry, extends `lease_expires_at`,
+  preserving `write_credential_expires_at ≥ lease_expires_at` and ensuring the
   credential never expires before the lease. A renewal that affects zero rows
-  means the worker was fenced; it must abort.
+  means the worker was fenced; it must abort without writing.
 - A worker that crashes mid-attempt leaves the job `RUNNING` with an expired
   lease. A recovery pass (run by any worker's lease/heartbeat cycle) performs a
   single atomic transaction that (a) conditionally updates the job keyed on the
@@ -541,7 +629,7 @@ recovery pass re-claims its job, before it can commit a stale result.
 - **Lease/heartbeat test**: a long ingestion whose worker heartbeats across
   several `LEASE_DURATION`s never loses its write credential: after the claim
   and after every renewal the test asserts the invariant
-  `write_credential_expires_at ≤ lease_expires_at`, that the recorded expiry
+  `write_credential_expires_at ≥ lease_expires_at` (the credential never expires before the lease), that the recorded expiry
   advances with each renewal, and that `PutObject` to the attempt prefix keeps
   succeeding until the job completes. A companion test stops the heartbeat and
   asserts that, after the lease expires, the recovery pass re-claims the job
@@ -555,10 +643,34 @@ recovery pass re-claims its job, before it can commit a stale result.
   CLEANUP_GRACE`, and that no delete occurs while the orphaned credential is
   still valid — a write it issues before natural expiry is either rejected
   (revocation confirmed) or occurs before the sweep bound, never after it.
-- **Renewal all-or-nothing test**: a renewal whose STS call fails does not
-  extend the lease, and the worker either retries the combined renewal or stops
-  writing and fails retryably — it never reaches the state "lease alive, write
-  credential expired" (§12.1).
+- **Renewal all-or-nothing test (commit-last)**: a renewal whose STS call fails
+  or whose provider returns an expiry outside `[D, D + CREDENTIAL_SLACK]` commits
+  **no** lease extension — the lease and the credential expiry are written
+  together in step 3 only after a credential that covers the new window exists —
+  and the worker either retries the combined renewal or stops writing and fails
+  retryably; it never reaches the state "lease alive, write credential expired".
+  The test also asserts that after every committed renewal the invariant
+  `write_credential_expires_at ≥ lease_expires_at` holds (the credential never
+  expires before the lease), and that `lease_expires_at` is observed never to
+  advance unless `write_credential_expires_at` advances in the same transaction
+  to a value at least as late (§12.1). A
+  companion test drives a renewal that loses the fence after step 2 and asserts
+  the lease was not extended, recovery fences the job when the (unextended)
+  lease expires, and the sweeper deletes the prefix only after
+  `max(write_credential_expires_at, write_credential_reserved_until) +
+  CLEANUP_GRACE` (§4 rule 8).
+- **Commit-then-crash staging cleanup test**: a `convert` worker writes staging,
+  writes the complete `lake/…/version=<n>/attempt=<n>/` prefix, commits the
+  fenced `READY`/`SUCCEEDED` transition, and then crashes **before** deleting its
+  `staging/…/attempt=<n>/` prefix. The test asserts that the sweeper — once the
+  job is `SUCCEEDED` and
+  `now() > max(write_credential_expires_at, write_credential_reserved_until) +
+  CLEANUP_GRACE` — deletes the staging prefix (§4 rule 9), while the committed
+  `lake/…/attempt=<n>/` prefix (the `object_prefix`) is never deleted (§4 rules 6
+  and 7). A companion test asserts the sweeper never deletes the staging of a
+  still-`RUNNING`/`BUILDING` attempt (serialization, rule 7), and that a
+  successful attempt whose worker *did* delete its own staging is a no-op for the
+  sweeper (idempotent delete).
 
 ### 6.2 Retry and version numbering
 
@@ -572,6 +684,11 @@ recovery pass re-claims its job, before it can commit a stale result.
 - Retry is offered only for `FAILED` jobs marked `retryable` (worker crash,
   transient object-store error). A `CANCELLED` job is terminal and not retried;
   the operator submits a fresh ingestion instead.
+- A retry that re-reads the source upload is subject to the release/retry
+  mutual-exclusion protocol in §10: it may be created only while the source
+  job's `upload_released_at` is NULL (serialized on the source job's row lock),
+  and a retry requested after the upload was released must re-upload its input
+  as a fresh `convert` rather than reference the deleted source.
 - A retried job writes to a fresh `staging/…/attempt=<n>/` directory under a new
   job id, so it never collides with a crashed attempt's staging prefix; any stale
   staging prefix from a crashed attempt is reclaimed by the stale-attempt sweeper
@@ -693,8 +810,9 @@ and meta function listed in the denial set below.
 
 **Deny-by-default rule.** After alias normalization, any function name not
 present in the lists above is rejected. This includes future DuckDB functions,
-unlisted aliases, collations, and anything provided by a loaded extension
-(extensions are not loaded in v1). The allowlist is enforced at validation time
+unlisted aliases, collations, and anything provided by a loaded extension (the
+only loaded extension in v1 is the trusted, pinned `httpfs`, whose network
+functions are denied above; no user-loadable extension is loaded). The allowlist is enforced at validation time
 and again by the engine-level controls in §7.4.
 
 ### 7.3 Relation scope (what a query may reference)
@@ -710,7 +828,8 @@ and again by the engine-level controls in §7.4.
 
 ### 7.4 Engine-level enforcement (defense in depth, layered)
 
-The boundary is enforced by four layers. No single layer is trusted; the
+The boundary is enforced by four enforcement layers, preceded by a
+trusted-extension setup step (layer 0). No single layer is trusted; the
 parser/validator is the primary SQL control and the per-query scoped credential
 is the independently enforced object-store control. A keyword blacklist is never
 the boundary.
@@ -726,8 +845,11 @@ the boundary.
 > `autoload_known_extensions`, `autoinstall_known_extensions`,
 > `allow_unsigned_extensions`, `lock_configuration`, `allowed_configs`,
 > `memory_limit`, `threads`, `max_execution_time`,
-> `enable_global_s3_configuration`, and the Secrets Manager
-> (`CREATE SECRET … SCOPE`, where `SCOPE` is a path prefix) — is verified, with
+> `enable_global_s3_configuration`, the Secrets Manager
+> (`CREATE SECRET … SCOPE`, where `SCOPE` is a path prefix), and the trusted
+> `httpfs` extension (its pinned binary and SHA-256 checksum, the explicit
+> `LOAD` path, and the loaded-version verification via `duckdb_extensions()`) — is
+> verified, with
 > any discrepancy reconciled back into this document before implementation
 > relies on it. Until then, the engine-level layer (layer 4) and the scoped
 > secret selection (layer 3) are stated design targets, and the only boundary
@@ -737,6 +859,38 @@ the boundary.
 > pinned version. Phase 6 then pins each control with an adversarial test, so a
 > later DuckDB upgrade that changes behavior fails the test rather than silently
 > widening the surface.
+
+0. **Trusted HTTPFS extension (the only loaded extension; pinned and loaded by
+   trusted worker code before the connection is sealed).** Reading
+   S3-compatible objects requires DuckDB's `httpfs` extension, which ships with
+   the engine but is not enabled by default. The same extension also ships the
+   `http_get`/`http_post` network functions (denied to user SQL in §7.2), and any
+   extension load must be denied to user SQL. The worker therefore loads `httpfs`
+   itself on a code path user SQL can never reach, and only afterwards seals the
+   connection:
+
+   - **Pinned, local binary.** The worker image bundles the `httpfs` extension
+     binary for the exact pinned DuckDB version, and its SHA-256 checksum is
+     verified at build/deploy time. The binary is staged into the connection's
+     extension directory, which is read-only to the query process; it is loaded
+     from local disk, never downloaded from the extension repository at runtime.
+   - **Explicit, verifiable load.** Trusted worker code issues `LOAD httpfs` on
+     the execution connection, then asserts the loaded extension version equals
+     the pin (via the trusted `duckdb_extensions()` introspection call, which is
+     itself denied to user SQL, §7.2). A missing or mismatched extension fails
+     the query **closed** before any user statement runs.
+   - **Then seal.** Only after the trusted load does the worker set
+     `autoload_known_extensions=false`, `autoinstall_known_extensions=false`,
+     and `allow_unsigned_extensions=false` and lock the configuration (layer 4).
+     No user statement can trigger an extension load or install: `INSTALL`,
+     `LOAD`, and `FORCE INSTALL` are statement-denied (§7.1), no known extension
+     is auto-loaded or auto-installed, unsigned extensions are refused, and the
+     extension directory is not writable by the query process.
+
+   The trusted `LOAD` therefore executes on a different code path from user SQL:
+   it is worker code run before the validator (layer 1) ever sees a user
+   statement and before `lock_configuration` seals the connection, so it cannot
+   be reached, imitated, or widened by the query text.
 
 1. **Parser/AST validation (primary SQL boundary).** The user statement is
    parsed to an AST with a real parser. Before any engine work: the statement
@@ -795,7 +949,12 @@ the boundary.
    - `disabled_filesystems='LocalFileSystem'` — local filesystem I/O is disabled;
      only the S3-compatible httpfs filesystem remains for the registered reads.
    - `autoload_known_extensions=false`, `autoinstall_known_extensions=false`,
-     `allow_unsigned_extensions=false` — no extension load or install.
+     `allow_unsigned_extensions=false` — no *user- or auto-initiated* extension
+     load or install: user SQL cannot `INSTALL`/`LOAD`/`FORCE INSTALL` (§7.1), no
+     known extension is auto-loaded or auto-installed, and unsigned extensions
+     are refused. The sole loaded extension is the trusted, pinned `httpfs`,
+     loaded by worker code **before** these flags are set and the configuration
+     is locked (layer 0); it is never reachable from user SQL.
    - `enable_global_s3_configuration=false` — DuckDB never fetches ambient AWS
      credentials from the process environment, so an out-of-prefix read cannot
      fall back to a process-wide credential (see the fail-closed requirement
@@ -885,6 +1044,18 @@ The boundary is tested by both positive and adversarial cases (recorded in
   `enable_global_s3_configuration` is `false` and no unscoped secret is
   registered, so the read has no applicable credential.
 
+- **HTTPFS extension pin test**: the worker's connection setup loads `httpfs`
+  from the pinned local binary and asserts the loaded version equals the pin,
+  failing closed on a missing or mismatched binary; with the connection sealed
+  (`autoload_known_extensions=false`, `autoinstall_known_extensions=false`,
+  `allow_unsigned_extensions=false`, `lock_configuration=true`), user SQL
+  attempting `INSTALL`, `LOAD`, `FORCE INSTALL`, or any known-extension
+  reference is denied with `query_denied` and no extension is loaded or
+  installed; and a registered S3 dataset read succeeds only through the trusted
+  pinned `httpfs` load — never through autoload/autoinstall. A companion test
+  removes the bundled extension binary and asserts the worker fails closed
+  before executing any query.
+
 These behaviors are pinned in phase 6 with adversarial tests, including a
 sentinel object placed outside every registered prefix that a passing test must
 never observe.
@@ -906,8 +1077,9 @@ never observe.
     STS credential whose policy allows write to exactly this attempt's
     `staging/<namespace>/<dataset>/<job-id>/attempt=<n>/` and
     `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/` prefixes and whose TTL
-    is the remaining lease duration at issuance time, so it expires no later than
-    the attempt's current `lease_expires_at` (the actual expiry is recorded as
+    is the full lease window plus a slack margin at issuance time, so it expires
+    no earlier than the attempt's current `lease_expires_at` — the credential
+    covers the entire lease window (the actual expiry is recorded as
     `write_credential_expires_at`, §3.1). There is **no** long-lived,
     deployment-wide `lake/` or `staging/` write credential on the ingestion path;
     this is what lets the sweeper guarantee "no writes after delete" (§4 rule 8,
@@ -996,7 +1168,7 @@ never observe.
 |---|---|
 | `lake/` Parquet objects | Retained for the life of the deployment. Archive does **not** delete them (unarchive is reversible); no automatic deletion in v1. Hard delete/GC is out of scope. |
 | Original uploads | `retain_original=true`: retained for the life of the deployment (no auto-delete). `retain_original=false`: deleted promptly after the version reaches `READY`; on a terminal `FAILED`/`CANCELLED`/crash-recovered job, retained for `UPLOAD_RETRY_WINDOW` (default 7 days, max 90 days) so a retry can reuse the input, then deleted |
-| `staging/` objects | Successful attempt: removed by the transitioning worker after conversion completes. Failed/cancelled/crashed attempt: reclaimed only by the stale-attempt sweeper after `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE` (§4 rules 6 and 8) — never at the cancel/fail transition itself |
+| `staging/` objects | Reclaimed by the stale-attempt sweeper once the job is terminal (`SUCCEEDED`, `FAILED`, or `CANCELLED`) and after `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE` (§4 rules 6, 8, and 9) — never at the transition itself. A successful attempt's staging is best-effort deleted by the worker after the `READY` commit, but the sweeper is the authoritative backstop, so a worker that crashes after the commit strands nothing |
 | `exports/` (results/exports) | TTL default 24h, swept |
 | query_job history rows | Bounded retention (default 30 days, configurable); the SQL statement is retained for the job's full lifetime and is never purged or overwritten before the job reaches a terminal state; after that the statement and its `statement_hash` are removed together with the row under the same retention window. There is no separate hash store, so no hash outlives its row |
 | Failed version error summaries | Retained with the version for its lifetime (archive does not delete version rows) |
@@ -1020,15 +1192,57 @@ so no upload is ever left indefinitely:
     re-stage the same input; after the window it is deleted even if no retry was
     ever submitted. The window is a bound on *retention*, not a promise of
     indefinite input availability.
-- **Cleanup.** A catalog-driven upload sweeper deletes
-  `uploads/<namespace>/<dataset>/<job-id>/` only when the catalog proves the
-  prefix is due: the job is terminal (`SUCCEEDED`/`FAILED`/`CANCELLED`), the
-  dataset's `retain_original` is `false`, and either the version reached `READY`
-  (success) or `now() > finished_at + UPLOAD_RETRY_WINDOW` (non-success). It
-  never deletes the upload of a `QUEUED`/`RUNNING` job, and it never deletes an
-  upload while a retry (`retry_of` = this job) is still `QUEUED`/`RUNNING` and
-  has not yet re-staged the input. The sweep is idempotent and re-derives the
-  due set from the catalog each pass, so a crashed sweeper re-runs safely.
+- **Cleanup is serialized against retry creation (release ↔ retry mutual
+  exclusion).** Upload release and retry are made mutually exclusive by a shared
+  catalog lock and a durable release flag, so (a) a concurrent retry can never
+  have its source upload deleted while it is reading or re-staging it, and (b) no
+  retry can be created after the upload is released. Both operations serialize on
+  the **row lock of the job that owns the upload** — the `ingestion_job` whose id
+  appears in the `uploads/<namespace>/<dataset>/<job-id>/` key:
+
+  - **Durable state.** `upload_released_at` (timestamptz, NULL until released) is
+    the single durable flag that the owning job's upload prefix has been declared
+    due and handed to the lifecycle rule; it is written only by the release
+    transaction below, and once set it is a barrier no dependent retry may cross.
+    `source_upload_consumed_at` (timestamptz, NULL until consumed) is set by a
+    retry the moment it has finished re-staging the source upload into its own
+    staging prefix, after which it no longer reads the source.
+  - **Release (one transaction, commit-last).** The upload sweeper runs, in a
+    single transaction: `SELECT … FOR UPDATE` on the owning job row; re-read the
+    job and verify the release precondition — the job is terminal
+    (`SUCCEEDED`/`FAILED`/`CANCELLED`), the dataset's `retain_original` is
+    `false`, and either the version reached `READY` (success) or
+    `now() > finished_at + UPLOAD_RETRY_WINDOW` (non-success) — **and** that no
+    dependent retry is still relying on the source: there is no row with
+    `retry_of` = this job whose `status IN ('QUEUED','RUNNING')` and
+    `source_upload_consumed_at IS NULL`. If all hold, set
+    `upload_released_at = now()`; commit. If any condition fails, nothing is
+    committed and the upload is not released.
+  - **Retry creation (one transaction, commit-last).** Creating a retry that
+    re-reads the source upload runs, in a single transaction: `SELECT … FOR
+    UPDATE` on the owning job row; verify the source job is `FAILED` and
+    `retryable`, and that `upload_released_at IS NULL`. If `upload_released_at`
+    is already set, the upload has been released, so the retry **cannot
+    reference it**: the request is refused (the operator must re-upload the input
+    as a fresh `convert`). Otherwise the new `ingestion_job` is inserted with
+    `retry_of` = the owning job in the same transaction; commit.
+  - **Why this is race-free.** Because both transactions `SELECT … FOR UPDATE`
+    the same owning job row, they are totally ordered. If retry creation commits
+    first, its new dependent row is visible to release's under-lock check, which
+    then skips the upload. If release commits first, `upload_released_at` is
+    visible to retry creation's under-lock check, which then refuses to reference
+    the source. There is no interleaving in which a retry references a released
+    upload, and none in which release deletes an upload a retry still depends on.
+  - **External action (after commit, idempotent).** Only after the release
+    transaction commits does the sweeper perform the object-store action: it
+    re-tags the upload objects `lakehouse-upload-retain=release` and records
+    `lakehouse-upload-release-at=<finished_at + UPLOAD_RETRY_WINDOW>` (arming the
+    tag-filtered lifecycle rule below), and may also delete the prefix directly
+    (idempotent). Because `upload_released_at` is durable, a sweeper that crashes
+    after the commit but before the re-tag re-derives the released prefix on the
+    next pass and completes the re-tag; no retry can be created in the interim
+    because the flag is already set. The sweep is idempotent and re-derives the
+    due set from the catalog each pass, so a crashed sweeper re-runs safely.
 - **No blanket age-based lifecycle rule on `uploads/`.** The upload retention
   decision depends on catalog state an age rule cannot observe — the job's
   terminal status, the dataset's `retain_original`, a retry window measured from
@@ -1047,27 +1261,33 @@ so no upload is ever left indefinitely:
      so a retained (`retain_original=true`), `QUEUED`/`RUNNING`, or
      still-within-window upload can never be expired no matter how long it has
      existed.
-  2. When the catalog sweeper proves a prefix due (terminal, `retain_original`
-     is `false`, and either `READY` or `now() > finished_at +
-     UPLOAD_RETRY_WINDOW`, with no in-flight retry that has not re-staged), it
-     re-tags the upload objects `lakehouse-upload-retain=release` and records
-     `lakehouse-upload-release-at=<due-time>`. The re-tag is the only event that
-     arms the lifecycle rule, so deletion remains driven by the catalog decision
-     and the retry window is measured from `finished_at` — accounting for
-     arbitrary job duration rather than object age. The sweeper may also delete
-     the prefix itself directly (idempotent); the tag-filtered lifecycle rule is
-     the backstop that completes the delete after the grace even if the sweeper
-     dies mid-delete.
+  2. Only after the release transaction has set `upload_released_at` does the
+     sweeper re-tag the upload objects `lakehouse-upload-retain=release` and
+     record `lakehouse-upload-release-at=<finished_at + UPLOAD_RETRY_WINDOW>`.
+     The re-tag is the only event that arms the lifecycle rule, so deletion
+     remains driven by the catalog decision and the retry window is measured from
+     `finished_at` — accounting for arbitrary job duration rather than object age.
+     The release flag (not the tag) is what blocks retries; the tag only arms the
+     object-store rule. The sweeper may also delete the prefix itself directly
+     (idempotent); the tag-filtered lifecycle rule is the backstop that completes
+     the delete after the grace even if the sweeper dies mid-delete.
   3. Uploads are written once at upload time and are never rewritten or appended
      to by ingestion or retry, so no write-quiescence wait applies to upload
      deletion (unlike `lake/`/`staging/`, §4 rules 6–8); the retry re-reads the
      original rather than re-writing it.
-- **Retry and re-staging.** A retry (`retry_of` = the failed job) re-reads the
-  original upload under the failed job's `uploads/…/<job-id>/` prefix and
-  re-stages it into its own `staging/…/attempt=<n>/`; from that point the retry
-  no longer depends on the original upload, so the original can be deleted at
-  the window's close without affecting the in-flight retry. A retry that is not
-  submitted within the window re-uploads its input.
+- **Retry and re-staging.** A retry (`retry_of` = the owning job) re-reads the
+  original upload under the owning job's `uploads/…/<job-id>/` prefix and
+  re-stages it into its own `staging/…/attempt=<n>/`; the moment the re-stage
+  completes it sets `source_upload_consumed_at`, so from that point the retry no
+  longer depends on the original upload and the original can be released/deleted
+  at the window's close without affecting the in-flight retry (the release
+  transaction's under-lock check observes `source_upload_consumed_at` and no
+  longer treats the retry as dependent). A retry created after the upload was
+  released (`upload_released_at` set) cannot re-read the source and must
+  re-upload its input as a fresh `convert` (§6.2). The exclusion holds regardless
+  of submission order: a retry submitted before release proceeds under the shared
+  lock and delays release until it re-stages; a retry submitted after release is
+  refused.
 - **Testability**: a `convert` job whose version reaches `READY` has its upload
   deleted when `retain_original=false` and retained when `retain_original=true`;
   a failed/cancelled/crash-recovered job retains its upload until
@@ -1079,6 +1299,21 @@ so no upload is ever left indefinitely:
   (retained, `QUEUED`/`RUNNING`, or within the retry window) even after its age
   exceeds any configured duration, and only expires an upload after it is
   re-tagged `lakehouse-upload-retain=release` by the sweeper.
+- **Release/retry race test**: two transactions race on the owning job's row
+  lock — one performs the release (verify due and no dependent retry, then set
+  `upload_released_at`) and one creates a retry (verify `upload_released_at IS
+  NULL`, then insert a `retry_of` row). The test drives both orderings and
+  asserts the invariant that release and a dependent retry are never both
+  committed: (1) release-then-retry — retry creation is refused (or requires a
+  fresh upload) because `upload_released_at` is set, and the source upload is
+  never re-read by a retry; (2) retry-then-release — release observes the
+  un-consumed dependent retry under the lock, does **not** set
+  `upload_released_at`, and does not re-tag or delete the upload until the retry
+  sets `source_upload_consumed_at`, after which the next release pass proceeds.
+  A concurrency test runs the two transactions in parallel many times and asserts
+  no interleaving produces both a released upload and a dependent retry, and that
+  the object-store re-tag/delete never removes an upload a committed retry is
+  still reading.
 
 ## 11. API error contract
 
@@ -1137,7 +1372,7 @@ only pin a default where a test explicitly chooses to.
 | Query lease duration (`QUERY_LEASE_DURATION`) | 120s | max 600s |
 | Lease heartbeat interval | `LEASE_DURATION / 3` | `< LEASE_DURATION − LEASE_RENEWAL_MARGIN` |
 | Lease renewal margin (`LEASE_RENEWAL_MARGIN`) | 30s | configurable |
-| Write-credential TTL slack (`CREDENTIAL_SLACK`) | 30s | configurable |
+| Write-credential slack margin (`CREDENTIAL_SLACK`) | 30s | configurable, covers STS latency + clock skew |
 | Min write-credential TTL (`MIN_WRITE_CREDENTIAL_TTL`) | 30s | configurable |
 | Cleanup grace (`CLEANUP_GRACE`) | 15m | configurable |
 | Upload retention window (`UPLOAD_RETRY_WINDOW`) | 7 days | max 90 days |
@@ -1178,40 +1413,73 @@ liveness is carried entirely by the lease.
   `status='RUNNING'`:
   `UPDATE … SET lease_expires_at = now() + LEASE_DURATION WHERE id=? AND
   fencing_token=? AND status='RUNNING'`. A renewal that affects zero rows means
-  the worker was fenced; it must abort without writing or committing. The
+  the worker was fenced; it must abort without writing or committing. This plain
+  lease extension is the whole heartbeat for a **query** job (which holds no
+  write credential); an **ingestion** job never performs this extension alone —
+  its heartbeat is the combined commit-last renewal in the next bullet, and its
+  `lease_expires_at` is advanced only in that renewal's step 3. The
   heartbeat interval must satisfy
   `LEASE_HEARTBEAT_INTERVAL + LEASE_RENEWAL_MARGIN < LEASE_DURATION`, where
   `LEASE_RENEWAL_MARGIN` (default 30s) covers scheduling delay and a renewal
   round-trip; configuration validation rejects any combination that violates
   this precondition, and a test asserts it.
-- **Renewal and write credentials (ingestion only).** Ingestion renewal is
-  all-or-nothing and follows the same reserve → issue → persist ordering as
-  initial issuance, so the invariant `write_credential_expires_at ≤
-  lease_expires_at` holds at every instant. On each renewal the worker (a)
-  computes the target lease `new_lease = now() + LEASE_DURATION`, (b) commits a
-  conditional update keyed on the current token and `status='RUNNING'` that sets
-  `lease_expires_at = new_lease` and
-  `write_credential_reserved_until = new_lease − CREDENTIAL_SLACK`, (c) requests
-  a write credential whose TTL is at most `reserved_until − now()` (so its
-  actual expiry is ≤ `reserved_until`), and (d) persists the credential's actual
-  expiry and clears the reservation in a second conditional update keyed on the
-  current token and `status='RUNNING'`. If the worker is fenced after (b) but
-  before (d), the durable reservation still bounds every credential it could have
-  obtained, so the sweeper waits on
-  `max(write_credential_expires_at, write_credential_reserved_until)` and never
-  deletes a prefix a fenced renewal's credential can still write to (§4 rule 8).
-  If the credential cannot be re-issued (STS failure, or the remaining TTL would
-  fall below `MIN_WRITE_CREDENTIAL_TTL`), the worker does **not** extend the
-  lease — it keeps the existing credential and lease and retries the combined
-  renewal — so it can never reach the state "lease alive, write credential
-  expired" that would silently strip a live ingestion's write capability. A
-  worker that cannot complete a combined renewal before its current credential
-  expires stops writing and fails the job retryably (the same path as
-  credential-issuance failure, §6.1); the stale-attempt sweeper reclaims the
-  prefix after the reservation/expiry bound plus `CLEANUP_GRACE` (§4 rule 8). An
-  active ingestion therefore never loses its write capability mid-job: its
-  credential is re-issued at least as often as its lease is renewed and always
-  expires no later than the lease.
+- **Renewal and write credentials (ingestion only, commit-last).** Ingestion
+  renewal follows the reserve → issue → persist ordering of §6.1, but the lease
+  extension is moved to the persist step so that **the lease is never extended
+  before a replacement credential that covers the new window is usable.** On
+  each renewal the worker:
+  1. **Reserve (no lease change).** computes the target new deadline
+     `D = now() + LEASE_DURATION` and the reservation bound
+     `reserved_until = D + CREDENTIAL_SLACK`, then commits a
+     conditional update keyed on the current token and `status='RUNNING'` that
+     sets `write_credential_reserved_until = reserved_until` **only** — it does
+     **not** change `lease_expires_at`. A zero-row result means fenced → no
+     credential is requested.
+  2. **Issue.** requests a write credential whose TTL is
+     `reserved_until − now()` (so its nominal expiry is `reserved_until`) and
+     **verifies** the provider's actual expiry `E` satisfies
+     `D ≤ E ≤ reserved_until`; an expiry outside either bound is rejected as an
+     issuance failure.
+  3. **Commit lease + expiry (atomic, conditional).** in a single conditional
+     update keyed on the current token and `status='RUNNING'`, sets
+     `lease_expires_at = D` **and**
+     `write_credential_expires_at = E` and clears the reservation.
+     **Only this step extends the lease**, and no `staging/`/`lake/` write may
+     use the *old* credential once it is known the lease is not being extended.
+  Because the lease extension and the credential's persisted expiry are written
+  in one transaction and `E ≥ D = lease_expires_at`,
+  `write_credential_expires_at ≥ lease_expires_at` holds at every instant a
+  credential exists, and the worker has a usable credential for the entire new
+  window (the credential never expires before the lease). If the worker is
+  fenced after step 1 or step 2 but before step 3, the durable reservation still
+  bounds every credential it could have obtained (a step-2 credential has actual
+  expiry `E ≤ reserved_until`), and the lease was **not** extended — so the job
+  proceeds toward lease expiry and recovery, and the sweeper waits on
+  `max(write_credential_expires_at, write_credential_reserved_until)` before
+  deleting (§4 rule 8). If the credential cannot be re-issued (STS failure, a
+  provider expiry outside `[D, reserved_until]`, or the requested TTL falling
+  below `MIN_WRITE_CREDENTIAL_TTL`), step 3 is not committed and **the lease is
+  not extended**; the worker keeps its existing credential and lease and retries
+  the combined renewal within the current window. A worker that cannot commit a
+  step 3 before its current lease would expire —
+  `now() ≥ lease_expires_at` — stops writing and fails the job
+  retryably: it releases the claim
+  (`status='FAILED'`, `retryable=true`, `attempt=attempt+1`,
+  `fencing_token=NULL`, `lease_owner=NULL`, `lease_expires_at=NULL`) and carries
+  the write-quiescence bound forward —
+  `write_credential_expires_at = GREATEST(COALESCE(write_credential_expires_at,
+  'epoch'), COALESCE(write_credential_reserved_until, 'epoch'))` — retaining the
+  reservation, so the existing credential and any reservation still bound the
+  sweeper (§4 rule 8). If it fails to do so in time, the lease (never later than
+  the credential) also expires and the recovery pass fences the job by the same
+  carry-forward rule (§6.1), so a job is never left `RUNNING` under an extended
+  lease without write capability. The stale-attempt sweeper reclaims the prefix
+  only after
+  `max(write_credential_expires_at, write_credential_reserved_until) +
+  CLEANUP_GRACE` (§4 rule 8). An active ingestion therefore never runs out of
+  write capability mid-job: its lease is renewed only together with a credential
+  that covers the new window, and the credential always expires no earlier than
+  the lease.
 - **Query requeue is liveness-only.** Because a healthy worker renews the query
   lease continuously while the query runs, requeue (the recovery pass's
   `lease_expires_at < now()` transition, §13) fires only when the worker stops
