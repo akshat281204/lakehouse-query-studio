@@ -17,7 +17,10 @@ later):
 
 - Distributed/multi-node query execution; any future engine (Trino, etc.) is
   deferred until a measured need justifies it.
-- Multi-tenant identity, billing, governance, or a semantic BI layer.
+- Multi-tenant identity, per-user authentication/authorization, RBAC, billing,
+  governance, or a semantic BI layer. v1 is a single-operator, single-namespace
+  deployment; the caller trust model and the enforceable exposure boundary are
+  defined in §15.
 - Arbitrary user-installed DuckDB extensions or unrestricted file/URL access.
 - Iceberg/Delta/Hudi catalog semantics.
 
@@ -57,9 +60,14 @@ storage (immutable data); in-memory state is always reconstructible.
 Dataset status: `ACTIVE` ↔ `ARCHIVED`.
 
 - A dataset is created (ACTIVE) when its first version is requested.
-- `ARCHIVED` is a soft delete: the dataset stops appearing in discovery and
-  query views, but its versions and objects are retained per the retention
-  policy (§10). Archive is reversible; hard delete is out of scope in v1.
+- `ARCHIVED` is a reversible soft delete implemented at the catalog layer only.
+  Archiving a dataset sets its status to `ARCHIVED`: it stops appearing in
+  discovery, schema/preview, and query views, and no new ingestion or query job
+  may target it. Archive **does not delete any version rows or any objects**;
+  it only flips the status. Because the underlying versions and objects are
+  untouched, unarchive (returning the dataset to `ACTIVE`) is always reversible
+  and requires no data restoration. Hard delete and object GC are out of scope
+  in v1 (§10).
 - A dataset may have zero `READY` versions while its first version is being
   built or has failed; it is still an ACTIVE dataset record.
 
@@ -166,52 +174,102 @@ transaction statements (`BEGIN`, `COMMIT`, `ROLLBACK`), `USE`, multiple
 statements (including semicolon-separated), user-supplied `EXPLAIN`/
 `EXPLAIN ANALYZE`, and any `VALUES`-top-level statement.
 
-### 7.2 Allowed functions
+### 7.2 Allowed functions (exhaustive, deny-by-default)
 
-Functions are allow-listed by category. The lists below are representative
-(the implementation enforces the allow-list from the parser/engine, and the
-adversarial tests in §7.5 pin the boundary), and they are all read-only and
-non-I/O.
+The function surface is a **closed, compile-time allowlist**. The worker
+resolves every function reference — after Unicode case-folding and alias
+normalization — against this fixed list and rejects any name that is not
+present. The list is a constant compiled into the worker; it is **not** derived
+by enumerating DuckDB's runtime function catalog, so a later DuckDB release
+that adds functions does not silently widen the surface. Everything not
+enumerated below — unlisted aliases, user-defined functions, table macros, and
+extension-provided functions — is denied with `query_denied`.
 
-Allowed categories:
+**Operators.** Comparison (`=`, `<>`/`!=`, `<`, `<=`, `>`, `>=`); logical
+(`AND`, `OR`, `NOT`); arithmetic (`+`, `-`, `*`, `/`, integer division `//`,
+`%`, `^`, unary `+`/`-`); string concatenation (`||`); `IS [NOT] NULL`;
+`IS [NOT] DISTINCT FROM`; `[NOT] BETWEEN`; `[NOT] IN`; `[NOT] LIKE`;
+`[NOT] ILIKE`; `[NOT] SIMILAR TO`; regex match `~`, `!~`, `~*`, `!~*`; and the
+subscript `[]` operator for 1-based list/array indexing and map key lookup.
+`CASE`/`WHEN`/`THEN`/`ELSE` is a language construct and is allowed.
 
-- Comparison/logical/arithmetic operators; `CAST`, `::`, `TRY_CAST`, `typeof`.
-- String: `lower`, `upper`, `trim`, `ltrim`, `rtrim`, `length`, `substr`,
-  `substring`, `concat`, `concat_ws`, `replace`, `reverse`, `split`,
-  `string_split`, `position`, `instr`, `left`, `right`, `lpad`, `rpad`,
-  `repeat`, `starts_with`, `ends_with`, `contains`, `like`/`ilike`,
-  `regexp_matches`, `regexp_replace`, `regexp_extract`.
-- Numeric/math: `abs`, `round`, `floor`, `ceil`/`ceiling`, `sqrt`,
-  `pow`/`power`, `exp`, `ln`, `log`, `log10`, `sign`, `mod`, `greatest`,
-  `least`.
-- Date/time: `current_date`, `current_time`, `current_timestamp`, `now`,
-  `date_trunc`, `date_part`, `date_diff`, `date_add`, `date_sub`, `extract`,
-  `strftime`, `make_date`, `make_time`, `make_timestamp`, `epoch`,
-  `to_timestamp`, `year`, `month`, `day`, `hour`, `minute`, `second`.
-- Null/conditional: `coalesce`, `nullif`, `ifnull`, `if`, `case`.
-- Aggregates: `count`, `sum`, `avg`, `min`, `max`, `count_distinct`,
-  `approx_count_distinct`, `stddev`, `stddev_pop`, `stddev_samp`, `variance`,
-  `var_pop`, `var_samp`, `median`, `quantile_cont`, `quantile_disc`, `arg_min`,
-  `arg_max`, `string_agg`, `list`, `array_agg`, `first`, `last`, `bool_and`,
-  `bool_or`, `bit_and`, `bit_or`, `bit_xor`.
-- Window functions (used with `OVER`): `row_number`, `rank`, `dense_rank`,
-  `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`,
-  `last_value`, `nth_value`.
-- Struct/list read-only access: column de-referencing, `unnest` over list/struct
-  columns, and list/struct accessor functions that do not open files or URLs.
+**Casts and type predicates.** `CAST(expr AS type)`, the `::` operator,
+`TRY_CAST`, and `typeof`.
 
-Explicitly denied (the I/O and control surface, regardless of the allow-list):
+**String.** `lower`, `upper`, `trim`, `ltrim`, `rtrim`, `length` (alias `len`),
+`substring` (alias `substr`), `concat`, `concat_ws`, `replace`, `reverse`,
+`split` (aliases `string_split`, `str_split`), `string_to_array`, `position`
+(alias `strpos`), `left`, `right`, `lpad`, `rpad`, `repeat`, `starts_with`,
+`ends_with`, `contains`, `prefix`, `suffix`, `regexp_matches`,
+`regexp_replace`, `regexp_extract`, `regexp_full_match`.
 
-- File/table functions: `read_csv`, `read_csv_auto`, `read_json`,
-  `read_json_auto`, `read_ndjson`, `read_parquet`, `parquet_scan`, `read_text`,
-  `read_blob`, `glob`, `sniff_csv`, `sniff_parquet`.
-- Network/URL: `http_get`, `http_post`, any `httpfs`/`s3` URL-taking function,
-  and any function accepting a `url`, `path`, or `filename` argument.
-- Session/system/config: `current_setting`, `set_config`, `current_schema`,
-  secret-related functions, and `duckdb_*` introspection that exposes the
-  filesystem or settings.
-- Extension/module management (already statement-denied, re-listed here for
-  function completeness): `INSTALL`, `LOAD`.
+**Numeric / math.** `abs`, `sign`, `round`, `floor`, `ceil` (alias `ceiling`),
+`sqrt`, `pow` (alias `power`), `exp`, `ln`, `log`, `log2`, `log10`, `mod`,
+`greatest`, `least`.
+
+**Date / time.** `current_date`, `current_time`, `current_timestamp` (alias
+`now`), `date_trunc` (alias `datetrunc`), `date_part` (alias `datepart`),
+`date_diff` (alias `datediff`), `date_add` (alias `dateadd`), `date_sub` (alias
+`datesub`), `extract`, `strftime`, `make_date`, `make_time`, `make_timestamp`,
+`epoch`, `to_timestamp`, `year`, `month`, `day`, `hour`, `minute`, `second`,
+`dayofmonth`, `dayofweek`, `dayofyear`, `week`, `quarter`. `extract` and
+`date_part` accept only the fields `year, month, day, hour, minute, second,
+millisecond, microsecond, dow, isodow, doy, week, quarter, epoch, decade,
+century, millennium`.
+
+**Null / conditional.** `coalesce`, `nullif`, `ifnull`, `if`, and `CASE`
+(construct).
+
+**Aggregates** (usable with `DISTINCT`, `ORDER BY`, and `FILTER (WHERE …)`
+where DuckDB permits them). `count` (including `count(*)`), `sum`, `avg` (alias
+`mean`), `min`, `max`, `approx_count_distinct`, `stddev` (alias `stddev_samp`),
+`stddev_pop`, `variance` (alias `var_samp`), `var_pop`, `median`, `mode`,
+`quantile_cont` (alias `quantile`), `quantile_disc`, `arg_min` (alias
+`min_by`), `arg_max` (alias `max_by`), `string_agg` (alias `group_concat`),
+`list` (alias `array_agg`), `first`, `last`, `any_value`, `bool_and`,
+`bool_or`, `bit_and`, `bit_or`, `bit_xor`.
+
+**Window functions** (only inside an `OVER (...)` clause). `row_number`,
+`rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`,
+`first_value`, `last_value`, `nth_value`.
+
+**Nested types (struct / list / map), read-only accessors only.**
+
+- Struct: field dereference `s.field` (and chained `s.a.b`), and
+  `struct_extract(s, 'field')`.
+- List/array: subscript `l[1]` (1-based), `list_extract(l, idx)`, and
+  `array_extract(l, idx)`; `length`/`len` for list size.
+- Map: subscript `m['key']`, `map_extract(m, 'key')`, and
+  `map_extract_value(m, 'key')`.
+- Expansion: `unnest` (see table functions below).
+
+No other `struct_*`, `list_*`, `array_*`, or `map_*` function is allowed;
+`struct_pack` and other constructors are denied.
+
+**Table functions.** Exactly one is allowed: `unnest`. All other table
+functions are denied, including `range`, `generate_series`, and every reader
+and meta function listed in the denial set below.
+
+**Explicitly denied (also covered by deny-by-default, listed for clarity).**
+
+- File/table readers and metadata: `read_csv`, `read_csv_auto`, `read_json`,
+  `read_json_auto`, `read_ndjson`, `read_ndjson_auto`, `read_parquet`,
+  `parquet_scan`, `parquet_metadata`, `parquet_schema`, `read_text`,
+  `read_blob`, `glob`, `list_files`, `sniff_csv`, `sniff_parquet`, and any
+  other `read_*` function.
+- Network / URL: `http_get`, `http_post`, any `httpfs` function, and any
+  function accepting a `url`, `path`, `filename`, or `secret` argument.
+- Session / system / config / secret: `current_setting`, `set_config`,
+  `current_schema`, `current_catalog`, `current_user`, `session_user`,
+  `version`, `gen_random_uuid`, `uuid`, `random`, `random_normal`, and every
+  `duckdb_*` introspection function.
+- Extension / module management (also statement-denied): `INSTALL`, `LOAD`.
+
+**Deny-by-default rule.** After alias normalization, any function name not
+present in the lists above is rejected. This includes future DuckDB functions,
+unlisted aliases, collations, and anything provided by a loaded extension
+(extensions are not loaded in v1). The allowlist is enforced at validation time
+and again by the engine-level controls in §7.4.
 
 ### 7.3 Relation scope (what a query may reference)
 
@@ -224,28 +282,66 @@ Explicitly denied (the I/O and control surface, regardless of the allow-list):
 
 ### 7.4 Engine-level enforcement (defense in depth)
 
-The boundary is enforced by layers, never by a keyword blacklist alone:
+The boundary is enforced by layers, never by a keyword blacklist alone. Reads of
+registered Parquet happen through DuckDB's S3/HTTPFS filesystem; the
+`enable_external_access=false` gate does **not** remove that capability — it
+removes the *user's* ability to perform external I/O, and the worker re-enables
+its own registered-prefix reads through an explicit path allowlist.
 
-1. **Parser**: SQL is parsed with a real parser to an AST; statement count,
-   statement type, table references, and function calls are validated as above.
-2. **Engine mode**: DuckDB is opened with `access_mode=read_only`,
-   `enable_external_access=false`, unsigned extensions disabled, and
-   `INSTALL`/`LOAD` unavailable.
-3. **Generated-view execution**: for each validated query, the worker creates
-   the referenced catalog views in a per-query, read-only database connection
-   and executes the user statement against only those views. Arbitrary object
-   access is therefore impossible even if one layer is bypassed.
+1. **Parser/AST validation**: SQL is parsed with a real parser to an AST;
+   statement count, statement type, table references, and function calls are
+   validated against §7.1–§7.3 before any engine work begins. No user statement
+   ever contains a table function, a file/URL scalar function, or a path/URL
+   literal, so there is no user-supplied "arbitrary path" to evaluate.
+
+2. **Trusted bootstrap (worker code, not user SQL)**: the worker opens the
+   per-query DuckDB connection with server-side S3 credentials and creates one
+   generated view per referenced `READY` version,
+   `CREATE VIEW catalog.<dataset>_v<n> AS SELECT * FROM parquet_scan('s3://…/lake/<namespace>/<dataset>/version=<n>/**')`.
+   The prefix is taken from the catalog, never from user input. The worker then
+   sets `allowed_directories`/`allowed_paths` to exactly the registered prefixes
+   the query may touch (and the `exports/` spool prefix), so the generated views
+   can read under an otherwise-locked engine.
+
+3. **Locked execution (user SQL)**: before the user statement runs, the worker
+   applies `access_mode=read_only`, `enable_external_access=false`,
+   `lock_configuration=true` (with `allowed_configs` limited to the query-budget
+   settings), `allow_unsigned_extensions=false`, extension auto-install/autoload
+   disabled, and `disabled_filesystems` set to disable `LocalFileSystem` (and
+   any other filesystem not required for the S3-compatible backend). Under
+   `enable_external_access=false`, any user attempt to invoke a file/URL reader,
+   `COPY`, `INSTALL`/`LOAD`, or a local or arbitrary S3 path is rejected at bind
+   time; the only reads that still succeed are those under
+   `allowed_directories`/`allowed_paths`, which the worker populated with the
+   registered prefixes.
+
 4. **Secret scoping**: object-store credentials are injected server-side with
-   least privilege and are never present in the SQL text or the client.
+   least privilege (query scope: read `lake/` and read/write `exports/` only)
+   and are never present in the SQL text or the client. Even if every DuckDB
+   layer above were bypassed, the credential's IAM policy denies reads outside
+   the registered prefixes.
 
 ### 7.5 Testability
 
-The boundary is tested by adversarial cases that must fail (recorded in
-`plan/06-security-and-observability.md`): DDL/DML, `COPY`, `ATTACH`,
-`INSTALL`/`LOAD`, `EXPORT`, multiple statements, local paths
-(`read_csv('/etc/…')`), arbitrary S3 URLs, `http_get`, extension loading, reads
-of an unregistered prefix, and oversized result requests. Each must be denied
-and must not read data outside registered prefixes.
+The boundary is tested by both positive and adversarial cases (recorded in
+`plan/06-security-and-observability.md`):
+
+- **Registered queries succeed**: a validated `SELECT` over
+  `catalog.<dataset>_v<n>` returns rows for every `READY` version; joins and
+  aggregates across two registered versions of the same or different datasets
+  succeed; `unnest` over a list/struct column succeeds.
+- **Out-of-prefix denial must fail**: DDL/DML, `COPY`, `ATTACH`, `INSTALL`/
+  `LOAD`, `EXPORT`, `PRAGMA`, `SET`, `CALL`, multiple statements, local paths
+  (`read_csv('/etc/…')`), arbitrary S3 URLs
+  (`read_parquet('s3://bucket/uploads/…')`, an unregistered prefix, a different
+  dataset's prefix), `http_get`, extension loading, unlisted functions (e.g.,
+  `read_text`, `current_setting`, `gen_random_uuid`), and oversized result
+  requests. Each must be denied with `query_denied` (or the mapped engine/limit
+  error) and must read no data outside the registered prefixes.
+
+Both behaviors are pinned in phase 6 with adversarial tests, including a
+sentinel object placed outside every registered prefix that a passing test must
+never observe.
 
 ## 8. Object access and credentials
 
@@ -282,12 +378,12 @@ and must not read data outside registered prefixes.
 
 | Data | Retention |
 |---|---|
-| `lake/` Parquet objects | Until the dataset/version is archived; no automatic deletion in v1 |
+| `lake/` Parquet objects | Retained for the life of the deployment. Archive does **not** delete them (unarchive is reversible); no automatic deletion in v1. Hard delete/GC is out of scope. |
 | Original uploads | Deleted after `READY` unless `retain_original=true` |
 | `staging/` objects | Deleted immediately on success or failure |
 | `exports/` (results/exports) | TTL default 24h, swept |
 | query_job history rows | Bounded retention (default 30 days, configurable); SQL text retention configurable (hash always kept) |
-| Failed version error summaries | Retained with the version until archive |
+| Failed version error summaries | Retained with the version for its lifetime (archive does not delete version rows) |
 
 ## 11. API error contract
 
@@ -326,6 +422,12 @@ Codes (enum) and status mapping:
 Safety rules for errors: never echo SQL text, object keys, credentials, or
 filesystem paths; messages are length-bounded; field-level `details` is typed
 and sanitized.
+
+`unauthorized` (401) and `forbidden` (403) have precise meanings under the
+trust model in §15: `unauthorized` means a missing or invalid deployment token
+when token authentication is enabled; `forbidden` means the authenticated
+caller's operation is refused by a deployment policy gate (there is no per-user
+authorization in v1).
 
 ## 12. Timeouts, limits, and concurrency
 
@@ -374,3 +476,54 @@ Query status: `QUEUED → RUNNING → SUCCEEDED | FAILED | CANCELLED | TIMED_OUT
   such work is scheduled in this plan.
 - Documentation and the README must state this limit explicitly and must not
   describe the product as a distributed OLAP database.
+
+## 15. Caller trust, authentication, and authorization
+
+### 15.1 Trust model
+
+v1 is a **single-operator, trusted-local deployment**. There is exactly one
+namespace (`default`); there is no multi-tenant isolation. Every party that can
+reach the API — the operator, the bundled dashboard, and any operator tooling —
+is in the operator's trust domain and holds full capability to enumerate
+datasets, submit queries, and consume results. This is a deliberate, documented
+limit; multi-tenant identity and per-user authorization are out of scope (§1).
+
+### 15.2 Enforceable exposure boundary
+
+- **Network boundary (primary)**: by default the API and the dashboard bind to
+  `127.0.0.1` (or the private Docker Compose network) and are **not** published
+  to public or host-facing interfaces. Exposure beyond the local host is out of
+  scope; a remote or shared deployment requires adding authentication before it
+  is permitted (a precondition, not an option).
+- **Deployment token (optional hardening)**: the API MAY be configured with a
+  single static deployment token (`API_TOKEN`, supplied via environment/secret).
+  When set, every request must present it as a bearer credential; a missing or
+  invalid token returns `401 unauthorized`. This is one shared operator
+  credential, not per-user identity.
+- The token is never embedded in the static dashboard bundle. In the default
+  single-host Compose deployment the dashboard is served same-origin and relies
+  on the network boundary; if token authentication is enabled, the token is
+  provided to the operator's browser session at runtime (for example, via a
+  same-origin login/session route that keeps the credential server-side), never
+  baked into client-visible data.
+
+### 15.3 Authorization
+
+- There is **no per-user authorization** in v1: an authenticated caller is the
+  operator and may perform any operation.
+- `forbidden` (403) is reserved and is produced only by deployment policy gates
+  that are independent of caller identity — for example, refusing to archive a
+  dataset with in-flight jobs, or refusing a mutation on an immutable version.
+- Both `unauthorized` and `forbidden` are defined now (rather than added later)
+  so the error contract (§11) and its meaning are stable when per-user authn/z
+  is introduced in a future release.
+
+### 15.4 Testability
+
+- With token authentication disabled, the API answers only on the configured
+  bind address; a request from outside that boundary cannot reach it.
+- With token authentication enabled, requests without a token return `401`, and
+  requests with a wrong token return `401`.
+- A policy-gated operation (e.g., archive with in-flight jobs) returns `403`
+  with a stable code, proving the authorization path exists independently of
+  caller identity.

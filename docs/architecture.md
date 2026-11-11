@@ -20,7 +20,7 @@ history. The first release runs entirely under Docker Compose.
 |---|---|
 | Go API / control plane | Dataset registration, ingestion coordination, query submission/status/cancellation, result paging/export, health/readiness/metrics, configuration validation. Stateless; all durable state lives in PostgreSQL and the object store. |
 | Go query worker | Bounded asynchronous job execution. Runs DuckDB through a maintained Go binding behind `internal/query.Engine`; isolates engine-specific setup and S3 configuration behind that interface. |
-| DuckDB | Local, single-node analytical execution over Parquet via its S3/HTTPFS support. Opened read-only with external access disabled; never reachable from browser code. |
+| DuckDB | Local, single-node analytical execution over Parquet via its S3/HTTPFS support. The worker registers dataset views in a trusted bootstrap phase, then runs user SQL on a read-only connection with external access disabled and only registered prefixes whitelisted (see `docs/design.md` §7.4). Never reachable from browser code. |
 | PostgreSQL | Durable catalog metadata, dataset versions, ingestion jobs, query jobs, and bounded query history. Never stores result payloads or credentials. |
 | MinIO (local) / S3-compatible (remote) | Immutable source and converted Parquet objects. Uses distinct prefixes for datasets, uploads, staging, and temporary query exports. |
 | React + TypeScript dashboard | Application UI: dataset catalog, SQL editor, result grid, charting, history, and operational summary. No object-store credentials or keys ever reach the browser. |
@@ -47,9 +47,13 @@ history. The first release runs entirely under Docker Compose.
 1. The dashboard submits SQL via `POST /api/v1/queries`; the API validates the
    statement against the safety boundary (§7 of `docs/design.md`) and writes a
    durable `query_job` (QUEUED) with a statement hash.
-2. The worker acquires the job lease, opens a read-only DuckDB connection,
-   generates catalog views for the referenced `READY` dataset versions, and
-   executes the single read-only statement against only those views.
+2. The worker acquires the job lease and opens DuckDB in two phases on one
+   connection. First, a **trusted bootstrap** phase registers a generated view
+   per referenced `READY` dataset version (`catalog.<dataset>_v<n>`, reading
+   only that version's registered `lake/` prefix via the S3/HTTPFS filesystem
+   with server-side credentials) and whitelists exactly those prefixes. Then
+   the user's single validated statement executes against only those views with
+   external access disabled (see `docs/design.md` §7.4).
 3. The worker spools results to `exports/<namespace>/<query-id>/result.parquet`,
    records row/byte counts (and bytes scanned / plan summary when the engine
    exposes them), and marks the job `SUCCEEDED` only after results and state are
@@ -76,9 +80,17 @@ history. The first release runs entirely under Docker Compose.
 
 ## 5. Security boundaries
 
+- **Caller trust**: single-operator, trusted-local-only deployment. The API and
+  dashboard bind to `127.0.0.1`/the private Compose network by default; an
+  optional single deployment token (`API_TOKEN`) gates all requests. No per-user
+  authentication or authorization exists in v1 (see `docs/design.md` §15).
 - **SQL boundary**: one read-only `SELECT` (optionally with `WITH` CTE) over
-  generated catalog views; enforced by parser validation, DuckDB read-only mode,
-  and server-side secret scoping (see `docs/design.md` §7).
+  generated catalog views; enforced by parser/AST validation (closed function
+  allowlist, deny-by-default), a trusted-bootstrap + locked-execution DuckDB
+  mode (`access_mode=read_only`, `enable_external_access=false`,
+  `allowed_directories`/`allowed_paths` scoped to registered prefixes,
+  `lock_configuration`, disabled local filesystem), and server-side secret
+  scoping (see `docs/design.md` §7).
 - **Object access**: two least-privilege credential scopes — `ingest` (read
   uploads/source, write staging/lake) and `query` (read lake, read/write
   exports). The browser never receives credentials or object keys.
@@ -118,6 +130,10 @@ history. The first release runs entirely under Docker Compose.
 
 - Single host, single instance of each service. MinIO may be swapped for a
   remote S3-compatible bucket without code changes (adapter boundary).
+- By default the API and dashboard bind to `127.0.0.1`/the private Compose
+  network and are not published to public interfaces; this is the primary
+  exposure boundary for the trusted-local-only deployment (see
+  `docs/design.md` §15).
 - Named Compose volumes persist PostgreSQL data and MinIO objects across
   restarts.
 - No horizontal scaling, no multi-region replication, no Kubernetes, and no
