@@ -108,11 +108,11 @@ history. The first release runs entirely under Docker Compose.
 
 - **Caller trust**: single-operator, trusted-local-only deployment. The API and
   dashboard bind to `127.0.0.1`/the private Compose network by default, but
-  loopback binding is **not** a caller boundary: a strict Host/Origin allowlist
-  plus CSRF protection for state-changing requests is mandatory in the default
-  deployment, and an optional single deployment token (`API_TOKEN`) additionally
-  gates all requests. No per-user authentication or authorization exists in v1
-  (see `docs/design.md` §15).
+  loopback binding is **not** a caller boundary: a strict Host/Origin/fetch-site
+  allowlist plus CSRF protection for state-changing requests is mandatory in the
+  default deployment, and an optional single deployment token (`API_TOKEN`)
+  additionally gates all requests. No per-user authentication or authorization
+  exists in v1 (see `docs/design.md` §15).
 - **SQL boundary**: one read-only `SELECT` (optionally with `WITH` CTE) over the
   registered datasets; enforced by parser/AST validation (closed function
   allowlist, deny-by-default, table-reference whitelist), server-side re-binding
@@ -173,9 +173,9 @@ history. The first release runs entirely under Docker Compose.
   §5, and `docs/design.md` §8, §9).
 - By default the API and dashboard bind to `127.0.0.1`/the private Compose
   network and are not published to public interfaces; this network boundary is
-  reinforced by a mandatory Host/Origin allowlist and CSRF protection for
-  state-changing requests, since loopback binding alone does not establish the
-  caller's identity (see `docs/design.md` §15).
+  reinforced by a mandatory Host/Origin/fetch-site allowlist and CSRF protection
+  for state-changing requests, since loopback binding alone does not establish
+  the caller's identity (see `docs/design.md` §15).
 - Named Compose volumes persist PostgreSQL data and MinIO objects across
   restarts.
 - No horizontal scaling, no multi-region replication, no Kubernetes, and no

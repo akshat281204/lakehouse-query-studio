@@ -47,11 +47,11 @@ storage (immutable data); in-memory state is always reconstructible.
 | Entity | Storage | Key fields | Terminal states |
 |---|---|---|---|
 | namespace | PostgreSQL | id, slug | ACTIVE (permanent in v1; namespace archival/delete is out of scope, §3.2) |
-| dataset | PostgreSQL | id (UUID), namespace_id, name, source_prefix, format, status, created_at, updated_at | ACTIVE, ARCHIVED |
+| dataset | PostgreSQL | id (UUID), namespace_id, name, source_prefix, format, status, retain_original (bool, default false), created_at, updated_at | ACTIVE, ARCHIVED |
 | dataset_version | PostgreSQL | id, dataset_id, version (monotonic int), object_prefix, format, partition_columns, status, schema_snapshot_id, error_summary, created_at | READY, FAILED |
 | schema_column | PostgreSQL | id, version_id, position, name, type, nullable, is_partition | — (rows) |
-| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps, lease_owner, lease_expires_at, write_credential_expires_at, write_credential_revoked | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
-| query_job | PostgreSQL | id (UUID), statement (verbatim SQL text), statement_hash, dataset_version_ids, status, failure_reason, retryable, rows_returned, truncated, bytes_scanned, result_ref, plan_summary, attempt, fencing_token, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED, TIMED_OUT (state model §13) |
+| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps (created_at, started_at, finished_at), lease_owner, lease_expires_at, write_credential_expires_at, write_credential_revoked | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
+| query_job | PostgreSQL | id (UUID), statement (verbatim SQL text), statement_hash, dataset_version_ids, status, failure_reason, retryable, rows_returned, truncated, bytes_scanned, result_ref, plan_summary, attempt, fencing_token, timestamps (created_at, started_at, finished_at), lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED, TIMED_OUT (state model §13) |
 | object (Parquet) | object store | key under `lake/…` | — (immutable) |
 | spooled result | object store | key under `exports/…/attempt=<n>/…` | — (TTL-expired) |
 
@@ -64,7 +64,7 @@ attempt-scoped, short-lived object-store write credential that authorizes writes
 to `staging/` and `lake/`; it is the single authority for the write-quiescence
 guarantee in §4 rule 8 and §6.1. It is NULL until the attempt's credential is
 actually issued, and then records the credential's true expiry, which is never
-later than the attempt's fixed `lease_expires_at` (§6.1); a NULL value means no
+later than the attempt's current `lease_expires_at` (§6.1); a NULL value means no
 credential was ever issued for that attempt, so there is no write capability to
 quiesce and the sweeper treats the prefix as already quiescent (§4 rule 8).
 `write_credential_revoked` (ingestion jobs
@@ -130,7 +130,9 @@ therefore injective: two distinct accepted names can never share a key prefix.
 #   partition segments are percent-encoded name=value pairs (§4.1)
 lake/<namespace>/<dataset>/version=<n>/attempt=<n>/[<enc-col>=<enc-value>/...]/part-<uuid>.parquet
 
-# Original uploads (retained only when retention is enabled)
+# Original uploads (job-scoped durable input; retention per §10 — deleted on READY
+# or after UPLOAD_RETRY_WINDOW, or kept for the life of the deployment when
+# retain_original=true)
 uploads/<namespace>/<dataset>/<job-id>/<sanitized-original-name>
 
 # Ingestion staging (temporary, attempt-scoped; removed on success, reclaimed by the sweeper after write-quiescence on failure/cancel/crash)
@@ -200,7 +202,9 @@ Rules:
    rewrite.
 4. Original uploads are retained only when the dataset/namespace policy sets
    `retain_original=true`; otherwise upload objects are removed after the
-   version reaches `READY`.
+   version reaches `READY`. For a job that never reaches `READY` (failed,
+   cancelled, or crash-recovered), the upload is retained for the bounded
+   `UPLOAD_RETRY_WINDOW` and then removed — never left indefinitely (§10).
 5. No object key appears in client-visible data (§8).
 6. **Stale-attempt cleanup (conclusively abandoned attempts only)**: a sweeper
    deletes a `lake/<namespace>/<dataset>/version=<n>/attempt=<m>/` prefix only
@@ -235,7 +239,7 @@ Rules:
    remains that could write to it. Ingestion writes to `lake/` and `staging/` are
    authorized solely by an attempt-scoped, short-lived STS credential whose TTL
    is the remaining lease duration at issuance time, so its expiry is never later
-   than the attempt's fixed `lease_expires_at` (§6.1); there is no long-lived,
+   than the attempt's current `lease_expires_at` (§6.1); there is no long-lived,
    deployment-wide `lake/` write credential on the ingestion path. The worker
    stores that credential's actual expiry in
    `write_credential_expires_at` (§3.1). The sweeper deletes an abandoned attempt
@@ -348,7 +352,7 @@ impossible; the write-credential fields make stale-worker *writes* impossible
   short-lived write credential that authorizes this attempt's writes to
   `staging/` and `lake/`. It is NULL until the credential is actually issued;
   once issued, the credential's TTL is the remaining lease duration at issuance
-  time, so its expiry is never later than the attempt's fixed `lease_expires_at`.
+  time, so its expiry is never later than the attempt's current `lease_expires_at`.
   The field records the true expiry returned by the provider, persisted before
   any write (see "Credential issuance" below). The stale-attempt sweeper deletes
   an abandoned attempt prefix only after this time plus `CLEANUP_GRACE` (§4 rule
@@ -362,7 +366,7 @@ impossible; the write-credential fields make stale-worker *writes* impossible
   both fields keep their original values and the sweeper waits for natural
   expiry plus `CLEANUP_GRACE` (§4 rule 8).
 
-**Credential issuance (normative ordering).** The lease deadline is fixed by the
+**Credential issuance (normative ordering).** The lease deadline is set by the
 claim — `lease_expires_at = claim_time + LEASE_DURATION` — and the write
 credential is derived from that deadline, never the reverse. After winning the
 claim the worker requests an attempt-scoped write credential whose TTL is the
@@ -374,10 +378,21 @@ expiry as `write_credential_expires_at` in a second conditional update keyed on
 the current token and `status='RUNNING'`:
 `UPDATE … SET write_credential_expires_at=? WHERE id=? AND fencing_token=? AND
 status='RUNNING'`. **No `staging/` or `lake/` write may occur before that commit
-succeeds.** Because the TTL is computed against the fixed deadline (not the full
-`LEASE_DURATION`), the credential always expires at or before the lease no matter
-how long the STS call takes; `write_credential_expires_at` records the
+succeeds.** Because the TTL is computed against the claim-time deadline (not the
+full `LEASE_DURATION`), the credential always expires at or before the lease no
+matter how long the STS call takes; `write_credential_expires_at` records the
 credential's true expiry, which is exactly what §4 rule 8 waits on.
+
+**Renewal re-issues the credential with every lease extension.** The lease is a
+sliding window renewed by heartbeat (§12.1). Each renewal repeats the issuance
+ordering above against the *extended* deadline, so the invariant
+`write_credential_expires_at ≤ lease_expires_at` holds continuously and an
+active ingestion never runs out of write capability mid-job. Renewal is
+all-or-nothing: the lease is extended and the credential re-issued (its TTL is
+the new remaining lease minus `CREDENTIAL_SLACK`) in the same conditional update
+keyed on the current token and `status='RUNNING'`; if the credential cannot be
+re-issued, the lease is not extended, and the worker retries the combined
+renewal or stops writing and fails retryably (§12.1).
 
 **Credential-issuance failure.** If the credential cannot be issued with an
 expiry `≤ lease_expires_at` — the STS call fails, the remaining lease duration is
@@ -419,7 +434,7 @@ recovery pass re-claims its job, before it can commit a stale result.
 | From | Event | To | Notes |
 |---|---|---|---|
 | (new) | ingestion requested (`register` or `convert`) | QUEUED | `ingestion_job` row created with `attempt = 0` and no token; target `dataset_version` created as `PENDING`; `retry_of` set when this is a retry |
-| QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=now()+LEASE_DURATION, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'`; exactly one winner. The claim fixes the lease deadline only — it does **not** set `write_credential_expires_at`, which stays NULL until the credential is actually issued. The worker then issues the attempt-scoped write credential against the fixed deadline and persists its actual expiry before writing (see "Credential issuance" above); version `PENDING` → `BUILDING` |
+| QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=now()+LEASE_DURATION, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'`; exactly one winner. The claim sets the initial lease deadline (later renewed by heartbeat, §12.1) only — it does **not** set `write_credential_expires_at`, which stays NULL until the credential is actually issued. The worker then issues the attempt-scoped write credential against that deadline and persists its actual expiry before writing (see "Credential issuance" above); version `PENDING` → `BUILDING` |
 | RUNNING | all Parquet written to `lake/…/version=<n>/attempt=<n>/` + schema captured, then commit | SUCCEEDED | one conditional transaction sets the version `READY` with `object_prefix` = this attempt's prefix and the job `SUCCEEDED`, both `WHERE … fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort (rules 6 and 8 sweep any straggler after write-credential expiry) |
 | RUNNING | cancel accepted | CANCELLED | conditional on token; version → `FAILED` with `error_summary = "cancelled"`. No object deletion here: cancellation occurs while the attempt write credential may still authorize writes, so staging/lake reclamation is deferred to the stale-attempt sweeper, which deletes only after write-quiescence — `write_credential_expires_at + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
 | RUNNING | unrecoverable error | FAILED | conditional on token; `failure_reason` + `error_summary` set; version → `FAILED`. No object deletion here: staging/lake reclamation is deferred to the stale-attempt sweeper after write-quiescence — `write_credential_expires_at + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
@@ -427,6 +442,12 @@ recovery pass re-claims its job, before it can commit a stale result.
 
 - `QUEUED` jobs survive worker restart: state lives in PostgreSQL and the queue
   is reconstructed by scanning for `QUEUED` rows.
+- A `RUNNING` job's lease is a sliding window renewed by the holding worker's
+  heartbeat (§12.1): while the worker is alive it extends `lease_expires_at`
+  and, in the same conditional update, re-issues the attempt write credential,
+  preserving `write_credential_expires_at ≤ lease_expires_at` and ensuring the
+  credential never expires before the lease. A renewal that affects zero rows
+  means the worker was fenced; it must abort.
 - A worker that crashes mid-attempt leaves the job `RUNNING` with an expired
   lease. A recovery pass (run by any worker's lease/heartbeat cycle) performs a
   single atomic transaction that (a) conditionally updates the job keyed on the
@@ -476,6 +497,19 @@ recovery pass re-claims its job, before it can commit a stale result.
   is observable after the sweeper completes. A companion test asserts that a live
   (`BUILDING`) attempt's prefix is never deleted while its credential is
   unexpired.
+- **Lease/heartbeat test**: a long ingestion whose worker heartbeats across
+  several `LEASE_DURATION`s never loses its write credential: after the claim
+  and after every renewal the test asserts the invariant
+  `write_credential_expires_at ≤ lease_expires_at`, that the recorded expiry
+  advances with each renewal, and that `PutObject` to the attempt prefix keeps
+  succeeding until the job completes. A companion test stops the heartbeat and
+  asserts that, after the lease expires, the recovery pass re-claims the job
+  (`FAILED`, retryable), the old token no longer commits, and the sweeper deletes
+  the prefix only after `write_credential_expires_at + CLEANUP_GRACE` (§4 rule 8).
+- **Renewal all-or-nothing test**: a renewal whose STS call fails does not
+  extend the lease, and the worker either retries the combined renewal or stops
+  writing and fails retryably — it never reaches the state "lease alive, write
+  credential expired" (§12.1).
 
 ### 6.2 Retry and version numbering
 
@@ -824,7 +858,7 @@ never observe.
     `staging/<namespace>/<dataset>/<job-id>/attempt=<n>/` and
     `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/` prefixes and whose TTL
     is the remaining lease duration at issuance time, so it expires no later than
-    the attempt's fixed `lease_expires_at` (the actual expiry is recorded as
+    the attempt's current `lease_expires_at` (the actual expiry is recorded as
     `write_credential_expires_at`, §3.1). There is **no** long-lived,
     deployment-wide `lake/` or `staging/` write credential on the ingestion path;
     this is what lets the sweeper guarantee "no writes after delete" (§4 rule 8,
@@ -912,11 +946,90 @@ never observe.
 | Data | Retention |
 |---|---|
 | `lake/` Parquet objects | Retained for the life of the deployment. Archive does **not** delete them (unarchive is reversible); no automatic deletion in v1. Hard delete/GC is out of scope. |
-| Original uploads | Deleted after `READY` unless `retain_original=true` |
+| Original uploads | `retain_original=true`: retained for the life of the deployment (no auto-delete). `retain_original=false`: deleted promptly after the version reaches `READY`; on a terminal `FAILED`/`CANCELLED`/crash-recovered job, retained for `UPLOAD_RETRY_WINDOW` (default 7 days, max 90 days) so a retry can reuse the input, then deleted |
 | `staging/` objects | Successful attempt: removed by the transitioning worker after conversion completes. Failed/cancelled/crashed attempt: reclaimed only by the stale-attempt sweeper after `write_credential_expires_at + CLEANUP_GRACE` (§4 rules 6 and 8) — never at the cancel/fail transition itself |
 | `exports/` (results/exports) | TTL default 24h, swept |
-| query_job history rows | Bounded retention (default 30 days, configurable); the SQL statement is retained for the job's full lifetime and is never purged or overwritten before the job reaches a terminal state; after that it follows the history retention window (configurable), while the statement hash is always kept |
+| query_job history rows | Bounded retention (default 30 days, configurable); the SQL statement is retained for the job's full lifetime and is never purged or overwritten before the job reaches a terminal state; after that the statement and its `statement_hash` are removed together with the row under the same retention window. There is no separate hash store, so no hash outlives its row |
 | Failed version error summaries | Retained with the version for its lifetime (archive does not delete version rows) |
+
+**Original-upload lifecycle (complete, including terminal jobs).** An upload
+object under `uploads/<namespace>/<dataset>/<job-id>/` is the durable input for
+its ingestion job and for any retry of it (via `retry_of`). Its lifetime is
+fully determined by the job's outcome and the dataset `retain_original` policy,
+so no upload is ever left indefinitely:
+
+- `retain_original=true` — the upload is retained for the life of the
+  deployment (the same rule as `lake/` objects), regardless of job outcome, and
+  is never auto-deleted in v1.
+- `retain_original=false` — the upload is deleted as soon as it is provably no
+  longer needed:
+  - **Success**: once the version reaches `READY` the upload is deleted (§4 rule
+    4); the converted Parquet is the durable artifact.
+  - **Terminal failure / cancel / crash-recovery**: the upload is retained for
+    `UPLOAD_RETRY_WINDOW` (default 7 days, configurable, hard max 90 days)
+    measured from the job's terminal transition (`finished_at`), so a retry can
+    re-stage the same input; after the window it is deleted even if no retry was
+    ever submitted. The window is a bound on *retention*, not a promise of
+    indefinite input availability.
+- **Cleanup.** A catalog-driven upload sweeper deletes
+  `uploads/<namespace>/<dataset>/<job-id>/` only when the catalog proves the
+  prefix is due: the job is terminal (`SUCCEEDED`/`FAILED`/`CANCELLED`), the
+  dataset's `retain_original` is `false`, and either the version reached `READY`
+  (success) or `now() > finished_at + UPLOAD_RETRY_WINDOW` (non-success). It
+  never deletes the upload of a `QUEUED`/`RUNNING` job, and it never deletes an
+  upload while a retry (`retry_of` = this job) is still `QUEUED`/`RUNNING` and
+  has not yet re-staged the input. The sweep is idempotent and re-derives the
+  due set from the catalog each pass, so a crashed sweeper re-runs safely.
+- **No blanket age-based lifecycle rule on `uploads/`.** The upload retention
+  decision depends on catalog state an age rule cannot observe — the job's
+  terminal status, the dataset's `retain_original`, a retry window measured from
+  `finished_at`, and whether an in-flight retry has not yet re-staged the input.
+  A prefix-wide age rule operates independently of the catalog sweeper and would
+  therefore delete `retain_original=true` uploads (which are promised to live for
+  the deployment), uploads of still-`QUEUED`/`RUNNING` jobs, or a long-running
+  job's input before its retry window begins. The object store therefore applies
+  **no** unqualified age expiry to `uploads/`; upload deletion is keyed to the
+  catalog decision alone, and the object-store lifecycle rule is **tag-filtered**
+  so it can only act on uploads the catalog has already declared due:
+  1. Every upload is written with the retention-class tag
+     `lakehouse-upload-retain=active`. The lifecycle rule expires **only**
+     objects tagged `lakehouse-upload-retain=release` (after a short grace,
+     default `CLEANUP_GRACE`). An object tagged `active` never matches the rule,
+     so a retained (`retain_original=true`), `QUEUED`/`RUNNING`, or
+     still-within-window upload can never be expired no matter how long it has
+     existed.
+  2. When the catalog sweeper proves a prefix due (terminal, `retain_original`
+     is `false`, and either `READY` or `now() > finished_at +
+     UPLOAD_RETRY_WINDOW`, with no in-flight retry that has not re-staged), it
+     re-tags the upload objects `lakehouse-upload-retain=release` and records
+     `lakehouse-upload-release-at=<due-time>`. The re-tag is the only event that
+     arms the lifecycle rule, so deletion remains driven by the catalog decision
+     and the retry window is measured from `finished_at` — accounting for
+     arbitrary job duration rather than object age. The sweeper may also delete
+     the prefix itself directly (idempotent); the tag-filtered lifecycle rule is
+     the backstop that completes the delete after the grace even if the sweeper
+     dies mid-delete.
+  3. Uploads are written once at upload time and are never rewritten or appended
+     to by ingestion or retry, so no write-quiescence wait applies to upload
+     deletion (unlike `lake/`/`staging/`, §4 rules 6–8); the retry re-reads the
+     original rather than re-writing it.
+- **Retry and re-staging.** A retry (`retry_of` = the failed job) re-reads the
+  original upload under the failed job's `uploads/…/<job-id>/` prefix and
+  re-stages it into its own `staging/…/attempt=<n>/`; from that point the retry
+  no longer depends on the original upload, so the original can be deleted at
+  the window's close without affecting the in-flight retry. A retry that is not
+  submitted within the window re-uploads its input.
+- **Testability**: a `convert` job whose version reaches `READY` has its upload
+  deleted when `retain_original=false` and retained when `retain_original=true`;
+  a failed/cancelled/crash-recovered job retains its upload until
+  `UPLOAD_RETRY_WINDOW` elapses, after which the sweeper deletes it, while the
+  same job with `retain_original=true` is never deleted. The sweeper never
+  deletes the upload of a `QUEUED`/`RUNNING` job or of a job whose retry has not
+  yet re-staged the input. A companion test asserts the tag-filtered lifecycle
+  rule never expires an upload still tagged `lakehouse-upload-retain=active`
+  (retained, `QUEUED`/`RUNNING`, or within the retry window) even after its age
+  exceeds any configured duration, and only expires an upload after it is
+  re-tagged `lakehouse-upload-retain=release` by the sweeper.
 
 ## 11. API error contract
 
@@ -959,7 +1072,7 @@ and sanitized.
 `unauthorized` (401) and `forbidden` (403) have precise meanings under the
 trust model in §15: `unauthorized` means a missing or invalid deployment token
 when token authentication is enabled; `forbidden` means the request was refused
-by the mandatory browser-request defense (Host/Origin allowlist or CSRF
+by the mandatory browser-request defense (Host/Origin/fetch-site checks or CSRF
 protection, §15.2) or by a deployment policy gate (there is no per-user
 authorization in v1).
 
@@ -971,6 +1084,14 @@ only pin a default where a test explicitly chooses to.
 | Control | Default | Bound |
 |---|---|---|
 | Query execution timeout | 60s | max 300s |
+| Ingestion lease duration (`LEASE_DURATION`) | 15m | max 30m |
+| Query lease duration (`QUERY_LEASE_DURATION`) | 120s | max 600s |
+| Lease heartbeat interval | `LEASE_DURATION / 3` | `< LEASE_DURATION − LEASE_RENEWAL_MARGIN` |
+| Lease renewal margin (`LEASE_RENEWAL_MARGIN`) | 30s | configurable |
+| Write-credential TTL slack (`CREDENTIAL_SLACK`) | 30s | configurable |
+| Min write-credential TTL (`MIN_WRITE_CREDENTIAL_TTL`) | 30s | configurable |
+| Cleanup grace (`CLEANUP_GRACE`) | 15m | configurable |
+| Upload retention window (`UPLOAD_RETRY_WINDOW`) | 7 days | max 90 days |
 | Worker concurrency (queries) | 2 | configurable, ≥1 |
 | DuckDB threads | min(4, cpus) | configurable |
 | DuckDB memory | 4 GiB | configurable |
@@ -986,6 +1107,67 @@ deadline, and the engine enforces the same budget via DuckDB's
 `max_execution_time` (milliseconds). Cancellation is observable and persisted in
 the job row (§13).
 
+### 12.1 Leases and heartbeat (liveness, not a time budget)
+
+Every job claim (ingestion §6.1, query §13) carries a lease — `lease_owner` and
+`lease_expires_at = claim_time + LEASE_DURATION` (ingestion) or
+`claim_time + QUERY_LEASE_DURATION` (query). A lease is a **liveness and
+ownership** mechanism, not the job's compute budget. It answers one question —
+"is the claiming worker still alive and in charge?" — so a dead or partitioned
+worker's job can be reclaimed (ingestion fails retryably, query requeues). The
+job's actual runtime budget is a separate control: the query execution timeout
+(§12 table) for queries, and for ingestion there is no fixed runtime budget —
+liveness is carried entirely by the lease.
+
+- **Durations.** `LEASE_DURATION` (ingestion) defaults to 15 minutes, hard max
+  30 minutes. `QUERY_LEASE_DURATION` (query) defaults to 120 seconds, hard max
+  600 seconds. Both are configurable and validated against their bounds at
+  startup; a test asserts the bounds are enforced.
+- **Heartbeat / renewal.** While a job is `RUNNING`, its holder renews the lease
+  every `LEASE_HEARTBEAT_INTERVAL` (default one third of the lease duration) by
+  a conditional update keyed on its current `fencing_token` and
+  `status='RUNNING'`:
+  `UPDATE … SET lease_expires_at = now() + LEASE_DURATION WHERE id=? AND
+  fencing_token=? AND status='RUNNING'`. A renewal that affects zero rows means
+  the worker was fenced; it must abort without writing or committing. The
+  heartbeat interval must satisfy
+  `LEASE_HEARTBEAT_INTERVAL + LEASE_RENEWAL_MARGIN < LEASE_DURATION`, where
+  `LEASE_RENEWAL_MARGIN` (default 30s) covers scheduling delay and a renewal
+  round-trip; configuration validation rejects any combination that violates
+  this precondition, and a test asserts it.
+- **Renewal and write credentials (ingestion only).** Ingestion renewal is
+  all-or-nothing: extending `lease_expires_at` and re-issuing the attempt-scoped
+  write credential happen together, so the invariant
+  `write_credential_expires_at ≤ lease_expires_at` holds at every instant. On
+  each renewal the worker (a) computes the target lease `new_lease = now() +
+  LEASE_DURATION`, (b) requests a write credential whose TTL is
+  `new_lease − now() − CREDENTIAL_SLACK` (so its actual expiry is ≤ `new_lease`),
+  and (c) persists both in one conditional update keyed on the current token and
+  `status='RUNNING'`:
+  `UPDATE … SET lease_expires_at = new_lease, write_credential_expires_at =
+  <credential-expiry> WHERE id=? AND fencing_token=? AND status='RUNNING'`.
+  If the credential cannot be re-issued (STS failure, or the remaining TTL would
+  fall below `MIN_WRITE_CREDENTIAL_TTL`), the worker does **not** extend the
+  lease — it keeps the existing credential and lease and retries the combined
+  renewal — so it can never reach the state "lease alive, write credential
+  expired" that would silently strip a live ingestion's write capability. A
+  worker that cannot complete a combined renewal before its current credential
+  expires stops writing and fails the job retryably (the same path as
+  credential-issuance failure, §6.1); the stale-attempt sweeper reclaims the
+  prefix after `write_credential_expires_at + CLEANUP_GRACE` (§4 rule 8). An
+  active ingestion therefore never loses its write capability mid-job: its
+  credential is re-issued at least as often as its lease is renewed and always
+  expires no later than the lease.
+- **Query requeue is liveness-only.** Because a healthy worker renews the query
+  lease continuously while the query runs, requeue (the recovery pass's
+  `lease_expires_at < now()` transition, §13) fires only when the worker stops
+  heartbeating — that is, when it has died or been partitioned — never when a
+  live query is still executing within its declared execution timeout. The
+  execution timeout is enforced separately by the worker (Go context deadline)
+  and by DuckDB's `max_execution_time`; when it fires the worker itself
+  transitions the job to `TIMED_OUT` via a fenced conditional update, which does
+  not require the lease to have expired.
+
 ## 13. Query job lifecycle and crash model
 
 Query status: `QUEUED → RUNNING → SUCCEEDED | FAILED | CANCELLED | TIMED_OUT`.
@@ -1000,15 +1182,20 @@ and must abort without publishing results.
 | From | Event | To | Notes |
 |---|---|---|---|
 | (new) | submit validated | QUEUED | durable row (`attempt=0`, no token); the full SQL statement is persisted in `statement` and its hash in `statement_hash` — the worker executes the persisted statement, never a reconstruction from the hash |
-| QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=?, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'` |
+| QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=now()+QUERY_LEASE_DURATION, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'`; the holder then renews the lease by heartbeat (§12.1), so a live query is never requeued while it stays within its execution timeout |
 | RUNNING | results committed to object store + row marked | SUCCEEDED | worker writes the spool to `exports/…/attempt=<n>/result.parquet`, then one conditional update `SET status='SUCCEEDED', result_ref=?, rows_returned=?, truncated=?, … WHERE id=? AND fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort (spool left to TTL, never referenced) |
 | RUNNING | cancel accepted | CANCELLED | conditional on token; observable and persisted |
 | RUNNING | timeout exceeded | TIMED_OUT | conditional on token; distinct from FAILED |
 | RUNNING | engine/object-store error | FAILED | conditional on token; `failure_reason` set (engine_error, object_store, resource_exceeded, …) |
-| RUNNING | lease expires (worker died or partitioned) | QUEUED (requeue) | recovery pass re-claims in one conditional update keyed on `lease_expires_at < now() AND status='RUNNING'`: `SET status='QUEUED', lease_owner=NULL, lease_expires_at=NULL, attempt=attempt+1, fencing_token=NULL`; the old worker is fenced by the token change |
+| RUNNING | lease expires (worker died or partitioned — a liveness failure, not a normal timeout) | QUEUED (requeue) | recovery pass re-claims in one conditional update keyed on `lease_expires_at < now() AND status='RUNNING'`: `SET status='QUEUED', lease_owner=NULL, lease_expires_at=NULL, attempt=attempt+1, fencing_token=NULL`; the old worker is fenced by the token change. Requeue is a **liveness** signal only: a healthy worker renews the lease while the query runs, so a job is requeued only when its worker stops heartbeating — never because a live query outlived its lease while still within its declared execution timeout (§12.1) |
 
 - Queued jobs survive worker restart (state is in PostgreSQL; the queue is
   reconstructed by scanning for `QUEUED` rows).
+- A `RUNNING` query's lease is a sliding window renewed by heartbeat (§12.1); it
+  is a liveness mechanism, not the query's compute budget (that is the execution
+  timeout in §12). The worker renews the lease continuously while the query runs
+  and has not exceeded its execution timeout, so a healthy query is never
+  requeued mid-execution.
 - The submitted statement is persisted verbatim in `query_job.statement` at
   submission and is the single source the worker uses to execute the job: on
   claim, the worker reads `statement` from the row, re-validates it against the
@@ -1034,6 +1221,13 @@ and must abort without publishing results.
   holder's conditional commit; a stale attempt's spool is never referenced and is
   reclaimed by TTL.
 - Cancellation and timeout are observable in status and persisted.
+- **Lease/requeue liveness test**: a healthy query running at the maximum
+  execution timeout (300s) and heartbeating on schedule is never requeued — its
+  `status` stays `RUNNING` until the worker itself transitions it to `SUCCEEDED`
+  or `TIMED_OUT`. A companion test kills the worker (no heartbeat) and asserts
+  the job is requeued after `QUERY_LEASE_DURATION` and re-executed from the
+  persisted `statement` (never from the hash). This pins requeue to liveness,
+  not to the execution timeout.
 
 ## 14. Single-node limit
 
@@ -1075,29 +1269,44 @@ not optional hardening.
   not by itself identify or authorize the *caller* (see the browser-request
   defense below).
 
-- **Host/Origin allowlist (mandatory)**: the API and the dashboard reject any
-  request whose `Host` header is not in a closed, configured allowlist of the
-  exact `host:port` values the services are bound to (for example
-  `127.0.0.1:8080` and `localhost:8080`). A DNS-rebinding attack presents the
-  attacker's domain in the `Host` header, so it fails the allowlist even though
-  the underlying socket terminates on loopback. In addition, for any request
-  that carries an `Origin` or `Sec-Fetch-Site` header (i.e. a browser-initiated
-  request), the API requires `Origin` to match the exact scheme + host + port of
-  the served dashboard; a cross-origin browser request is rejected with
-  `403 forbidden`. The API does not emit permissive CORS headers
-  (`Access-Control-Allow-Origin: *`); it emits CORS allow headers only for the
-  exact dashboard origin, so a foreign page cannot read any response.
+- **Host/Origin/fetch-site checks (mandatory)**: the API and the dashboard
+  reject any request whose `Host` header is not in a closed, configured
+  allowlist of the exact `host:port` values the services are bound to (for
+  example `127.0.0.1:8080` and `localhost:8080`). A DNS-rebinding attack
+  presents the attacker's domain in the `Host` header, so it fails the allowlist
+  even though the underlying socket terminates on loopback. In addition:
+  - If the request carries an `Origin` header, the API validates it against the
+    exact scheme + host + port of the served dashboard and rejects a mismatch
+    (cross-origin) with `403 forbidden`. `Origin` is validated **when supplied**;
+    its **absence is not an error**. Browsers commonly send `Sec-Fetch-Site`
+    without an `Origin` on same-origin safe `GET` requests, and non-browser
+    clients omit `Origin` entirely, so a missing `Origin` does not by itself
+    reject a request — the request still must satisfy the Host check and, for
+    mutations, the CSRF proof below.
+  - If the request carries a `Sec-Fetch-Site` header, its value is checked as an
+    additional signal: `cross-site` is rejected with `403 forbidden`;
+    `same-origin`, `same-site`, and `none` are accepted; a missing header is
+    accepted. `Sec-Fetch-Site` is **not** used to demand an `Origin` header, so
+    the dashboard's same-origin polling and result paging (which may send
+    `Sec-Fetch-Site: same-origin` without `Origin`) are not rejected.
+  - The API does not emit permissive CORS headers
+    (`Access-Control-Allow-Origin: *`); it emits CORS allow headers only for the
+    exact dashboard origin, so a foreign page cannot read any response.
+  - Read-only `GET`/`HEAD` requests with a valid `Host` and, when present, a
+    valid `Origin`/`Sec-Fetch-Site` are accepted. State-changing requests are
+    not secured by `Origin` presence (a cross-site page may omit or forge a
+    missing `Origin` on some flows); they rely on the mandatory CSRF proof below.
 
 - **CSRF protection for state changes (mandatory)**: every state-changing
   request (`POST`, `PUT`, `PATCH`, `DELETE`) must carry proof of same-origin
-  intent that a cross-site page cannot forge. The API requires one of: (a) a
-  custom request header that forces a CORS preflight (for example
-  `X-Lakehouse-CSRF: 1`), whose preflight is rejected for any non-allowlisted
-  origin, or (b) an unguessable CSRF token issued by the API and bound to the
-  operator's session (synchronizer token or double-submit cookie), presented on
-  every mutation. Read-only `GET`/`HEAD` requests have no side effects and are
-  covered by the Host/Origin allowlist plus same-origin CORS; they are not
-  exempt from the Host/Origin allowlist.
+  intent that a cross-site page cannot forge, regardless of whether an `Origin`
+  header is present. The API requires one of: (a) a custom request header that
+  forces a CORS preflight (for example `X-Lakehouse-CSRF: 1`), whose preflight
+  is rejected for any non-allowlisted origin, or (b) an unguessable CSRF token
+  issued by the API and bound to the operator's session (synchronizer token or
+  double-submit cookie), presented on every mutation. Read-only `GET`/`HEAD`
+  requests have no side effects and are covered by the Host/Origin/fetch-site
+  checks above plus same-origin CORS; they are not exempt from the Host check.
 
 - **Deployment token (optional hardening)**: the API MAY additionally be
   configured with a single static deployment token (`API_TOKEN`, supplied via
@@ -1110,18 +1319,19 @@ not optional hardening.
 
 - The token is never embedded in the static dashboard bundle. In the default
   single-host Compose deployment the dashboard is served same-origin and relies
-  on the Host/Origin allowlist plus CSRF protection (not on loopback alone); if
-  token authentication is enabled, the token is provided to the operator's
-  browser session at runtime (for example, via a same-origin login/session route
-  that keeps the credential server-side), never baked into client-visible data.
+  on the Host/Origin/fetch-site checks plus CSRF protection (not on loopback
+  alone); if token authentication is enabled, the token is provided to the
+  operator's browser session at runtime (for example, via a same-origin
+  login/session route that keeps the credential server-side), never baked into
+  client-visible data.
 
 ### 15.3 Authorization
 
 - There is **no per-user authorization** in v1: an authenticated caller is the
   operator and may perform any operation.
 - `forbidden` (403) is reserved and is produced by (a) the mandatory
-  browser-request defense — a request rejected by the Host/Origin allowlist or
-  CSRF protection (§15.2) — and (b) deployment policy gates that are
+  browser-request defense — a request rejected by the Host/Origin/fetch-site
+  checks or CSRF protection (§15.2) — and (b) deployment policy gates that are
   independent of caller identity, for example refusing to archive a dataset with
   in-flight jobs, or refusing a mutation on an immutable version.
 - Both `unauthorized` and `forbidden` are defined now (rather than added later)
@@ -1136,10 +1346,13 @@ not optional hardening.
   (a DNS-rebinding simulation) or any value not in the allowlist returns
   `403 forbidden` and is not processed, even though the TCP connection
   terminates on the loopback interface.
-- **Origin allowlist**: a browser-initiated request whose `Origin` is a foreign
-  origin returns `403 forbidden`; a request whose `Origin` is the exact
-  dashboard origin is accepted; and the API's CORS allow headers name only that
-  exact origin (never `*`).
+- **Origin/fetch-site checks**: a browser-initiated request whose `Origin` is a
+  foreign origin returns `403 forbidden`; a request whose `Origin` is the exact
+  dashboard origin is accepted; a same-origin safe `GET` that sends
+  `Sec-Fetch-Site` (e.g. `same-origin`) but **no** `Origin` header is accepted
+  (dashboard polling and result paging are not rejected); a request carrying
+  `Sec-Fetch-Site: cross-site` is rejected; and the API's CORS allow headers name
+  only that exact origin (never `*`).
 - **CSRF**: a state-changing request without the required CSRF proof (custom
   header or valid CSRF token) returns `403 forbidden` and causes no state
   change; the same request with valid proof succeeds. A companion test issues a
