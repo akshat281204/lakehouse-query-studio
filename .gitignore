@@ -1,0 +1,24 @@
+# Dependencies / build output
+node_modules/
+dist/
+build/
+bin/
+coverage/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+
+# Local runtime data
+.data/
+tmp/
+.stack/
+.review/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
