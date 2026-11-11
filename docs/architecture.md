@@ -38,20 +38,27 @@ history. The first release runs entirely under Docker Compose.
    (conditional update keyed on `status='QUEUED'`) and either inspects the
    existing prefix (`register`) or converts uploaded CSV/JSON into Parquet under
    `staging/<namespace>/<dataset>/<job-id>/attempt=<n>/` (`convert`).
-4. On success, the worker places complete Parquet parts into
-   `lake/<namespace>/<dataset>/version=<n>/`, captures the schema, and marks the
-   version `READY` in the same logical commit — conditional on the current
-   `fencing_token`, so a fenced worker's commit matches zero rows and it aborts
-   without publishing. On failure, staging objects are removed and the version is
-   marked `FAILED` with an error summary.
+4. On success, the worker places complete Parquet parts into the attempt-scoped
+   prefix `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/`, captures the
+   schema, and in one fenced transaction (conditional on the current
+   `fencing_token`) sets the version `READY` with `object_prefix` pointing at
+   that attempt prefix. A fenced worker's commit matches zero rows and it aborts
+   without making the attempt visible; the stale-attempt sweeper removes only
+   conclusively abandoned (terminal) attempt prefixes, serialized against the
+   publish commit (`docs/design.md` §4 rules 6–7). On failure, staging objects
+   are removed, the attempt prefix is removed, and the version is marked
+   `FAILED` with an error summary.
 
 ### 3.2 Query execution
 
 1. The dashboard submits SQL via `POST /api/v1/queries`; the API validates the
    statement against the safety boundary (§7 of `docs/design.md`) and writes a
-   durable `query_job` (QUEUED) with a statement hash.
+   durable `query_job` (QUEUED) that persists the full SQL statement plus its
+   hash — the worker executes the persisted statement, so a job that is requeued
+   after a worker restart still has the exact text to run.
 2. The worker claims the job lease under a fresh `fencing_token`/`attempt`
-   (conditional update keyed on `status='QUEUED'`), then runs the query on a
+   (conditional update keyed on `status='QUEUED'`), reads the persisted
+   `statement` from the job row, then runs the query on a
    single connection: it parses/validates the statement, re-binds each
    `catalog.<dataset>_v<n>` reference to that version's registered `lake/`
    prefix (taken from the catalog, never the SQL text), obtains a per-query
@@ -107,8 +114,9 @@ history. The first release runs entirely under Docker Compose.
   disabled and configuration locked (see `docs/design.md` §7).
 - **Object access**: ingest uses a least-privilege worker credential (read
   uploads/source, write staging/lake); each query uses a short-lived credential
-  scoped to exactly the `lake/<namespace>/<dataset>/version=<n>/` prefixes it
-  references (read), registered as a prefix-scoped DuckDB secret with ambient
+  scoped to exactly the committed attempt prefixes
+  `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/` it references (read),
+  registered as a prefix-scoped DuckDB secret with ambient
   credential fallback disabled; the worker holds a write-scoped credential for
   only that query's `exports/<namespace>/<query-id>/attempt=<n>/` prefix; and the
   API holds a short-lived, prefix-scoped read credential for only the one

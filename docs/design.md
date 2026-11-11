@@ -51,7 +51,7 @@ storage (immutable data); in-memory state is always reconstructible.
 | dataset_version | PostgreSQL | id, dataset_id, version (monotonic int), object_prefix, format, partition_columns, status, schema_snapshot_id, error_summary, created_at | READY, FAILED |
 | schema_column | PostgreSQL | id, version_id, position, name, type, nullable, is_partition | — (rows) |
 | ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
-| query_job | PostgreSQL | id (UUID), statement_hash, dataset_version_ids, status, failure_reason, retryable, rows_returned, bytes_scanned, result_ref, plan_summary, attempt, fencing_token, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED, TIMED_OUT (state model §13) |
+| query_job | PostgreSQL | id (UUID), statement (verbatim SQL text), statement_hash, dataset_version_ids, status, failure_reason, retryable, rows_returned, bytes_scanned, result_ref, plan_summary, attempt, fencing_token, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED, TIMED_OUT (state model §13) |
 | object (Parquet) | object store | key under `lake/…` | — (immutable) |
 | spooled result | object store | key under `exports/…/attempt=<n>/…` | — (TTL-expired) |
 
@@ -74,6 +74,10 @@ Dataset status: `ACTIVE` ↔ `ARCHIVED`.
   untouched, unarchive (returning the dataset to `ACTIVE`) is always reversible
   and requires no data restoration. Hard delete and object GC are out of scope
   in v1 (§10).
+- A dataset's name remains reserved while it is `ARCHIVED`: because names are
+  unique across active and archived datasets (§5), a new dataset can never be
+  created with an archived dataset's name, so archived object keys cannot be
+  shadowed or overwritten.
 - A dataset may have zero `READY` versions while its first version is being
   built or has failed; it is still an ACTIVE dataset record.
 
@@ -101,8 +105,8 @@ All keys are relative to the configured bucket. Layout is ASCII, URL-safe, and
 deterministic; dataset and namespace are slug-normalized before use in keys.
 
 ```
-# Converted / registered Parquet (immutable, the query source)
-lake/<namespace>/<dataset>/version=<n>/[col=value/...]/part-<uuid>.parquet
+# Converted / registered Parquet (immutable, the query source; attempt-isolated)
+lake/<namespace>/<dataset>/version=<n>/attempt=<n>/[col=value/...]/part-<uuid>.parquet
 
 # Original uploads (retained only when retention is enabled)
 uploads/<namespace>/<dataset>/<job-id>/<sanitized-original-name>
@@ -114,11 +118,15 @@ staging/<namespace>/<dataset>/<job-id>/attempt=<n>/part-<uuid>.parquet
 exports/<namespace>/<query-id>/attempt=<n>/result.parquet
 ```
 
-The `attempt=<n>/` segment on `staging/` and `exports/` keys is the job's
-attempt counter (§6.1, §13); every (re)claim writes under its own attempt
+The `attempt=<n>/` segment on `staging/`, `lake/`, and `exports/` keys is the
+job's attempt counter (§6.1, §13); every (re)claim writes under its own attempt
 segment, so a stale worker from a previous attempt cannot write under, or
-clobber, a live attempt's output. CSV export is streamed from the spool and is
-not a separate object (§9).
+clobber, a live attempt's output. A `dataset_version` becomes queryable only
+when its fenced catalog commit records the winning attempt's prefix in
+`object_prefix`; a losing/stale attempt prefix of a `READY` version, and every
+attempt prefix of a `FAILED` version, are unreferenced and are removed by the
+cleanup sweeper once the version is terminal (rule 6). CSV export is streamed
+from the spool and is not a separate object (§9).
 
 Rules:
 
@@ -127,24 +135,57 @@ Rules:
    scoped to the single query's `exports/` prefix (§8, §9).
 2. Hive-style partition directories are `col=value/` segments in the
    dataset-declared partition order; unpartitioned datasets write files directly
-   under `version=<n>/`.
+   under `version=<n>/attempt=<n>/`.
 3. Part files are written once and never mutated; a version commit is a
-   catalog pointer update, not an object rewrite.
+   fenced catalog pointer update to the winning attempt prefix, not an object
+   rewrite.
 4. Original uploads are retained only when the dataset/namespace policy sets
    `retain_original=true`; otherwise upload objects are removed after the
    version reaches `READY`.
 5. No object key appears in client-visible data (§8).
+6. **Stale-attempt cleanup (conclusively abandoned attempts only)**: a sweeper
+   deletes a `lake/<namespace>/<dataset>/version=<n>/attempt=<m>/` prefix only
+   when the catalog proves that attempt is *conclusively abandoned* — it can no
+   longer be published and is not the version's committed prefix. The abandoned
+   set is exactly:
+   - every attempt prefix of a version whose status is terminal `FAILED` (a
+     `FAILED` version can never become `READY`, §3.3), and
+   - every attempt prefix whose `attempt` differs from a `READY` version's
+     committed `object_prefix` attempt (a losing/stale attempt).
+   A version in `PENDING` or `BUILDING` has **no** abandoned attempt prefix: its
+   winning `object_prefix` is not yet committed and a live worker may be writing
+   under it, so the sweeper deletes nothing for it. This bounds orphan retention
+   (stale/losing attempts, and the whole prefix set of a failed version) without
+   ever touching a live or newly committed attempt.
+7. **Cleanup is serialized against publication**: the sweeper's delete decision
+   is re-verified against the catalog and serialized with the fenced commit that
+   publishes a version, so a live or newly committed attempt can never be
+   deleted. Concretely, the sweeper takes a per-version lock (the same lock the
+   fenced `BUILDING → READY` commit holds while it records `object_prefix`),
+   re-reads the version's `status` and `object_prefix` under that lock,
+   recomputes the abandoned set from rule 6, and only then deletes those
+   prefixes. Because publication acquires the same lock before making a version
+   `READY`, the state the sweeper re-checked cannot change to reference a prefix
+   between the re-check and the delete. The sweep is idempotent (deleting an
+   already-deleted prefix is a no-op) and may run on any schedule; each pass
+   recomputes the abandoned set from the catalog, so a crashed sweeper re-runs
+   safely.
 
 ## 5. Catalog and version semantics
 
-- A version's object prefix is `lake/<namespace>/<dataset>/version=<n>/`.
+- A version's object prefix is the winning attempt prefix,
+  `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/`, recorded in
+  `dataset_version.object_prefix` by the fenced commit (§6.1).
 - The schema snapshot (columns, types, nullability, partition columns) is
   captured and stored with the version and becomes immutable once the version
   is `READY`.
 - The catalog never stores credentials, secret keys, or raw result payloads.
 - Timestamps are stored as UTC; `created_at`/`updated_at` on all mutable rows.
-- Uniqueness: `(namespace, dataset name)` is unique among active datasets;
-  version number is unique per dataset; job ids are UUIDs.
+- Uniqueness: `(namespace, dataset name)` is unique across **all** datasets,
+  active and archived. Dataset names are never reused: archiving reserves the
+  name permanently (§3.2), so `lake/<namespace>/<dataset>/…` keys can never
+  collide with an archived dataset's objects. Version number is unique per
+  dataset; job ids are UUIDs.
 
 ## 6. Ingestion behavior
 
@@ -161,10 +202,15 @@ Common rules:
   paired with exactly one target `dataset_version` (status
   `PENDING → BUILDING → READY | FAILED`, §3.3).
 - Conversion writes to `staging/<namespace>/<dataset>/<job-id>/attempt=<n>/`
-  first and only "commits" by (a) placing complete Parquet parts into
-  `lake/…/version=<n>/` and (b) marking the version `READY` in the same logical
-  commit — and both steps are conditional on the job's current `fencing_token`
-  (§6.1). A partial version is never exposed as `READY`.
+  first and then writes the complete Parquet parts to the attempt-isolated
+  durable prefix
+  `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/`. Publication is the
+  fenced catalog commit (§6.1): the version becomes `READY` and its
+  `object_prefix` points at the winning attempt prefix in one conditional
+  transaction. A partial or losing attempt is never referenced; its objects are
+  removed by the stale-attempt sweeper once the version is terminal (§4 rule 6),
+  never while it is `PENDING`/`BUILDING`. A partial version is never exposed as
+  `READY`.
 - Failure leaves no dangling staging objects and no `READY` version.
 - Partition columns are explicit and user-selected with a safe default (no
   partitioning, or only low-cardinality columns); high-cardinality partitioning
@@ -190,35 +236,43 @@ token and the expected current status, for example
 `UPDATE … WHERE id = ? AND fencing_token = ? AND status = 'RUNNING'`. A
 conditional update that affects **zero rows** means the worker has been fenced —
 its token is no longer current — and it **must** abort: it discards local state,
-cleans only its own attempt's `staging/…/attempt=<n>/` prefix, and never
-publishes objects or transitions state. Expiry is the *trigger* for fencing, but
-the fence is *enforced* at commit time by the token check, so a merely delayed
-(not dead) worker is fenced the instant a recovery pass re-claims its job, before
-it can commit a stale result.
+deletes its own attempt's `staging/…/attempt=<n>/` and any objects it wrote under
+its own `lake/…/version=<n>/attempt=<n>/` prefix, and never transitions state.
+The stale-attempt sweeper (§4 rule 6) is the backstop that reclaims an orphaned
+attempt prefix when a fenced worker's own self-delete is interrupted. Expiry is
+the *trigger* for fencing, but the fence is
+*enforced* at commit time by the token check, so a merely delayed (not dead)
+worker is fenced the instant a recovery pass re-claims its job, before it can
+commit a stale result.
 
 | From | Event | To | Notes |
 |---|---|---|---|
 | (new) | ingestion requested (`register` or `convert`) | QUEUED | `ingestion_job` row created with `attempt = 0` and no token; target `dataset_version` created as `PENDING`; `retry_of` set when this is a retry |
 | QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=?, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'`; exactly one winner; version `PENDING` → `BUILDING` |
-| RUNNING | all Parquet written to `staging/…/attempt=<n>/` + schema captured, then commit | SUCCEEDED | publish staging → `lake/…/version=<n>/`, then one conditional transaction: version → `READY` and job → `SUCCEEDED`, both `WHERE … fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort, clean this attempt's staging |
-| RUNNING | cancel accepted | CANCELLED | conditional on token; staging cleaned; version → `FAILED` with `error_summary = "cancelled"` |
-| RUNNING | unrecoverable error | FAILED | conditional on token; `failure_reason` + `error_summary` set; staging cleaned; version → `FAILED` |
-| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token first (increments `attempt`, clears `fencing_token`) and marks the job FAILED retryable; the old worker is fenced by that token change |
+| RUNNING | all Parquet written to `lake/…/version=<n>/attempt=<n>/` + schema captured, then commit | SUCCEEDED | one conditional transaction sets the version `READY` with `object_prefix` = this attempt's prefix and the job `SUCCEEDED`, both `WHERE … fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort, delete this attempt's prefixes (§4 rule 6 sweeps any straggler) |
+| RUNNING | cancel accepted | CANCELLED | conditional on token; staging and this attempt's lake prefix cleaned; version → `FAILED` with `error_summary = "cancelled"` |
+| RUNNING | unrecoverable error | FAILED | conditional on token; `failure_reason` + `error_summary` set; staging and this attempt's lake prefix cleaned; version → `FAILED` |
+| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token (increments `attempt`, clears `fencing_token`) **and atomically marks the target version `FAILED`** in one transaction; the old worker is fenced by the token change |
 
 - `QUEUED` jobs survive worker restart: state lives in PostgreSQL and the queue
   is reconstructed by scanning for `QUEUED` rows.
 - A worker that crashes mid-attempt leaves the job `RUNNING` with an expired
   lease. A recovery pass (run by any worker's lease/heartbeat cycle) performs a
-  single atomic conditional update —
+  single atomic transaction that (a) conditionally updates the job —
   `UPDATE … SET status='FAILED', failure_reason='worker_crash', retryable=true,
   attempt=attempt+1, fencing_token=NULL, lease_owner=NULL, lease_expires_at=NULL
-  WHERE id=? AND status='RUNNING' AND lease_expires_at < now()` — which both
-  marks the job terminal and invalidates the old token, then cleans the old
-  attempt's `staging/` prefix. Because the old token no longer matches, any later
-  commit by the delayed worker affects zero rows and is detected; the worker
-  aborts without publishing. Interrupted jobs are never silently `SUCCEEDED`, and
-  a partitioned-but-alive worker cannot overwrite the terminal state that the
-  recovery pass set.
+  WHERE id=? AND status='RUNNING' AND lease_expires_at < now()` — and (b) in the
+  same transaction marks the target version
+  `FAILED WHERE id=<target_version> AND status='BUILDING'`. Job and version can
+  therefore never diverge: a crashed attempt cannot leave a permanently
+  `BUILDING` version. After the transaction commits, the pass deletes the old
+  attempt's `staging/` and `lake/…/version=<n>/attempt=<old>/` prefixes (safe
+  because the version is `FAILED`, i.e., its attempt prefixes are conclusively
+  abandoned per §4 rule 6). Because the old token no longer matches, any
+  later commit by the delayed worker affects zero rows and is detected; the
+  worker aborts without transitioning state. Interrupted jobs are never silently
+  `SUCCEEDED`, and a partitioned-but-alive worker cannot overwrite the terminal
+  state that the recovery pass set.
 
 ### 6.2 Retry and version numbering
 
@@ -372,15 +426,26 @@ parser/validator is the primary SQL control and the per-query scoped credential
 is the independently enforced object-store control. A keyword blacklist is never
 the boundary.
 
-> **DuckDB version pin.** These controls are validated against the exact DuckDB
-> version pinned in `go.mod` (DuckDB v2.x; the precise patch is chosen in phase 4
-> and fixed thereafter). The settings named below — `access_mode`,
-> `disabled_filesystems`, `autoload_known_extensions`,
-> `autoinstall_known_extensions`, `allow_unsigned_extensions`,
-> `lock_configuration`, `allowed_configs`, `memory_limit`, `threads`,
-> `max_execution_time`, `enable_global_s3_configuration`, and the Secrets Manager
-> (`CREATE SECRET … SCOPE`, where `SCOPE` is a path prefix) — exist and behave as
-> described on that version. Phase 6 pins each with an adversarial test, so a
+> **DuckDB version pin — prerequisite, not yet satisfied.** This phase ships no
+> `go.mod` pin, so nothing in this section is "validated against a pinned
+> version"; the settings and Secrets-Manager behavior named below are the
+> *intended* enforcement controls, not verified facts. They become enforceable
+> only after two prerequisites are met: (1) phase 4 selects and pins an exact
+> DuckDB version (its full `major.minor.patch` and the corresponding binding
+> commit) in `go.mod` and the build, and (2) that exact version's availability
+> and behavior for every named control — `access_mode`, `disabled_filesystems`,
+> `autoload_known_extensions`, `autoinstall_known_extensions`,
+> `allow_unsigned_extensions`, `lock_configuration`, `allowed_configs`,
+> `memory_limit`, `threads`, `max_execution_time`,
+> `enable_global_s3_configuration`, and the Secrets Manager
+> (`CREATE SECRET … SCOPE`, where `SCOPE` is a path prefix) — is verified, with
+> any discrepancy reconciled back into this document before implementation
+> relies on it. Until then, the engine-level layer (layer 4) and the scoped
+> secret selection (layer 3) are stated design targets, and the only boundary
+> that may be described as *enforceable* today is what runs in worker code
+> before the engine — the parser/validator allowlist and deny-by-default (layer 1)
+> and server-side table binding (layer 2) — each to be re-verified against the
+> pinned version. Phase 6 then pins each control with an adversarial test, so a
 > later DuckDB upgrade that changes behavior fails the test rather than silently
 > widening the surface.
 
@@ -395,12 +460,17 @@ the boundary.
    read. Rejection returns `query_denied` before DuckDB is involved.
 
 2. **Server-side table binding (no user-controlled paths).** The worker resolves
-   each allowed `catalog.<dataset>_v<n>` reference to the exact registered
-   `lake/<namespace>/<dataset>/version=<n>/` prefix stored in the catalog and
-   binds it to a server-generated `read_parquet('s3://…/lake/…/version=<n>/**')`
-   scan. The `**` here is a file glob that expands to every object under that
-   prefix; it is unrelated to the secret `SCOPE`, which is a literal path prefix
-   (layer 3). The prefix comes from the catalog row, never from the SQL text.
+   each allowed `catalog.<dataset>_v<n>` reference to the version's committed
+   attempt prefix — `dataset_version.object_prefix` =
+   `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/` — stored in the catalog
+   and binds it to a server-generated
+   `read_parquet('s3://…/lake/…/version=<n>/attempt=<n>/**')` scan. Binding to
+   the committed attempt prefix (not the whole `version=<n>/` subtree) means a
+   stale or losing attempt's objects are never read, even before the sweeper
+   removes them. The `**` here is a file glob that expands to every object under
+   that prefix; it is unrelated to the secret `SCOPE`, which is a literal path
+   prefix (layer 3). The prefix comes from the catalog row, never from the SQL
+   text.
    There is no `CREATE VIEW` issued from user SQL at query time, so there is no
    read-only-versus-DDL ordering conflict; the trust boundary is this binding
    step, which runs entirely in worker code before the rewritten statement is
@@ -409,15 +479,16 @@ the boundary.
 3. **Per-query scoped object-store credential (independently enforced
    boundary).** For each query the worker obtains a short-lived, prefix-scoped
    credential — an S3/MinIO STS token whose policy allows `s3:GetObject` and
-   `s3:ListBucket` on exactly the `lake/<namespace>/<dataset>/version=<n>/`
-   object prefix (a real S3 prefix key, not a glob) — and registers it as a
+   `s3:ListBucket` on exactly the committed attempt prefix
+   `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/`
+   (a real S3 prefix key, not a glob) — and registers it as a
    connection-scoped DuckDB secret whose `SCOPE` is that same clean prefix
    (`CREATE SECRET … IN connection … SCOPE
-   's3://<bucket>/lake/…/version=<n>/'`). A secret scope is a path **prefix**,
-   not a glob: the `SCOPE` therefore ends at `version=<n>/` (no `*` or `**`
-   suffix), so the matching read URL
-   `s3://<bucket>/lake/…/version=<n>/[col=value/…]part-<uuid>.parquet` always
-   begins with it. DuckDB's Secrets Manager selects a secret only when its scope
+   's3://<bucket>/lake/…/version=<n>/attempt=<n>/'`). A secret scope is a path
+   **prefix**, not a glob: the `SCOPE` therefore ends at `attempt=<n>/` (no `*`
+   or `**` suffix), so the matching read URL
+   `s3://<bucket>/lake/…/version=<n>/attempt=<n>/[col=value/…]part-<uuid>.parquet`
+   always begins with it. DuckDB's Secrets Manager selects a secret only when its scope
    is the longest-prefix match for the path being read; every read outside the
    granted prefixes has **no matching secret** and — because no unscoped or
    ambient credential is available (see the fail-closed requirement below) —
@@ -494,7 +565,8 @@ The boundary is tested by both positive and adversarial cases (recorded in
   `catalog.<dataset>_v<n>` returns rows for every `READY` version; joins and
   aggregates across two registered versions of the same or different datasets
   succeed; `unnest` over a list/struct column succeeds. The test asserts that the
-  per-query secret's `SCOPE` is the clean `lake/…/version=<n>/` prefix, so the
+  per-query secret's `SCOPE` is the clean `lake/…/version=<n>/attempt=<n>/`
+  prefix, so the
   granted secret is actually selected (longest-prefix match) for every legitimate
   read.
 - **Out-of-prefix denial must fail**: DDL/DML, `COPY`, `ATTACH`, `INSTALL`/
@@ -543,10 +615,11 @@ never observe.
     hardening, not required.
   - **Query (read)** (per query, short-lived, prefix-scoped): before execution
     the worker obtains an STS credential whose policy allows read of **exactly
-    the `lake/<namespace>/<dataset>/version=<n>/` object prefixes referenced by
-    that query** (S3 prefix, not a glob) and registers it as a connection-scoped
+    the committed attempt prefixes
+    `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/` referenced by that
+    query** (S3 prefix, not a glob) and registers it as a connection-scoped
     DuckDB secret whose `SCOPE` is that same clean prefix, ending at
-    `version=<n>/` (§7.4 layer 3). The query connection has no unscoped secret
+    `attempt=<n>/` (§7.4 layer 3). The query connection has no unscoped secret
     and `enable_global_s3_configuration=false` (see the fail-closed requirement
     in §7.4), so there is no ambient fallback. There is no bucket-wide `lake/`
     read credential for query execution: a query can only present credentials
@@ -617,7 +690,7 @@ never observe.
 | Original uploads | Deleted after `READY` unless `retain_original=true` |
 | `staging/` objects | Deleted immediately on success or failure |
 | `exports/` (results/exports) | TTL default 24h, swept |
-| query_job history rows | Bounded retention (default 30 days, configurable); SQL text retention configurable (hash always kept) |
+| query_job history rows | Bounded retention (default 30 days, configurable); the SQL statement is retained for the job's full lifetime and is never purged or overwritten before the job reaches a terminal state; after that it follows the history retention window (configurable), while the statement hash is always kept |
 | Failed version error summaries | Retained with the version for its lifetime (archive does not delete version rows) |
 
 ## 11. API error contract
@@ -700,7 +773,7 @@ and must abort without publishing results.
 
 | From | Event | To | Notes |
 |---|---|---|---|
-| (new) | submit validated | QUEUED | durable row (`attempt=0`, no token), statement hash recorded |
+| (new) | submit validated | QUEUED | durable row (`attempt=0`, no token); the full SQL statement is persisted in `statement` and its hash in `statement_hash` — the worker executes the persisted statement, never a reconstruction from the hash |
 | QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=?, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'` |
 | RUNNING | results committed to object store + row marked | SUCCEEDED | worker writes the spool to `exports/…/attempt=<n>/result.parquet`, then one conditional update `SET status='SUCCEEDED', result_ref=?, rows_returned=?, … WHERE id=? AND fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort (spool left to TTL, never referenced) |
 | RUNNING | cancel accepted | CANCELLED | conditional on token; observable and persisted |
@@ -710,6 +783,22 @@ and must abort without publishing results.
 
 - Queued jobs survive worker restart (state is in PostgreSQL; the queue is
   reconstructed by scanning for `QUEUED` rows).
+- The submitted statement is persisted verbatim in `query_job.statement` at
+  submission and is the single source the worker uses to execute the job: on
+  claim, the worker reads `statement` from the row, re-validates it against the
+  §7 boundary, and executes it. It is never derived from the hash, so a job
+  requeued after a worker restart executes the exact submitted text.
+  `statement_hash` (SHA-256 of the normalized statement) is stored alongside it
+  as an integrity/dedup aid and for the retention policy in §10; it is not a
+  substitute for the statement.
+- **Statement access and retention.** `statement` is written once by the API at
+  submission and never updated thereafter. It is read by the worker on every
+  claim (including a requeue after restart) and by the API when serving query
+  history and the rerun action. It is retained for the job's full lifetime — it
+  is never purged or overwritten before the job reaches a terminal state — and
+  thereafter follows the history retention window (§10). It is never emitted in
+  error responses or logs (§11); it is returned to the operator only through the
+  history/rerun surface, which already carries the operator's own query text.
 - An interrupted running job is requeued, never silently `SUCCEEDED`: the
   recovery pass increments `attempt` and clears the `fencing_token`, so any later
   commit by the delayed worker matches zero rows and is detected. The requeued
