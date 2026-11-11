@@ -36,22 +36,31 @@ storage, not a distributed database.
 make up
 ```
 
-`make up` builds and starts PostgreSQL, MinIO, the API, the worker placeholder,
-and the web dashboard, then waits for the dependency services to become healthy.
-Once up:
+`make up` first writes a gitignored `.env` with freshly generated local
+credentials (via `scripts/genenv.sh`), then builds and starts PostgreSQL, MinIO,
+the API, the worker placeholder, and the web dashboard, and waits for the
+dependency services to become healthy. Once up:
 
 - Dashboard: <http://localhost:5173>
 - API: <http://localhost:8080> (see `/healthz` and `/readyz`)
 - MinIO console: <http://localhost:9001>
+
+No credentials are committed to the repository: the local PostgreSQL and MinIO
+secrets are generated on first boot into a gitignored `.env`. All published
+ports are bound to `127.0.0.1` only. Do not expose these ports or reuse local
+credentials in a shared deployment.
 
 Stop the stack with `make down`. Named volumes (`pgdata`, `miniodata`) persist
 data across restarts.
 
 ## Configuration
 
-The API and worker read configuration from environment variables. Local
-development defaults are listed in [`.env.example`](.env.example); copy it to
-`.env` to override values.
+The API and worker read configuration from environment variables. Secrets are
+never committed: `make up` generates a gitignored `.env` with random local
+credentials via `scripts/genenv.sh`. [`.env.example`](.env.example) is a
+reference that lists the variables; its secret fields are intentionally blank,
+and the generator fills any blank secret it finds. To pin your own values, copy
+`.env.example` to `.env` and fill the blank fields before running `make up`.
 
 | Variable | Default | Purpose |
 |---|---|---|

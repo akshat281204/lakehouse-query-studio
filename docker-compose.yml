@@ -5,10 +5,10 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-lakehouse}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (run make up to generate .env)}
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -23,14 +23,14 @@ services:
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-lakehouse}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-lakehouse}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set (run make up to generate .env)}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - miniodata:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -46,14 +46,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       LOG_FORMAT: json
       SHUTDOWN_TIMEOUT: 10s
-      POSTGRES_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${POSTGRES_DB:-lakehouse}?sslmode=disable
+      POSTGRES_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lakehouse}?sslmode=disable
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-lakehouse}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-lakehouse}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: ${MINIO_BUCKET:-lakehouse}
       MINIO_USE_SSL: "false"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,10 +73,10 @@ services:
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       LOG_FORMAT: json
-      POSTGRES_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${POSTGRES_DB:-lakehouse}?sslmode=disable
+      POSTGRES_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lakehouse}?sslmode=disable
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-lakehouse}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-lakehouse}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: ${MINIO_BUCKET:-lakehouse}
       MINIO_USE_SSL: "false"
     depends_on:
@@ -90,7 +90,7 @@ services:
       context: ./web
       dockerfile: Dockerfile
     ports:
-      - "5173:80"
+      - "127.0.0.1:5173:80"
     depends_on:
       api:
         condition: service_started
