@@ -19,7 +19,7 @@ history. The first release runs entirely under Docker Compose.
 | Component | Responsibility |
 |---|---|
 | Go API / control plane | Dataset registration, ingestion coordination, query submission/status/cancellation, result paging/export, health/readiness/metrics, configuration validation. Stateless; all durable state lives in PostgreSQL and the object store. Is the sole reader of result spools: it pages and exports results by reading `exports/<namespace>/<query-id>/…` under a per-query, prefix-scoped read credential (§9 of `docs/design.md`). |
-| Go query worker | Bounded asynchronous job execution. Runs DuckDB through a maintained Go binding behind `internal/query.Engine`; isolates engine-specific setup and S3 configuration behind that interface. Claims jobs under a per-claim `fencing_token`/`attempt` and writes result spools to an attempt-scoped export prefix so a stale worker cannot publish results or overwrite terminal state (§6.1, §13 of `docs/design.md`). |
+| Go worker (ingestion + query) | Bounded asynchronous job execution under two independent concurrency pools — `INGESTION_WORKERS` for ingestion and `QUERY_WORKERS` for queries, sharing one process CPU/memory budget (§12 of `docs/design.md`). Runs DuckDB through a maintained Go binding behind `internal/query.Engine`; isolates engine-specific setup and S3 configuration behind that interface. Claims jobs under a per-claim `fencing_token`/`attempt` and writes result spools to an attempt-scoped export prefix so a stale worker cannot publish results or overwrite terminal state (§6.1, §13 of `docs/design.md`). |
 | DuckDB | Local, single-node analytical execution over Parquet via its S3/HTTPFS support. The worker loads the pinned, checksum-verified `httpfs` extension by trusted code before sealing the connection (so user SQL cannot load extensions), parses/validates user SQL, re-binds the allowed catalog references to their registered prefixes, and executes the rewritten statement on a read-only connection whose S3 credential is scoped to exactly those prefixes (see `docs/design.md` §7.4). Never reachable from browser code. |
 | PostgreSQL | Durable catalog metadata, dataset versions, ingestion jobs, query jobs, and bounded query history. Never stores result payloads or credentials. |
 | MinIO (local) / S3-compatible (remote) | Immutable source and converted Parquet objects. Uses distinct prefixes for datasets, uploads, staging, and temporary query exports. |
@@ -140,8 +140,10 @@ history. The first release runs entirely under Docker Compose.
 - **Secrets**: credentials are server-side only and never appear in logs,
   metrics, traces, catalog rows, or API responses. SQL text and user-controlled
   values are excluded from logs and metric labels.
-- **Limits**: query duration, worker concurrency, DuckDB threads/memory, page
-  size, and result size are bounded server-side (see `docs/design.md` §12).
+- **Limits**: query duration, ingestion and query worker concurrency, DuckDB
+  threads/memory, page size, and result size — including hard **byte** bounds for
+  materialization, paging, and CSV export with an explicit oversized-row rule —
+  are bounded server-side (see `docs/design.md` §9, §12).
 
 ## 6. Deployment topology
 

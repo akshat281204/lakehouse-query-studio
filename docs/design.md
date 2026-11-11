@@ -70,10 +70,18 @@ earlier than the attempt's current `lease_expires_at` (§6.1) — the credential
 always covers the entire lease window; a NULL value means no
 credential was ever issued for that attempt, so there is no write capability to
 quiesce and the sweeper treats the prefix as already quiescent (§4 rule 8).
-`write_credential_revoked` (ingestion jobs
-only) records whether the STS provider confirmed per-session revocation of that
-credential; it is set `true` only after a confirmed revocation, and only then is
-`write_credential_expires_at` advanced to the revocation instant (`now()`).
+`write_credential_session_ids` (ingestion jobs
+only) is the set of provider session/credential IDs issued for this attempt —
+the initial credential plus every renewal credential. An attempt can hold several
+concurrently valid credentials, because a renewal's earlier credential remains
+valid until its own expiry. `write_credential_expires_at` is the **maximum** true
+expiry across all issued credentials and is monotonic: a new issuance may only
+raise it, never lower it. `write_credential_revoked` is set `true` only after the
+provider confirms revocation of **every** ID in
+`write_credential_session_ids`; only then is `write_credential_expires_at`
+advanced to `now()`. If any issued credential is unrevoked or unconfirmed, the
+bound stays at its previous maximum and the sweeper waits for that expiry plus
+`CLEANUP_GRACE` (§4 rule 8).
 `write_credential_reserved_until` (ingestion jobs only) is the conservative upper
 bound for a credential the worker is about to request. The worker persists it
 **before** calling STS, conditional on the current `fencing_token`; every
@@ -315,14 +323,18 @@ Rules:
      delete, and a prefix that fails to quiesce raises an operational alert
      rather than being silently abandoned.
    Fencing governs *publication* (the token check in §6.1); credential expiry is
-   what governs *writes*. Revocation is optional hardening that shortens the
-   window: if the STS provider supports per-session revocation **and confirms**
-   it, the fencing transaction records `write_credential_revoked=true` and sets
-   `write_credential_expires_at = now()`; otherwise it **leaves the
-   issuance-recorded expiry and the reservation unchanged** (never overwrites
-   either with `now()`), and the
-   sweeper waits for natural expiry plus `CLEANUP_GRACE`. A version in
-   `PENDING`/`BUILDING` has no expired-credential abandoned prefix and is never
+   what governs *writes*. Because each renewal issues a new credential while the
+   previous one remains valid until its own expiry, `write_credential_expires_at`
+   is the **maximum** expiry across every credential in
+   `write_credential_session_ids`, never lowered by a newer issuance. Revocation
+   is optional hardening that shortens the window: only if the STS provider
+   confirms revocation of **every** session in `write_credential_session_ids`
+   does the fencing transaction record `write_credential_revoked=true` and set
+   `write_credential_expires_at = now()`; if any session is unrevoked or
+   unconfirmed, it **keeps the maximum expiry and the reservation unchanged**
+   (never lowers either to `now()`), and the sweeper waits for that bound plus
+   `CLEANUP_GRACE`. A version in `PENDING`/`BUILDING` has no
+   expired-credential abandoned prefix and is never
    swept (rule 6). The sweeper's bound is always
    `max(write_credential_expires_at, write_credential_reserved_until)`, so a
    credential issued by a renewal that lost the fence is covered by the
@@ -467,10 +479,13 @@ first step is durable *before* any credential exists:
    `E ≥ lease_expires_at` (the credential covers the full lease window) and
    `E ≤ reserved_until` (it does not outlive the durable reservation); an expiry
    outside either bound is rejected (treated as an issuance failure).
-3. **Persist actual expiry.** The worker records the credential's true expiry as
-   `write_credential_expires_at` and clears the reservation in one conditional
-   update keyed on the current token and `status='RUNNING'`:
-   `UPDATE … SET write_credential_expires_at=?, write_credential_reserved_until=NULL
+3. **Persist actual expiry.** The worker records the credential's true expiry
+   and adds the new session ID in one conditional update keyed on the current
+   token and `status='RUNNING'`, never lowering an existing bound:
+   `UPDATE … SET write_credential_expires_at =
+   GREATEST(COALESCE(write_credential_expires_at,'epoch'), ?),
+   write_credential_session_ids = write_credential_session_ids || ?,
+   write_credential_reserved_until=NULL
    WHERE id=? AND fencing_token=? AND status='RUNNING'`. **No `staging/` or
    `lake/` write may occur before that commit succeeds.**
 
@@ -497,9 +512,14 @@ reserve step.** Step 1 computes the target new deadline
 `lease_expires_at` unchanged; step 2 issues the credential; step 3 is a single
 conditional update (keyed on the current token and `status='RUNNING'`) that sets
 `lease_expires_at = D` **and**
-`write_credential_expires_at = <actual expiry>` (and clears the reservation)
-together, where the actual expiry satisfies
-`D ≤ write_credential_expires_at ≤ D + CREDENTIAL_SLACK`. Because only a
+`write_credential_expires_at = GREATEST(COALESCE(write_credential_expires_at, 'epoch'), <actual expiry>)`
+**and** appends the new session ID to `write_credential_session_ids` (and clears
+the reservation) together, where the actual expiry satisfies
+`D ≤ <actual expiry> ≤ D + CREDENTIAL_SLACK`. Because the previous credential
+stays valid until its own (possibly later) expiry, the persisted expiry is the
+**maximum** across every credential in `write_credential_session_ids` — never
+lowered by a newer issuance — and every session ID is retained so revocation can
+cover the full set (§3.1, §4 rule 8). Because only a
 committed step 3 extends the lease, the lease can never be extended without a
 replacement credential that already covers the new window: if the STS call
 fails or the provider returns an expiry outside `[D, D + CREDENTIAL_SLACK]`,
@@ -522,14 +542,15 @@ write**. It releases the claim in one conditional
 transaction keyed on the current token and `status='RUNNING'`:
 `UPDATE … SET status='FAILED', failure_reason='credential_issue_failed',
 retryable=true, attempt=attempt+1, fencing_token=NULL, lease_owner=NULL,
-lease_expires_at=NULL, write_credential_expires_at=NULL
+lease_expires_at=NULL
 WHERE id=? AND fencing_token=? AND status='RUNNING'`,
 and in the same transaction marks the target version
 `FAILED WHERE id=<target_version> AND status='BUILDING'`.
-`write_credential_expires_at` stays NULL — no credential was ever issued for the
-attempt — while any `write_credential_reserved_until` committed in step 1 is
-**retained, never lowered**, so the sweeper's bound is the reservation and it
-cannot delete before every credential that could have been issued is expired.
+`write_credential_expires_at` is **not lowered**: it keeps the maximum expiry of
+any credential previously issued for the attempt (NULL only if none was ever
+issued), while any `write_credential_reserved_until` committed in step 1 is
+**retained, never lowered**, so the sweeper's bound is the larger of the two and
+it cannot delete before every credential that could have been issued is expired.
 The sweeper may reclaim the (empty) attempt prefix once that bound plus
 `CLEANUP_GRACE` has passed (§4 rule 8). A failed issuance therefore never leaves
 an unbounded credential. (The mirrored case — the credential is issued but the
@@ -561,7 +582,7 @@ recovery pass re-claims its job, before it can commit a stale result.
 | RUNNING | all Parquet written to `lake/…/version=<n>/attempt=<n>/` + schema captured, then commit | SUCCEEDED | one conditional transaction sets the version `READY` with `object_prefix` = this attempt's prefix and the job `SUCCEEDED`, both `WHERE … fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort (rules 6 and 8 sweep any straggler after write-credential expiry) |
 | RUNNING | cancel accepted | CANCELLED | conditional on token; version → `FAILED` with `error_summary = "cancelled"`. No object deletion here: cancellation occurs while the attempt write credential may still authorize writes, so staging/lake reclamation is deferred to the stale-attempt sweeper, which deletes only after write-quiescence — `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
 | RUNNING | unrecoverable error | FAILED | conditional on token; `failure_reason` + `error_summary` set; version → `FAILED`. No object deletion here: staging/lake reclamation is deferred to the stale-attempt sweeper after write-quiescence — `max(write_credential_expires_at, write_credential_reserved_until) + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
-| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token (increments `attempt`, clears `fencing_token`) **and atomically marks the target version `FAILED`** in one transaction; `write_credential_expires_at` is set to `now()` and `write_credential_revoked=true` **only when** the STS provider confirms per-session revocation; otherwise recovery sets `write_credential_expires_at = max(recorded expiry, write_credential_reserved_until)` and keeps the reservation, so a credential issued by a renewal that lost the fence is still covered (§4 rule 8); the old worker is fenced by the token change and can no longer write once every possible credential has expired |
+| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token (increments `attempt`, clears `fencing_token`) **and atomically marks the target version `FAILED`** in one transaction; `write_credential_expires_at` is set to `now()` and `write_credential_revoked=true` **only when** the STS provider confirms revocation of **every** session in `write_credential_session_ids`; otherwise recovery sets `write_credential_expires_at = max(recorded expiry, write_credential_reserved_until)` and keeps the reservation, so a credential issued by a renewal that lost the fence is still covered (§4 rule 8); the old worker is fenced by the token change and can no longer write once every possible credential has expired |
 
 - `QUEUED` jobs survive worker restart: state lives in PostgreSQL and the queue
   is reconstructed by scanning for `QUEUED` rows.
@@ -580,7 +601,7 @@ recovery pass re-claims its job, before it can commit a stale result.
   `FAILED WHERE id=<target_version> AND status='BUILDING'`:
 
   - **Revocation confirmed** — the STS provider supports per-session revocation
-    and confirms the attempt credential is revoked:
+    and confirms **every** session in `write_credential_session_ids` is revoked:
     `UPDATE … SET status='FAILED', failure_reason='worker_crash', retryable=true,
     attempt=attempt+1, fencing_token=NULL, lease_owner=NULL, lease_expires_at=NULL,
     write_credential_expires_at=now(), write_credential_revoked=true
@@ -659,6 +680,15 @@ recovery pass re-claims its job, before it can commit a stale result.
   lease expires, and the sweeper deletes the prefix only after
   `max(write_credential_expires_at, write_credential_reserved_until) +
   CLEANUP_GRACE` (§4 rule 8).
+- **Renewal-then-revocation cleanup test**: an attempt issues credential A at
+  claim and credential B at a renewal, so A and B are both valid and A expires
+  after B's issuance. Recovery confirms revocation of B only. The test asserts
+  that `write_credential_expires_at` remains the maximum expiry (A's), that the
+  sweeper does not delete before A expires plus `CLEANUP_GRACE`, and that a write
+  using A before its expiry is either rejected (both sessions revoked) or occurs
+  before the sweep bound, never after the prefix is deleted. A companion case
+  confirms that only when **every** session ID is confirmed revoked is the bound
+  advanced to `now()` and cleanup allowed to proceed.
 - **Commit-then-crash staging cleanup test**: a `convert` worker writes staging,
   writes the complete `lake/…/version=<n>/attempt=<n>/` prefix, commits the
   fenced `READY`/`SUCCEEDED` transition, and then crashes **before** deleting its
@@ -1136,8 +1166,10 @@ never observe.
   read credential is requested per query, scoped to that query's export prefix,
   and never broadens to `lake/`, `uploads/`, `staging/`, or another query's
   `exports/`.
-- Paging returns a bounded page (default limit 1,000; hard max 10,000), read
-  from the spool with the scoped read credential.
+- Paging returns a bounded page read from the spool with the scoped read
+  credential, bounded by **both** row count and bytes (§9 byte bounds below):
+  default `limit` 1,000 rows (hard max 10,000) and `MAX_PAGE_BYTES`
+  (default 4 MiB, hard max 64 MiB), always stopping at a whole-row boundary.
 - Row bound: a query returns at most `MAX_RESULT_ROWS` (default 10,000, hard
   max 100,000) rows to the client. To make `truncated` exact, the engine
   materializes at most `MAX_RESULT_ROWS + 1` rows: if a
@@ -1149,9 +1181,68 @@ never observe.
   distinguishable from one with more rows. `rows_returned` is the count actually
   returned (at most `MAX_RESULT_ROWS`) and `truncated` is an independent boolean,
   so the two are never conflated.
+- **Byte bounds (materialization, paging, export).** Row-count limits alone do
+  not bound payload or spool size: a permitted row may hold an arbitrarily large
+  scalar, list, struct, or map value, so one page or export could still produce
+  an unbounded payload and spool. Every result path is therefore bounded in
+  bytes as well as rows, and every bound is enforced on the **serialized** size
+  of what is actually written or streamed — never on an estimate from column
+  types. The limits are `MAX_RESULT_BYTES` (total encoded size of the spooled
+  `result.parquet`; default 256 MiB, hard max 1 GiB), `MAX_ROW_BYTES` (encoded
+  size of a single materialized row; default 1 MiB, hard max 16 MiB),
+  `MAX_PAGE_BYTES` (serialized size of one paged response's row array; default
+  4 MiB, hard max 64 MiB), and `MAX_EXPORT_BYTES` (CSV payload bytes of one
+  export response; default 64 MiB, hard max 512 MiB). The invariant
+  `MAX_ROW_BYTES ≤ MIN(MAX_PAGE_BYTES, MAX_EXPORT_BYTES, MAX_RESULT_BYTES)` is
+  validated at startup (a violating configuration is rejected) and guarantees a
+  non-empty result always yields at least one whole row on every path: no page
+  or export is ever empty, and no row is ever split across a page or cut
+  mid-cell.
+
+  - **Materialization is byte-bounded and streamed.** The worker streams rows
+    from the engine in bounded chunks and counts both rows and encoded bytes as
+    it writes `result.parquet`. A row's encoded size is the size of its
+    contribution to the spool — the serialized columnar bytes the worker's own
+    encoder produces for that row, including the full contents of any nested
+    list/struct/map cell — not a type-width estimate. The same per-row size is
+    measured conservatively so that it upper-bounds the row's JSON and CSV wire
+    encodings as well (worst-case quoting/escaping), which is what lets the
+    invariant below guarantee every page and export can emit a whole row.
+    Writing stops at the first
+    violated bound: more than `MAX_RESULT_ROWS` rows, or a row that would push
+    the spool past `MAX_RESULT_BYTES`, truncates the result to the largest
+    whole-row prefix that fits and records `truncated=true`; the crossing row is
+    the probe row and is never written, returned, or counted. The spool
+    therefore never exceeds `MAX_RESULT_BYTES`, and the worker's in-memory
+    footprint during materialization is bounded by the chunk size, not the full
+    result.
+  - **Oversized row (single row too large).** A row whose encoded size exceeds
+    `MAX_ROW_BYTES` cannot be returned within any page, export, or result bound;
+    it is a property of the data, not of the request. The worker terminates the
+    query and records `FAILED` with `failure_reason=resource_exceeded` (surfaced
+    as `resource_exhausted` per §11); no spool is published and `result_ref` is
+    not set, and the oversized row is never written to the spool. This is the
+    only case in which a byte bound fails the query instead of truncating: an
+    *aggregate* result that is too large is truncated to the largest fitting
+    whole-row prefix, while a result containing a single oversized row is
+    refused. Because `MAX_ROW_BYTES ≤ MAX_RESULT_BYTES`, every non-oversized row
+    fits the spool, so byte truncation can never make an otherwise-valid result
+    empty.
+  - **Paging is bounded in bytes and rows.** A page returns whole rows from the
+    spool until either `limit` rows or `MAX_PAGE_BYTES` (the serialized size of
+    the page's row array as the API encodes it) is reached. When the byte bound
+    stops a page before `limit` rows, the pagination cursor advances by the
+    number of whole rows actually emitted, so no row is split across pages and a
+    page is never empty while rows remain.
+  - **CSV export is bounded in bytes and rows.** Export streams whole rows only,
+    bounded by both the export row limit and `MAX_EXPORT_BYTES` measured on the
+    CSV text after quoting/escaping; the API stops before emitting a row whose
+    CSV-encoded size would exceed the remaining byte budget, so the streamed
+    payload never exceeds the bound and no CSV row is truncated mid-cell.
 - CSV export streams a bounded CSV (default max 50,000 rows, capped by the
-  result bound) directly from the spool to the client; no separate `export.csv`
-  object is written, so no export-write credential is needed.
+  result bound, and `MAX_EXPORT_BYTES` whole-row bytes) directly from the spool
+  to the client; no separate `export.csv` object is written, so no export-write
+  credential is needed.
 - TTL: `exports/` objects expire after `EXPORT_TTL` (default 24h) via an
   object-store lifecycle rule plus a background sweeper; a query whose spool
   has expired returns a clear `result_expired` error rather than stale rows.
@@ -1161,6 +1252,24 @@ never observe.
   fail with an authorization error and read no data. The same test asserts the
   API's result/export endpoints never receive a credential broader than that
   query's export prefix.
+- **Byte-limit tests.** (1) *Oversized row*: a dataset containing one row whose
+  encoded size exceeds `MAX_ROW_BYTES` (a generated `VARCHAR`/`BLOB` of
+  `MAX_ROW_BYTES + 1` bytes) makes the query `FAILED` with
+  `failure_reason=resource_exceeded` (surfaced as `resource_exhausted`), no
+  `result_ref`, and no spool object — while the same query against rows each
+  below the limit succeeds, proving the failure is per-row, not per-query. (2)
+  *Total-bytes truncation*: many rows each below `MAX_ROW_BYTES` whose aggregate
+  encoded size exceeds `MAX_RESULT_BYTES` yield `truncated=true`, a
+  `rows_returned` equal to the largest whole-row prefix that fits, and a spool
+  object whose size is ≤ `MAX_RESULT_BYTES`, with no row split. (3) *Page byte
+  bound*: with `limit` large enough that `MAX_PAGE_BYTES` binds first, a page's
+  serialized row array is ≤ `MAX_PAGE_BYTES`, the cursor advances by whole rows,
+  no row is split across pages, and a page is never empty while rows remain.
+  (4) *Export byte bound*: CSV export of rows whose quoted/escaped text exceeds
+  `MAX_EXPORT_BYTES` stops at a whole-row boundary, the streamed payload is ≤
+  `MAX_EXPORT_BYTES`, at least one row is exported, and the final emitted row is
+  complete, valid CSV. (5) *Invariant*: startup rejects any configuration with
+  `MAX_ROW_BYTES > MIN(MAX_PAGE_BYTES, MAX_EXPORT_BYTES, MAX_RESULT_BYTES)`.
 
 ## 10. Data retention policy
 
@@ -1370,26 +1479,59 @@ only pin a default where a test explicitly chooses to.
 | Query execution timeout | 60s | max 300s |
 | Ingestion lease duration (`LEASE_DURATION`) | 15m | max 30m |
 | Query lease duration (`QUERY_LEASE_DURATION`) | 120s | max 600s |
-| Lease heartbeat interval | `LEASE_DURATION / 3` | `< LEASE_DURATION − LEASE_RENEWAL_MARGIN` |
+| Ingestion lease heartbeat interval | `LEASE_DURATION / 3` | `< LEASE_DURATION − LEASE_RENEWAL_MARGIN` |
+| Query lease heartbeat interval | `QUERY_LEASE_DURATION / 3` | `< QUERY_LEASE_DURATION − LEASE_RENEWAL_MARGIN` |
 | Lease renewal margin (`LEASE_RENEWAL_MARGIN`) | 30s | configurable |
 | Write-credential slack margin (`CREDENTIAL_SLACK`) | 30s | configurable, covers STS latency + clock skew |
 | Min write-credential TTL (`MIN_WRITE_CREDENTIAL_TTL`) | 30s | configurable |
 | Cleanup grace (`CLEANUP_GRACE`) | 15m | configurable |
 | Upload retention window (`UPLOAD_RETRY_WINDOW`) | 7 days | max 90 days |
-| Worker concurrency (queries) | 2 | configurable, ≥1 |
+| Worker concurrency (queries) | 2 | configurable, ≥1, hard max 16 |
+| Worker concurrency (ingestion) | 1 | configurable, ≥1, hard max 8 |
 | DuckDB threads | min(4, cpus) | configurable |
 | DuckDB memory | 4 GiB | configurable |
 | SQL text length | 64 KiB | hard cap |
 | Statements per query | 1 | exactly 1 |
 | Result rows | 10,000 | hard max 100,000 |
+| Result bytes (`MAX_RESULT_BYTES`) | 256 MiB | hard max 1 GiB |
+| Row bytes (`MAX_ROW_BYTES`) | 1 MiB | hard max 16 MiB |
 | Page size | 1,000 | hard max 10,000 |
+| Page bytes (`MAX_PAGE_BYTES`) | 4 MiB | hard max 64 MiB |
 | Export rows | 50,000 | capped by result bound |
+| Export bytes (`MAX_EXPORT_BYTES`) | 64 MiB | hard max 512 MiB |
 | Queue depth | 100 | bounded, rejects when full |
 
 The query timeout is enforced at two levels: the worker cancels via a Go context
 deadline, and the engine enforces the same budget via DuckDB's
 `max_execution_time` (milliseconds). Cancellation is observable and persisted in
 the job row (§13).
+
+**Worker concurrency is bounded per job class and shares one process budget.** A
+single Go worker process executes both ingestion and query jobs under two
+independent bounded pools, so one job class cannot starve the other:
+`INGESTION_WORKERS` (default 1; configurable, ≥1, hard max 8) bounds the number
+of concurrently `RUNNING` ingestion jobs, and `QUERY_WORKERS` (default 2;
+configurable, ≥1, hard max 16) bounds the number of concurrently `RUNNING` query
+jobs. A job is claimed (`QUEUED → RUNNING`) only when its class's pool has a free
+slot; otherwise it remains `QUEUED` and is retried on a later claim pass, so
+neither class can ever run more jobs than configured. The two pools share the
+single worker process and therefore its CPU and memory budget: the DuckDB thread
+and memory limits (§12 table) are applied per query job and ingestion conversion
+bounds its own per-job memory, so peak resource use is bounded by
+`(INGESTION_WORKERS × ingestion per-job budget) + (QUERY_WORKERS × query per-job
+budget)` within the single node (§14). Startup validation rejects any concurrency
+setting outside its class's bounds (including `0`) and any configuration whose
+worst-case per-job resource product exceeds the node's configured budget. The
+queue-depth limit (§12 table) applies to the combined queue (the sum of `QUEUED`
+ingestion and query jobs), so the worker never accumulates an unbounded backlog.
+
+**Testability (concurrency).** With `INGESTION_WORKERS=1` and `QUERY_WORKERS=1`, a
+test submits `N` ingestion jobs and `M` query jobs and asserts that at most one
+ingestion job and one query job is ever `RUNNING` concurrently, that excess jobs
+stay `QUEUED` and are claimed as slots free, and that a concurrency setting of `0`
+or above a class's hard max is rejected at startup. A companion test asserts that
+a long ingestion job does not delay a query job's claim (separate pools) and that
+the combined queue-depth limit rejects new submissions once full.
 
 ### 12.1 Leases and heartbeat (liveness, not a time budget)
 
@@ -1407,22 +1549,25 @@ liveness is carried entirely by the lease.
   30 minutes. `QUERY_LEASE_DURATION` (query) defaults to 120 seconds, hard max
   600 seconds. Both are configurable and validated against their bounds at
   startup; a test asserts the bounds are enforced.
-- **Heartbeat / renewal.** While a job is `RUNNING`, its holder renews the lease
-  every `LEASE_HEARTBEAT_INTERVAL` (default one third of the lease duration) by
-  a conditional update keyed on its current `fencing_token` and
-  `status='RUNNING'`:
-  `UPDATE … SET lease_expires_at = now() + LEASE_DURATION WHERE id=? AND
-  fencing_token=? AND status='RUNNING'`. A renewal that affects zero rows means
-  the worker was fenced; it must abort without writing or committing. This plain
-  lease extension is the whole heartbeat for a **query** job (which holds no
-  write credential); an **ingestion** job never performs this extension alone —
-  its heartbeat is the combined commit-last renewal in the next bullet, and its
-  `lease_expires_at` is advanced only in that renewal's step 3. The
-  heartbeat interval must satisfy
-  `LEASE_HEARTBEAT_INTERVAL + LEASE_RENEWAL_MARGIN < LEASE_DURATION`, where
-  `LEASE_RENEWAL_MARGIN` (default 30s) covers scheduling delay and a renewal
-  round-trip; configuration validation rejects any combination that violates
-  this precondition, and a test asserts it.
+- **Heartbeat / renewal.** Each job type has its own heartbeat interval and
+  extends with **its own** lease duration. While a query job is `RUNNING`, its
+  holder renews every `QUERY_HEARTBEAT_INTERVAL` (default
+  `QUERY_LEASE_DURATION / 3`) with
+  `UPDATE … SET lease_expires_at = now() + QUERY_LEASE_DURATION WHERE id=? AND
+  fencing_token=? AND status='RUNNING'`, after validating
+  `QUERY_HEARTBEAT_INTERVAL + LEASE_RENEWAL_MARGIN < QUERY_LEASE_DURATION`
+  (default: 40s + 30s < 120s). A query therefore renews well before its
+  120-second lease can expire and is never requeued while healthy. An
+  **ingestion** job never performs a plain lease extension: its heartbeat is the
+  combined commit-last renewal in the next bullet, which extends with
+  `LEASE_DURATION`, and its interval must satisfy
+  `INGESTION_HEARTBEAT_INTERVAL + LEASE_RENEWAL_MARGIN < LEASE_DURATION`
+  (default: 5m + 30s < 15m). Configuration validation rejects any interval or
+  duration combination that violates the precondition for the job type it
+  governs, and a test asserts both validations independently (a query is never
+  scheduled against the ingestion interval, and vice versa). A renewal that
+  affects zero rows means the worker was fenced; it must abort without writing or
+  committing.
 - **Renewal and write credentials (ingestion only, commit-last).** Ingestion
   renewal follows the reserve → issue → persist ordering of §6.1, but the lease
   extension is moved to the persist step so that **the lease is never extended
@@ -1443,7 +1588,13 @@ liveness is carried entirely by the lease.
   3. **Commit lease + expiry (atomic, conditional).** in a single conditional
      update keyed on the current token and `status='RUNNING'`, sets
      `lease_expires_at = D` **and**
-     `write_credential_expires_at = E` and clears the reservation.
+     `write_credential_expires_at = GREATEST(COALESCE(write_credential_expires_at, 'epoch'), E)`
+     **and** appends the new session ID to `write_credential_session_ids`, and
+     clears the reservation. The persisted expiry is the **maximum** across every
+     issued credential — never lowered by a newer issuance — so a renewal whose
+     credential expires before an earlier, still-valid credential's expiry cannot
+     shorten the sweep bound, and every session ID is retained so revocation
+     covers the full set (§3.1, §4 rule 8).
      **Only this step extends the lease**, and no `staging/`/`lake/` write may
      use the *old* credential once it is known the lease is not being extended.
   Because the lease extension and the credential's persisted expiry are written
