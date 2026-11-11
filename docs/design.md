@@ -50,10 +50,16 @@ storage (immutable data); in-memory state is always reconstructible.
 | dataset | PostgreSQL | id (UUID), namespace_id, name, source_prefix, format, status, created_at, updated_at | ACTIVE, ARCHIVED |
 | dataset_version | PostgreSQL | id, dataset_id, version (monotonic int), object_prefix, format, partition_columns, status, schema_snapshot_id, error_summary, created_at | READY, FAILED |
 | schema_column | PostgreSQL | id, version_id, position, name, type, nullable, is_partition | — (rows) |
-| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, error_summary, retry_of, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED |
-| query_job | PostgreSQL | id (UUID), statement_hash, dataset_version_ids, status, failure_reason, rows_returned, bytes_scanned, result_ref, plan_summary, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED, TIMED_OUT |
+| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
+| query_job | PostgreSQL | id (UUID), statement_hash, dataset_version_ids, status, failure_reason, retryable, rows_returned, bytes_scanned, result_ref, plan_summary, attempt, fencing_token, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED, TIMED_OUT (state model §13) |
 | object (Parquet) | object store | key under `lake/…` | — (immutable) |
-| spooled result | object store | key under `exports/…` | — (TTL-expired) |
+| spooled result | object store | key under `exports/…/attempt=<n>/…` | — (TTL-expired) |
+
+`attempt` and `fencing_token` are the lease-fencing fields defined in §6.1 and
+§13: `attempt` is a monotonically increasing integer incremented on every job
+claim, and `fencing_token` is a random value regenerated on every claim. Only the
+holder of a job's current `fencing_token` may transition it or publish its
+output.
 
 ### 3.2 Dataset lifecycle
 
@@ -101,18 +107,24 @@ lake/<namespace>/<dataset>/version=<n>/[col=value/...]/part-<uuid>.parquet
 # Original uploads (retained only when retention is enabled)
 uploads/<namespace>/<dataset>/<job-id>/<sanitized-original-name>
 
-# Ingestion staging (temporary; cleaned on success or failure)
-staging/<namespace>/<dataset>/<job-id>/part-<uuid>.parquet
+# Ingestion staging (temporary; cleaned on success or failure; attempt-scoped)
+staging/<namespace>/<dataset>/<job-id>/attempt=<n>/part-<uuid>.parquet
 
-# Spooled query results and exports (temporary; TTL)
-exports/<namespace>/<query-id>/result.parquet
-exports/<namespace>/<query-id>/export.csv
+# Spooled query results (temporary; TTL; attempt-scoped)
+exports/<namespace>/<query-id>/attempt=<n>/result.parquet
 ```
+
+The `attempt=<n>/` segment on `staging/` and `exports/` keys is the job's
+attempt counter (§6.1, §13); every (re)claim writes under its own attempt
+segment, so a stale worker from a previous attempt cannot write under, or
+clobber, a live attempt's output. CSV export is streamed from the spool and is
+not a separate object (§9).
 
 Rules:
 
 1. `lake/`, `uploads/`, `staging/`, and `exports/` are disjoint top-level
-   prefixes; query access is scoped to `lake/` only.
+   prefixes; query execution is scoped to `lake/` only, and result serving is
+   scoped to the single query's `exports/` prefix (§8, §9).
 2. Hive-style partition directories are `col=value/` segments in the
    dataset-declared partition order; unpartitioned datasets write files directly
    under `version=<n>/`.
@@ -145,17 +157,88 @@ Two kinds of ingestion job:
 
 Common rules:
 
-- Ingestion is asynchronous and persisted as an `ingestion_job`.
-- Conversion writes to `staging/…` first and only "commits" by (a) placing
-  complete Parquet parts into `lake/…/version=<n>/` and (b) updating the
-  catalog to `READY` in the same logical commit. A partial version is never
-  exposed as `READY`.
-- Retry-safe: a retried job writes to a fresh staging directory; a successful
-  retry does not create a second visible version.
+- Ingestion is asynchronous and persisted as an `ingestion_job`. Each attempt is
+  paired with exactly one target `dataset_version` (status
+  `PENDING → BUILDING → READY | FAILED`, §3.3).
+- Conversion writes to `staging/<namespace>/<dataset>/<job-id>/attempt=<n>/`
+  first and only "commits" by (a) placing complete Parquet parts into
+  `lake/…/version=<n>/` and (b) marking the version `READY` in the same logical
+  commit — and both steps are conditional on the job's current `fencing_token`
+  (§6.1). A partial version is never exposed as `READY`.
 - Failure leaves no dangling staging objects and no `READY` version.
 - Partition columns are explicit and user-selected with a safe default (no
   partitioning, or only low-cardinality columns); high-cardinality partitioning
   is not applied by default.
+
+### 6.1 Ingestion job state machine
+
+Ingestion status: `QUEUED → RUNNING → SUCCEEDED | FAILED | CANCELLED`. The job
+is the unit of work; its target version is the artifact it produces or fails to
+produce, and the two states move together.
+
+Every `ingestion_job` carries two lease-fencing fields (inventoried in §3.1) that
+make stale-worker commits impossible:
+
+- `attempt` — a monotonically increasing integer, incremented on every job
+  claim. The initial claim is attempt 1.
+- `fencing_token` — a random value (UUID) regenerated on every claim. Only the
+  holder of the job's **current** `fencing_token` may transition the job or its
+  target version out of a non-terminal state.
+
+All worker-initiated transitions and the final commit are **conditional** on the
+token and the expected current status, for example
+`UPDATE … WHERE id = ? AND fencing_token = ? AND status = 'RUNNING'`. A
+conditional update that affects **zero rows** means the worker has been fenced —
+its token is no longer current — and it **must** abort: it discards local state,
+cleans only its own attempt's `staging/…/attempt=<n>/` prefix, and never
+publishes objects or transitions state. Expiry is the *trigger* for fencing, but
+the fence is *enforced* at commit time by the token check, so a merely delayed
+(not dead) worker is fenced the instant a recovery pass re-claims its job, before
+it can commit a stale result.
+
+| From | Event | To | Notes |
+|---|---|---|---|
+| (new) | ingestion requested (`register` or `convert`) | QUEUED | `ingestion_job` row created with `attempt = 0` and no token; target `dataset_version` created as `PENDING`; `retry_of` set when this is a retry |
+| QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=?, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'`; exactly one winner; version `PENDING` → `BUILDING` |
+| RUNNING | all Parquet written to `staging/…/attempt=<n>/` + schema captured, then commit | SUCCEEDED | publish staging → `lake/…/version=<n>/`, then one conditional transaction: version → `READY` and job → `SUCCEEDED`, both `WHERE … fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort, clean this attempt's staging |
+| RUNNING | cancel accepted | CANCELLED | conditional on token; staging cleaned; version → `FAILED` with `error_summary = "cancelled"` |
+| RUNNING | unrecoverable error | FAILED | conditional on token; `failure_reason` + `error_summary` set; staging cleaned; version → `FAILED` |
+| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token first (increments `attempt`, clears `fencing_token`) and marks the job FAILED retryable; the old worker is fenced by that token change |
+
+- `QUEUED` jobs survive worker restart: state lives in PostgreSQL and the queue
+  is reconstructed by scanning for `QUEUED` rows.
+- A worker that crashes mid-attempt leaves the job `RUNNING` with an expired
+  lease. A recovery pass (run by any worker's lease/heartbeat cycle) performs a
+  single atomic conditional update —
+  `UPDATE … SET status='FAILED', failure_reason='worker_crash', retryable=true,
+  attempt=attempt+1, fencing_token=NULL, lease_owner=NULL, lease_expires_at=NULL
+  WHERE id=? AND status='RUNNING' AND lease_expires_at < now()` — which both
+  marks the job terminal and invalidates the old token, then cleans the old
+  attempt's `staging/` prefix. Because the old token no longer matches, any later
+  commit by the delayed worker affects zero rows and is detected; the worker
+  aborts without publishing. Interrupted jobs are never silently `SUCCEEDED`, and
+  a partitioned-but-alive worker cannot overwrite the terminal state that the
+  recovery pass set.
+
+### 6.2 Retry and version numbering
+
+- A retry is a **new** `ingestion_job` with `retry_of` set to the failed job,
+  targeting a **fresh** `dataset_version` with the next monotonic version number.
+  The failed version stays `FAILED` (terminal) and is never exposed.
+- Because only `READY` versions are visible to the query engine and the browser
+  (§3.3), a retry after failure or crash yields at most one new `READY` version
+  for the same logical input; the failed attempt never becomes visible, so retry
+  cannot create duplicate visible versions.
+- Retry is offered only for `FAILED` jobs marked `retryable` (worker crash,
+  transient object-store error). A `CANCELLED` job is terminal and not retried;
+  the operator submits a fresh ingestion instead.
+- A retried job writes to a fresh `staging/…/attempt=<n>/` directory; any stale
+  staging prefix from a crashed attempt is cleaned by the recovery pass before
+  the retry runs. Because each job — and each attempt within a job — has its own
+  `fencing_token` and its own attempt-scoped staging prefix, a stale worker from
+  a prior attempt can neither publish objects under the new attempt's prefix nor
+  transition the new job/version: its conditional commits match zero rows and
+  are detected (§6.1).
 
 ## 7. SQL safety boundary (normative)
 
@@ -273,53 +356,134 @@ and again by the engine-level controls in §7.4.
 
 ### 7.3 Relation scope (what a query may reference)
 
-- The only relations a query may reference are catalog views generated
-  server-side for `READY` dataset versions (one view per version, named
-  `catalog.<dataset>_v<n>` or an equivalent internal name).
+- The only relations a query may reference are the generated catalog relations
+  for `READY` dataset versions (one per version, exposed to user SQL as
+  `catalog.<dataset>_v<n>` or an equivalent internal name). These are realized
+  by server-side re-binding to the version's registered prefix (§7.4 layer 2),
+  never by user-issued DDL.
 - The parser resolves every table reference and rejects any reference to a raw
   `s3://` URL, `http(s)://` URL, `file://` path, local filesystem path, or any
   table not present in the generated catalog for that query.
 
-### 7.4 Engine-level enforcement (defense in depth)
+### 7.4 Engine-level enforcement (defense in depth, layered)
 
-The boundary is enforced by layers, never by a keyword blacklist alone. Reads of
-registered Parquet happen through DuckDB's S3/HTTPFS filesystem; the
-`enable_external_access=false` gate does **not** remove that capability — it
-removes the *user's* ability to perform external I/O, and the worker re-enables
-its own registered-prefix reads through an explicit path allowlist.
+The boundary is enforced by four layers. No single layer is trusted; the
+parser/validator is the primary SQL control and the per-query scoped credential
+is the independently enforced object-store control. A keyword blacklist is never
+the boundary.
 
-1. **Parser/AST validation**: SQL is parsed with a real parser to an AST;
-   statement count, statement type, table references, and function calls are
-   validated against §7.1–§7.3 before any engine work begins. No user statement
-   ever contains a table function, a file/URL scalar function, or a path/URL
-   literal, so there is no user-supplied "arbitrary path" to evaluate.
+> **DuckDB version pin.** These controls are validated against the exact DuckDB
+> version pinned in `go.mod` (DuckDB v2.x; the precise patch is chosen in phase 4
+> and fixed thereafter). The settings named below — `access_mode`,
+> `disabled_filesystems`, `autoload_known_extensions`,
+> `autoinstall_known_extensions`, `allow_unsigned_extensions`,
+> `lock_configuration`, `allowed_configs`, `memory_limit`, `threads`,
+> `max_execution_time`, `enable_global_s3_configuration`, and the Secrets Manager
+> (`CREATE SECRET … SCOPE`, where `SCOPE` is a path prefix) — exist and behave as
+> described on that version. Phase 6 pins each with an adversarial test, so a
+> later DuckDB upgrade that changes behavior fails the test rather than silently
+> widening the surface.
 
-2. **Trusted bootstrap (worker code, not user SQL)**: the worker opens the
-   per-query DuckDB connection with server-side S3 credentials and creates one
-   generated view per referenced `READY` version,
-   `CREATE VIEW catalog.<dataset>_v<n> AS SELECT * FROM parquet_scan('s3://…/lake/<namespace>/<dataset>/version=<n>/**')`.
-   The prefix is taken from the catalog, never from user input. The worker then
-   sets `allowed_directories`/`allowed_paths` to exactly the registered prefixes
-   the query may touch (and the `exports/` spool prefix), so the generated views
-   can read under an otherwise-locked engine.
+1. **Parser/AST validation (primary SQL boundary).** The user statement is
+   parsed to an AST with a real parser. Before any engine work: the statement
+   count is exactly one; the statement is a `SELECT` (optionally `WITH … SELECT`);
+   every table reference resolves to a generated catalog relation for a `READY`
+   dataset version (§7.3); every function call resolves to a name in the closed
+   §7.2 allowlist (deny-by-default); and no path/URL literal is present. Because
+   every file/URL reader and every scalar function that accepts a path, URL, or
+   secret is absent from the allowlist, the user cannot *express* an arbitrary
+   read. Rejection returns `query_denied` before DuckDB is involved.
 
-3. **Locked execution (user SQL)**: before the user statement runs, the worker
-   applies `access_mode=read_only`, `enable_external_access=false`,
-   `lock_configuration=true` (with `allowed_configs` limited to the query-budget
-   settings), `allow_unsigned_extensions=false`, extension auto-install/autoload
-   disabled, and `disabled_filesystems` set to disable `LocalFileSystem` (and
-   any other filesystem not required for the S3-compatible backend). Under
-   `enable_external_access=false`, any user attempt to invoke a file/URL reader,
-   `COPY`, `INSTALL`/`LOAD`, or a local or arbitrary S3 path is rejected at bind
-   time; the only reads that still succeed are those under
-   `allowed_directories`/`allowed_paths`, which the worker populated with the
-   registered prefixes.
+2. **Server-side table binding (no user-controlled paths).** The worker resolves
+   each allowed `catalog.<dataset>_v<n>` reference to the exact registered
+   `lake/<namespace>/<dataset>/version=<n>/` prefix stored in the catalog and
+   binds it to a server-generated `read_parquet('s3://…/lake/…/version=<n>/**')`
+   scan. The `**` here is a file glob that expands to every object under that
+   prefix; it is unrelated to the secret `SCOPE`, which is a literal path prefix
+   (layer 3). The prefix comes from the catalog row, never from the SQL text.
+   There is no `CREATE VIEW` issued from user SQL at query time, so there is no
+   read-only-versus-DDL ordering conflict; the trust boundary is this binding
+   step, which runs entirely in worker code before the rewritten statement is
+   handed to the engine.
 
-4. **Secret scoping**: object-store credentials are injected server-side with
-   least privilege (query scope: read `lake/` and read/write `exports/` only)
-   and are never present in the SQL text or the client. Even if every DuckDB
-   layer above were bypassed, the credential's IAM policy denies reads outside
-   the registered prefixes.
+3. **Per-query scoped object-store credential (independently enforced
+   boundary).** For each query the worker obtains a short-lived, prefix-scoped
+   credential — an S3/MinIO STS token whose policy allows `s3:GetObject` and
+   `s3:ListBucket` on exactly the `lake/<namespace>/<dataset>/version=<n>/`
+   object prefix (a real S3 prefix key, not a glob) — and registers it as a
+   connection-scoped DuckDB secret whose `SCOPE` is that same clean prefix
+   (`CREATE SECRET … IN connection … SCOPE
+   's3://<bucket>/lake/…/version=<n>/'`). A secret scope is a path **prefix**,
+   not a glob: the `SCOPE` therefore ends at `version=<n>/` (no `*` or `**`
+   suffix), so the matching read URL
+   `s3://<bucket>/lake/…/version=<n>/[col=value/…]part-<uuid>.parquet` always
+   begins with it. DuckDB's Secrets Manager selects a secret only when its scope
+   is the longest-prefix match for the path being read; every read outside the
+   granted prefixes has **no matching secret** and — because no unscoped or
+   ambient credential is available (see the fail-closed requirement below) —
+   fails, and the object store's own STS policy denies it independently. This is
+   the boundary that holds even if a parser bug let an unlisted reader through:
+   the read still fails at the object store for any prefix not granted to that
+   query.
+
+4. **Engine configuration (defense in depth, not the read boundary).** The
+   execution connection is locked down before the user statement runs:
+
+   - `access_mode=READ_ONLY` — the connection cannot perform DDL/DML or writes.
+     This complements, not replaces, parser rejection, and is applied only on the
+     execution connection after the scoped secret is registered.
+   - `disabled_filesystems='LocalFileSystem'` — local filesystem I/O is disabled;
+     only the S3-compatible httpfs filesystem remains for the registered reads.
+   - `autoload_known_extensions=false`, `autoinstall_known_extensions=false`,
+     `allow_unsigned_extensions=false` — no extension load or install.
+   - `enable_global_s3_configuration=false` — DuckDB never fetches ambient AWS
+     credentials from the process environment, so an out-of-prefix read cannot
+     fall back to a process-wide credential (see the fail-closed requirement
+     below).
+   - `lock_configuration=true` with `allowed_configs` limited to the per-query
+     budget settings (`threads`, `memory_limit`) — user SQL cannot `SET`/`PRAGMA`
+     its way out; `SET` and `PRAGMA` are also statement-denied (§7.1).
+
+   `enable_external_access` is **not** the read boundary and is deliberately not
+   used to distinguish worker SQL from user SQL: setting it to `false` would also
+   disable the `read_parquet` scans the query legitimately needs, and
+   `allowed_directories`/`allowed_paths` govern *local* paths, not `s3://`
+   prefixes. The worker/user distinction is structural — user SQL is parsed,
+   validated, and re-bound (layers 1–2), then executed under a scoped credential
+   (layer 3); the engine settings above only narrow what an already bound
+   statement can do.
+
+**Fail-closed: no ambient or unscoped credential fallback.** The boundary in
+layer 3 only holds if the query execution connection has **no other S3
+credential** that DuckDB could fall back to. DuckDB's default behavior
+(`enable_global_s3_configuration=true`) auto-loads ambient AWS credentials from
+the process environment — the deprecated global `s3_access_key_id`,
+`s3_secret_access_key`, and `s3_session_token` settings, the environment
+variables `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, and
+`AWS_PROFILE`, and `~/.aws/credentials`. With any of these present, an
+out-of-prefix read that matches no scoped secret can still succeed under the
+ambient credential, silently defeating the boundary. Therefore the worker
+**must** harden the query execution path so that no ambient or unscoped
+credential exists:
+
+- `enable_global_s3_configuration=false` on the execution connection, so DuckDB
+  never fetches ambient AWS credentials from the environment.
+- Only per-query, prefix-scoped `config`-provider secrets are registered, using
+  the explicit `KEY_ID`/`SECRET`/`SESSION_TOKEN` from the STS response. The
+  `credential_chain` provider and the deprecated global `s3_*` settings are
+  never used for query credentials, so the AWS SDK credential chain and legacy
+  settings are not consulted.
+- No unscoped secret is registered on the execution connection, and
+  persistent-secret loading is disabled for the query path (an empty/isolated
+  secret directory, or `allow_persistent_secrets=false`), so an operator's
+  stored unscoped secret cannot become an implicit fallback.
+
+The worker asserts these preconditions at startup and immediately before each
+query and **fails closed** if an ambient credential or unscoped secret is
+detected in the query execution path. Under these preconditions a read outside
+the granted prefixes has **no applicable credential at all** and fails with a
+credential/authorization error — never with data — regardless of what the
+deployment injects into the worker's environment.
 
 ### 7.5 Testability
 
@@ -329,7 +493,10 @@ The boundary is tested by both positive and adversarial cases (recorded in
 - **Registered queries succeed**: a validated `SELECT` over
   `catalog.<dataset>_v<n>` returns rows for every `READY` version; joins and
   aggregates across two registered versions of the same or different datasets
-  succeed; `unnest` over a list/struct column succeeds.
+  succeed; `unnest` over a list/struct column succeeds. The test asserts that the
+  per-query secret's `SCOPE` is the clean `lake/…/version=<n>/` prefix, so the
+  granted secret is actually selected (longest-prefix match) for every legitimate
+  read.
 - **Out-of-prefix denial must fail**: DDL/DML, `COPY`, `ATTACH`, `INSTALL`/
   `LOAD`, `EXPORT`, `PRAGMA`, `SET`, `CALL`, multiple statements, local paths
   (`read_csv('/etc/…')`), arbitrary S3 URLs
@@ -338,8 +505,26 @@ The boundary is tested by both positive and adversarial cases (recorded in
   `read_text`, `current_setting`, `gen_random_uuid`), and oversized result
   requests. Each must be denied with `query_denied` (or the mapped engine/limit
   error) and must read no data outside the registered prefixes.
+- **Scoped-credential boundary holds independently**: a test harness that
+  bypasses layers 1–2 (invoking `read_parquet` directly against the engine to
+  simulate a parser bug) must still fail to read (a) another dataset's prefix,
+  (b) `uploads/`, `staging/`, or another query's `exports/` prefix, and (c) a
+  sentinel object placed outside every granted prefix — because no matching
+  secret scope exists, no ambient/unscoped credential fallback is configured
+  (see the fail-closed requirement in §7.4), and the STS policy denies the read.
+  The same sentinel must never be observed by any passing query.
+- **Ambient-credential bypass test (fail closed)**: the scoped-credential test
+  above runs with the worker's **normal deployment environment** — including any
+  ambient AWS credential variables (`AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`) and credential
+  files that the Compose/deployment ordinarily injects for ingestion — and the
+  out-of-prefix read must still fail with a credential/authorization error,
+  never data. This proves the boundary does not depend on the worker process
+  happening to be clean: even with ambient credentials present,
+  `enable_global_s3_configuration` is `false` and no unscoped secret is
+  registered, so the read has no applicable credential.
 
-Both behaviors are pinned in phase 6 with adversarial tests, including a
+These behaviors are pinned in phase 6 with adversarial tests, including a
 sentinel object placed outside every registered prefix that a passing test must
 never observe.
 
@@ -347,32 +532,82 @@ never observe.
 
 - Credentials live only in the API/worker configuration (environment or secret
   store), never in catalog rows, logs, metrics, traces, browser bundles, or API
-  responses.
-- Two least-privilege scopes:
-  - **ingest**: read `uploads/` and registered source prefixes; write
-    `staging/` and `lake/`.
-  - **query**: read `lake/` (registered prefixes only); read/write `exports/`
-    (spooling results and exports).
+  responses. They are injected server-side and never appear in SQL text.
+- Credential classes, by function:
+
+  - **Ingest** (trusted worker code, operator-driven): a least-privilege
+    credential that may read the source prefixes it is told to read (`uploads/`
+    and/or an existing Parquet prefix) and write `staging/` and `lake/`.
+    Ingestion input is the operator's, not untrusted SQL, so a deployment-scoped
+    ingest credential is acceptable; a per-job-scoped variant is optional
+    hardening, not required.
+  - **Query (read)** (per query, short-lived, prefix-scoped): before execution
+    the worker obtains an STS credential whose policy allows read of **exactly
+    the `lake/<namespace>/<dataset>/version=<n>/` object prefixes referenced by
+    that query** (S3 prefix, not a glob) and registers it as a connection-scoped
+    DuckDB secret whose `SCOPE` is that same clean prefix, ending at
+    `version=<n>/` (§7.4 layer 3). The query connection has no unscoped secret
+    and `enable_global_s3_configuration=false` (see the fail-closed requirement
+    in §7.4), so there is no ambient fallback. There is no bucket-wide `lake/`
+    read credential for query execution: a query can only present credentials
+    for the prefixes it was granted, so even a DuckDB-control bypass cannot read
+    a different dataset's prefix, `uploads/`, `staging/`, or another query's
+    exports.
+  - **Export/spool (write)** (trusted worker code): the worker writes the
+    result-set spool on a separate connection using a write-scoped credential to
+    only the `exports/<namespace>/<query-id>/attempt=<n>/` prefix (again a clean
+    prefix, not a glob); this is trusted code, not user SQL (§9).
+  - **Result serving (read)** (trusted API code): paging and CSV export are
+    served by the API, which is the **only** component that reads the spool. For
+    each result/export request the API obtains a short-lived, prefix-scoped
+    credential whose policy allows `s3:GetObject` (and `s3:ListBucket` only where
+    enumeration is required) on exactly the `exports/<namespace>/<query-id>/`
+    prefix of that one query — no other prefix, no `lake/`, `uploads/`,
+    `staging/`, or another query's `exports/`, and no write. CSV export is
+    streamed from the spool to the client; no separate export object is written
+    (§9).
+
 - The dashboard/API never returns bucket credentials, secret keys, or raw
-  object keys. Preview/schema results are bounded (§9).
+  object keys. Preview/schema and result-serving credentials are server-side only
+  and never reach the browser. Preview/schema results are bounded (§9).
 
 ## 9. Result paging, export, and retention
 
 - Query result payloads are never stored as rows in PostgreSQL.
-- On completion, results are spooled to `exports/<namespace>/<query-id>/`
-  (Parquet) and summarized in the `query_job` row (row count, byte count,
-  result reference). Small and large results use the same path for consistency.
-- Paging: `GET …/queries/{id}/results?offset=&limit=` returns a bounded page
-  (default limit 1,000; hard max 10,000). Offset paging reads from the spool.
+- On completion, the worker (trusted code, on a separate write-scoped
+  connection) spools results to
+  `exports/<namespace>/<query-id>/attempt=<n>/result.parquet` and summarizes the
+  `query_job` row (row count, byte count, result reference pointing at that
+  attempt-scoped key). Small and large results use the same path for consistency.
+  The `attempt=<n>` segment is taken from the job's current claim (§13), so a
+  stale attempt never overwrites a live attempt's spool.
+- **Reader**: the API is the sole reader of the spool. Paging
+  (`GET …/queries/{id}/results?offset=&limit=`) and CSV export
+  (`GET …/queries/{id}/export`) both read
+  `exports/<namespace>/<query-id>/attempt=<n>/result.parquet` using a
+  short-lived, prefix-scoped **read** credential that permits `s3:GetObject`
+  (and `s3:ListBucket` where enumeration is needed) on exactly
+  `exports/<namespace>/<query-id>/` — no other prefix and no write (§8). The
+  read credential is requested per query, scoped to that query's export prefix,
+  and never broadens to `lake/`, `uploads/`, `staging/`, or another query's
+  `exports/`.
+- Paging returns a bounded page (default limit 1,000; hard max 10,000), read
+  from the spool with the scoped read credential.
 - Row bound: a query returns at most `MAX_RESULT_ROWS` (default 10,000, hard
   max 100,000). Rows beyond the bound are dropped and `truncated:true` is
   recorded; the engine stops early once the bound is reached.
-- CSV export: `GET …/queries/{id}/export` streams a bounded CSV (default max
-  50,000 rows, capped by the result bound) from the spool, written to
-  `exports/<namespace>/<query-id>/export.csv`.
+- CSV export streams a bounded CSV (default max 50,000 rows, capped by the
+  result bound) directly from the spool to the client; no separate `export.csv`
+  object is written, so no export-write credential is needed.
 - TTL: `exports/` objects expire after `EXPORT_TTL` (default 24h) via an
   object-store lifecycle rule plus a background sweeper; a query whose spool
   has expired returns a clear `result_expired` error rather than stale rows.
+- **Testability**: a test asserts that the result-read credential's prefix scope
+  is exactly the query's `exports/<namespace>/<query-id>/` prefix and that reads
+  of another query's `exports/` prefix, or of `lake/`, `uploads/`, or `staging/`,
+  fail with an authorization error and read no data. The same test asserts the
+  API's result/export endpoints never receive a credential broader than that
+  query's export prefix.
 
 ## 10. Data retention policy
 
@@ -447,24 +682,42 @@ only pin a default where a test explicitly chooses to.
 | Export rows | 50,000 | capped by result bound |
 | Queue depth | 100 | bounded, rejects when full |
 
+The query timeout is enforced at two levels: the worker cancels via a Go context
+deadline, and the engine enforces the same budget via DuckDB's
+`max_execution_time` (milliseconds). Cancellation is observable and persisted in
+the job row (§13).
+
 ## 13. Query job lifecycle and crash model
 
 Query status: `QUEUED → RUNNING → SUCCEEDED | FAILED | CANCELLED | TIMED_OUT`.
 
+Every `query_job` carries the same two lease-fencing fields as an ingestion job
+(`attempt` and `fencing_token`, §6.1) with the same rules: `attempt` is
+monotonically incremented and `fencing_token` regenerated on every claim; all
+transitions out of a non-terminal state are conditional on the current token and
+expected status; and a zero-row conditional update means the worker was fenced
+and must abort without publishing results.
+
 | From | Event | To | Notes |
 |---|---|---|---|
-| (new) | submit validated | QUEUED | durable row, statement hash recorded |
-| QUEUED | worker acquires lease | RUNNING | lease_owner/lease_expires_at set |
-| RUNNING | results committed to object store + row marked | SUCCEEDED | success recorded only after results + state are committed |
-| RUNNING | cancel accepted | CANCELLED | observable; cancellation is persisted |
-| RUNNING | timeout exceeded | TIMED_OUT | distinct from FAILED |
-| RUNNING | engine/object-store error | FAILED | failure_reason set (engine_error, object_store, resource_exceeded, …) |
-| RUNNING | lease expires (worker died) | FAILED (retryable) or requeue | never reported SUCCEEDED without committed results |
+| (new) | submit validated | QUEUED | durable row (`attempt=0`, no token), statement hash recorded |
+| QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=?, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'` |
+| RUNNING | results committed to object store + row marked | SUCCEEDED | worker writes the spool to `exports/…/attempt=<n>/result.parquet`, then one conditional update `SET status='SUCCEEDED', result_ref=?, rows_returned=?, … WHERE id=? AND fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort (spool left to TTL, never referenced) |
+| RUNNING | cancel accepted | CANCELLED | conditional on token; observable and persisted |
+| RUNNING | timeout exceeded | TIMED_OUT | conditional on token; distinct from FAILED |
+| RUNNING | engine/object-store error | FAILED | conditional on token; `failure_reason` set (engine_error, object_store, resource_exceeded, …) |
+| RUNNING | lease expires (worker died or partitioned) | QUEUED (requeue) | recovery pass re-claims in one conditional update keyed on `lease_expires_at < now() AND status='RUNNING'`: `SET status='QUEUED', lease_owner=NULL, lease_expires_at=NULL, attempt=attempt+1, fencing_token=NULL`; the old worker is fenced by the token change |
 
 - Queued jobs survive worker restart (state is in PostgreSQL; the queue is
   reconstructed by scanning for `QUEUED` rows).
-- Interrupted running jobs are detected by lease expiry and moved to an
-  explicit retryable/FAILED state — never silently SUCCEEDED.
+- An interrupted running job is requeued, never silently `SUCCEEDED`: the
+  recovery pass increments `attempt` and clears the `fencing_token`, so any later
+  commit by the delayed worker matches zero rows and is detected. The requeued
+  job is claimed again by a (possibly different) worker under a fresh token, and
+  its result is written to that attempt's own export prefix. The only
+  `result_ref` that ever becomes visible is the one set by the current token
+  holder's conditional commit; a stale attempt's spool is never referenced and is
+  reclaimed by TTL.
 - Cancellation and timeout are observable in status and persisted.
 
 ## 14. Single-node limit
