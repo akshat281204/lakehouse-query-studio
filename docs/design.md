@@ -46,11 +46,11 @@ storage (immutable data); in-memory state is always reconstructible.
 
 | Entity | Storage | Key fields | Terminal states |
 |---|---|---|---|
-| namespace | PostgreSQL | id, slug | ACTIVE, ARCHIVED |
+| namespace | PostgreSQL | id, slug | ACTIVE (permanent in v1; namespace archival/delete is out of scope, §3.2) |
 | dataset | PostgreSQL | id (UUID), namespace_id, name, source_prefix, format, status, created_at, updated_at | ACTIVE, ARCHIVED |
 | dataset_version | PostgreSQL | id, dataset_id, version (monotonic int), object_prefix, format, partition_columns, status, schema_snapshot_id, error_summary, created_at | READY, FAILED |
 | schema_column | PostgreSQL | id, version_id, position, name, type, nullable, is_partition | — (rows) |
-| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps, lease_owner, lease_expires_at, write_credential_expires_at | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
+| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps, lease_owner, lease_expires_at, write_credential_expires_at, write_credential_revoked | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
 | query_job | PostgreSQL | id (UUID), statement (verbatim SQL text), statement_hash, dataset_version_ids, status, failure_reason, retryable, rows_returned, truncated, bytes_scanned, result_ref, plan_summary, attempt, fencing_token, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED, TIMED_OUT (state model §13) |
 | object (Parquet) | object store | key under `lake/…` | — (immutable) |
 | spooled result | object store | key under `exports/…/attempt=<n>/…` | — (TTL-expired) |
@@ -62,9 +62,22 @@ holder of a job's current `fencing_token` may transition it or publish its
 output. `write_credential_expires_at` (ingestion jobs only) is the expiry of the
 attempt-scoped, short-lived object-store write credential that authorizes writes
 to `staging/` and `lake/`; it is the single authority for the write-quiescence
-guarantee in §4 rule 8 and §6.1.
+guarantee in §4 rule 8 and §6.1. It is NULL until the attempt's credential is
+actually issued, and then records the credential's true expiry, which is never
+later than the attempt's fixed `lease_expires_at` (§6.1); a NULL value means no
+credential was ever issued for that attempt, so there is no write capability to
+quiesce and the sweeper treats the prefix as already quiescent (§4 rule 8).
+`write_credential_revoked` (ingestion jobs
+only) records whether the STS provider confirmed per-session revocation of that
+credential; it is set `true` only after a confirmed revocation, and only then is
+`write_credential_expires_at` advanced to the revocation instant (`now()`).
 
 ### 3.2 Dataset lifecycle
+
+The single `default` namespace is created once at bootstrap and is **permanently
+`ACTIVE`**; v1 defines no namespace transition, archive, or delete operation, and
+a namespace row is never mutated after creation. Multi-namespace lifecycle is out
+of scope (§1).
 
 Dataset status: `ACTIVE` ↔ `ARCHIVED`.
 
@@ -220,23 +233,44 @@ Rules:
 8. **Cleanup waits for write-quiescence (no writes after delete)**: the sweeper
    deletes an abandoned attempt prefix only after it can prove that no credential
    remains that could write to it. Ingestion writes to `lake/` and `staging/` are
-   authorized solely by an attempt-scoped, short-lived STS credential whose
-   maximum lifetime equals the attempt's job lease (so it expires no later than
-   `lease_expires_at`); there is no long-lived, deployment-wide `lake/` write
-   credential on the ingestion path. The claim stores that credential's expiry in
+   authorized solely by an attempt-scoped, short-lived STS credential whose TTL
+   is the remaining lease duration at issuance time, so its expiry is never later
+   than the attempt's fixed `lease_expires_at` (§6.1); there is no long-lived,
+   deployment-wide `lake/` write credential on the ingestion path. The worker
+   stores that credential's actual expiry in
    `write_credential_expires_at` (§3.1). The sweeper deletes an abandoned attempt
    prefix only when `now() > write_credential_expires_at + CLEANUP_GRACE`, where
-   `CLEANUP_GRACE` (default a few seconds) bounds an already-accepted, in-flight
-   single-part PutObject. After the credential has expired the object store
-   rejects any further authenticated write to that prefix, so a delayed (fenced)
-   worker cannot write after the sweeper's delete; the grace only covers a write
-   accepted before expiry. Fencing governs *publication* (the token check in
-   §6.1); credential expiry is what governs *writes*. Revocation is optional
-   hardening that shortens the window: if the STS provider supports per-session
-   revocation, the fencing transaction also revokes the attempt credential and
-   sets `write_credential_expires_at = now()`; otherwise the sweeper waits for
-   natural expiry plus `CLEANUP_GRACE`. A version in `PENDING`/`BUILDING` has no
-   expired-credential abandoned prefix and is never swept (rule 6).
+   `CLEANUP_GRACE` (default 15 minutes) strictly exceeds the object store's
+   documented maximum time to complete an already-accepted write for the write
+   modes below. After the credential has expired the object store rejects any
+   further authenticated write to that prefix, so a delayed (fenced) worker
+   cannot write after the sweeper's delete.
+   - **Write modes are bounded.** Attempt-scoped writes to `staging/` and
+     `lake/` use single-part `PutObject` only; multipart uploads are disabled
+     for these prefixes and large inputs are split into part files of at most
+     64 MiB each. A single-part PUT accepted before credential expiry therefore
+     completes within the provider's documented request bound, which
+     `CLEANUP_GRACE` exceeds. If multipart writes are ever introduced, the
+     contract requires the writer to record the upload IDs, the sweeper to abort
+     every listed upload, and the sweeper to wait for abort completion before
+     deleting; until then multipart on attempt prefixes is a protocol violation
+     the object-store policy denies.
+   - **Delete-then-verify loop.** The sweeper deletes the prefix, waits
+     `CLEANUP_GRACE`, and re-lists it. If any object is present (only possible
+     for a write accepted before credential expiry), it re-applies the rule-6
+     decision and deletes again; it declares the prefix quiescent only after two
+     consecutive empty listings. It never reports cleanup complete on a single
+     delete, and a prefix that fails to quiesce raises an operational alert
+     rather than being silently abandoned.
+   Fencing governs *publication* (the token check in §6.1); credential expiry is
+   what governs *writes*. Revocation is optional hardening that shortens the
+   window: if the STS provider supports per-session revocation **and confirms**
+   it, the fencing transaction records `write_credential_revoked=true` and sets
+   `write_credential_expires_at = now()`; otherwise it **leaves the original
+   issuance-recorded expiry unchanged** (never overwrites it with `now()`), and the
+   sweeper waits for natural expiry plus `CLEANUP_GRACE`. A version in
+   `PENDING`/`BUILDING` has no expired-credential abandoned prefix and is never
+   swept (rule 6).
 
 ## 5. Catalog and version semantics
 
@@ -300,9 +334,9 @@ Ingestion status: `QUEUED → RUNNING → SUCCEEDED | FAILED | CANCELLED`. The j
 is the unit of work; its target version is the artifact it produces or fails to
 produce, and the two states move together.
 
-Every `ingestion_job` carries two lease-fencing fields and one write-quiescence
-field (inventoried in §3.1). The fencing fields make stale-worker *commits*
-impossible; the write-credential expiry makes stale-worker *writes* impossible
+Every `ingestion_job` carries two lease-fencing fields and two write-quiescence
+fields (inventoried in §3.1). The fencing fields make stale-worker *commits*
+impossible; the write-credential fields make stale-worker *writes* impossible
 (§4 rule 8):
 
 - `attempt` — a monotonically increasing integer, incremented on every job
@@ -310,11 +344,61 @@ impossible; the write-credential expiry makes stale-worker *writes* impossible
 - `fencing_token` — a random value (UUID) regenerated on every claim. Only the
   holder of the job's **current** `fencing_token` may transition the job or its
   target version out of a non-terminal state.
-- `write_credential_expires_at` — the expiry of the attempt-scoped, short-lived
-  write credential that authorizes this attempt's writes to `staging/` and
-  `lake/`; its maximum lifetime equals the attempt's job lease, so it expires no
-  later than `lease_expires_at`. The stale-attempt sweeper deletes an abandoned
-  attempt prefix only after this time plus `CLEANUP_GRACE` (§4 rule 8).
+- `write_credential_expires_at` — the actual expiry of the attempt-scoped,
+  short-lived write credential that authorizes this attempt's writes to
+  `staging/` and `lake/`. It is NULL until the credential is actually issued;
+  once issued, the credential's TTL is the remaining lease duration at issuance
+  time, so its expiry is never later than the attempt's fixed `lease_expires_at`.
+  The field records the true expiry returned by the provider, persisted before
+  any write (see "Credential issuance" below). The stale-attempt sweeper deletes
+  an abandoned attempt prefix only after this time plus `CLEANUP_GRACE` (§4 rule
+  8); a NULL value means no credential was ever issued, so there is no write
+  capability to quiesce and the sweeper may reclaim the (empty) prefix
+  immediately.
+- `write_credential_revoked` — whether the STS provider confirmed per-session
+  revocation of the attempt credential. Set `true` only after a confirmed
+  revocation, and only then is `write_credential_expires_at` advanced to the
+  revocation instant (`now()`); when revocation is unsupported or unconfirmed,
+  both fields keep their original values and the sweeper waits for natural
+  expiry plus `CLEANUP_GRACE` (§4 rule 8).
+
+**Credential issuance (normative ordering).** The lease deadline is fixed by the
+claim — `lease_expires_at = claim_time + LEASE_DURATION` — and the write
+credential is derived from that deadline, never the reverse. After winning the
+claim the worker requests an attempt-scoped write credential whose TTL is the
+*remaining* lease duration at the moment of issuance: `lease_expires_at − now()`,
+minus a small `CREDENTIAL_SLACK` margin (default 30s, configurable) covering STS
+issuance latency and clock skew. The worker **verifies** the credential's actual
+expiry is `≤ lease_expires_at` before accepting it, then persists that actual
+expiry as `write_credential_expires_at` in a second conditional update keyed on
+the current token and `status='RUNNING'`:
+`UPDATE … SET write_credential_expires_at=? WHERE id=? AND fencing_token=? AND
+status='RUNNING'`. **No `staging/` or `lake/` write may occur before that commit
+succeeds.** Because the TTL is computed against the fixed deadline (not the full
+`LEASE_DURATION`), the credential always expires at or before the lease no matter
+how long the STS call takes; `write_credential_expires_at` records the
+credential's true expiry, which is exactly what §4 rule 8 waits on.
+
+**Credential-issuance failure.** If the credential cannot be issued with an
+expiry `≤ lease_expires_at` — the STS call fails, the remaining lease duration is
+below a minimum usable threshold `MIN_WRITE_CREDENTIAL_TTL` (default 30s,
+configurable), or the provider returns an expiry later than the lease — the
+worker performs **no write**. It releases the claim in one conditional
+transaction keyed on the current token and `status='RUNNING'`:
+`UPDATE … SET status='FAILED', failure_reason='credential_issue_failed',
+retryable=true, attempt=attempt+1, fencing_token=NULL, lease_owner=NULL,
+lease_expires_at=NULL, write_credential_expires_at=NULL
+WHERE id=? AND fencing_token=? AND status='RUNNING'`,
+and in the same transaction marks the target version
+`FAILED WHERE id=<target_version> AND status='BUILDING'`.
+`write_credential_expires_at` stays NULL — no credential was ever issued for the
+attempt, so there is no write capability to quiesce and the sweeper may reclaim
+the (empty) attempt prefix immediately (§4 rule 8). A failed issuance therefore
+never leaves a credential that could outlive the lease. (The mirrored case — the
+credential is issued but the persist update is fenced — aborts with the same
+no-write rule: the worker discards the credential, best-effort revokes it, and
+never writes; because its TTL was the remaining lease duration, it expires no
+later than `lease_expires_at` regardless.)
 
 All worker-initiated transitions and the final commit are **conditional** on the
 token and the expected current status, for example
@@ -335,25 +419,39 @@ recovery pass re-claims its job, before it can commit a stale result.
 | From | Event | To | Notes |
 |---|---|---|---|
 | (new) | ingestion requested (`register` or `convert`) | QUEUED | `ingestion_job` row created with `attempt = 0` and no token; target `dataset_version` created as `PENDING`; `retry_of` set when this is a retry |
-| QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=?, attempt=attempt+1, fencing_token=<fresh UUID>, write_credential_expires_at=? WHERE id=? AND status='QUEUED'`; exactly one winner; the worker obtains an attempt-scoped write credential whose TTL equals the lease and records its expiry; version `PENDING` → `BUILDING` |
+| QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=now()+LEASE_DURATION, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'`; exactly one winner. The claim fixes the lease deadline only — it does **not** set `write_credential_expires_at`, which stays NULL until the credential is actually issued. The worker then issues the attempt-scoped write credential against the fixed deadline and persists its actual expiry before writing (see "Credential issuance" above); version `PENDING` → `BUILDING` |
 | RUNNING | all Parquet written to `lake/…/version=<n>/attempt=<n>/` + schema captured, then commit | SUCCEEDED | one conditional transaction sets the version `READY` with `object_prefix` = this attempt's prefix and the job `SUCCEEDED`, both `WHERE … fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort (rules 6 and 8 sweep any straggler after write-credential expiry) |
 | RUNNING | cancel accepted | CANCELLED | conditional on token; version → `FAILED` with `error_summary = "cancelled"`. No object deletion here: cancellation occurs while the attempt write credential may still authorize writes, so staging/lake reclamation is deferred to the stale-attempt sweeper, which deletes only after write-quiescence — `write_credential_expires_at + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
 | RUNNING | unrecoverable error | FAILED | conditional on token; `failure_reason` + `error_summary` set; version → `FAILED`. No object deletion here: staging/lake reclamation is deferred to the stale-attempt sweeper after write-quiescence — `write_credential_expires_at + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
-| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token (increments `attempt`, clears `fencing_token`), sets `write_credential_expires_at = now()` (revoking the attempt credential where supported) **and atomically marks the target version `FAILED`** in one transaction; the old worker is fenced by the token change and can no longer write (credential revoked/expired) |
+| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token (increments `attempt`, clears `fencing_token`) **and atomically marks the target version `FAILED`** in one transaction; `write_credential_expires_at` is set to `now()` and `write_credential_revoked=true` **only when** the STS provider confirms per-session revocation, otherwise the expiry recorded at issuance is left unchanged (§4 rule 8); the old worker is fenced by the token change and can no longer write (credential revoked/expired) |
 
 - `QUEUED` jobs survive worker restart: state lives in PostgreSQL and the queue
   is reconstructed by scanning for `QUEUED` rows.
 - A worker that crashes mid-attempt leaves the job `RUNNING` with an expired
   lease. A recovery pass (run by any worker's lease/heartbeat cycle) performs a
-  single atomic transaction that (a) conditionally updates the job —
-  `UPDATE … SET status='FAILED', failure_reason='worker_crash', retryable=true,
-  attempt=attempt+1, fencing_token=NULL, lease_owner=NULL, lease_expires_at=NULL,
-  write_credential_expires_at=now()
-  WHERE id=? AND status='RUNNING' AND lease_expires_at < now()` — (b) in the
-  same transaction marks the target version
-  `FAILED WHERE id=<target_version> AND status='BUILDING'`, and (c) revokes the
-  attempt's write credential when the STS provider supports per-session
-  revocation (otherwise the recorded expiry is the authoritative bound). Job and
+  single atomic transaction that (a) conditionally updates the job keyed on the
+  expired lease, applying **exactly one** of two mutually exclusive expiry rules,
+  and (b) in the same transaction marks the target version
+  `FAILED WHERE id=<target_version> AND status='BUILDING'`:
+
+  - **Revocation confirmed** — the STS provider supports per-session revocation
+    and confirms the attempt credential is revoked:
+    `UPDATE … SET status='FAILED', failure_reason='worker_crash', retryable=true,
+    attempt=attempt+1, fencing_token=NULL, lease_owner=NULL, lease_expires_at=NULL,
+    write_credential_expires_at=now(), write_credential_revoked=true
+    WHERE id=? AND status='RUNNING' AND lease_expires_at < now()`.
+  - **Revocation unsupported or unconfirmed** — the identical update without the
+    two write-credential columns:
+    `UPDATE … SET status='FAILED', failure_reason='worker_crash', retryable=true,
+    attempt=attempt+1, fencing_token=NULL, lease_owner=NULL, lease_expires_at=NULL
+    WHERE id=? AND status='RUNNING' AND lease_expires_at < now()`,
+    which **leaves `write_credential_expires_at` at the expiry recorded at
+    issuance** and `write_credential_revoked` false.
+
+  `now()` is recorded as the expiry only in the confirmed-revocation branch;
+  there is no code path that overwrites the issuance-recorded expiry with `now()`
+  without such confirmation, so the sweeper always waits for natural expiry plus
+  `CLEANUP_GRACE` when revocation was not confirmed (§4 rule 8). Job and
   version can therefore never diverge: a crashed attempt cannot leave a
   permanently `BUILDING` version. Deletion of the old attempt's `staging/` and
   `lake/…/version=<n>/attempt=<old>/` prefixes is **not** done by this pass; it
@@ -724,8 +822,9 @@ never observe.
     side (`staging/` and `lake/`) is **always** an attempt-scoped, short-lived
     STS credential whose policy allows write to exactly this attempt's
     `staging/<namespace>/<dataset>/<job-id>/attempt=<n>/` and
-    `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/` prefixes and whose
-    maximum lifetime equals the attempt's job lease (recorded as
+    `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/` prefixes and whose TTL
+    is the remaining lease duration at issuance time, so it expires no later than
+    the attempt's fixed `lease_expires_at` (the actual expiry is recorded as
     `write_credential_expires_at`, §3.1). There is **no** long-lived,
     deployment-wide `lake/` or `staging/` write credential on the ingestion path;
     this is what lets the sweeper guarantee "no writes after delete" (§4 rule 8,
@@ -859,8 +958,9 @@ and sanitized.
 
 `unauthorized` (401) and `forbidden` (403) have precise meanings under the
 trust model in §15: `unauthorized` means a missing or invalid deployment token
-when token authentication is enabled; `forbidden` means the authenticated
-caller's operation is refused by a deployment policy gate (there is no per-user
+when token authentication is enabled; `forbidden` means the request was refused
+by the mandatory browser-request defense (Host/Origin allowlist or CSRF
+protection, §15.2) or by a deployment policy gate (there is no per-user
 authorization in v1).
 
 ## 12. Timeouts, limits, and concurrency
@@ -958,30 +1058,72 @@ limit; multi-tenant identity and per-user authorization are out of scope (§1).
 
 ### 15.2 Enforceable exposure boundary
 
-- **Network boundary (primary)**: by default the API and the dashboard bind to
-  `127.0.0.1` (or the private Docker Compose network) and are **not** published
-  to public or host-facing interfaces. Exposure beyond the local host is out of
-  scope; a remote or shared deployment requires adding authentication before it
-  is permitted (a precondition, not an option).
-- **Deployment token (optional hardening)**: the API MAY be configured with a
-  single static deployment token (`API_TOKEN`, supplied via environment/secret).
-  When set, every request must present it as a bearer credential; a missing or
-  invalid token returns `401 unauthorized`. This is one shared operator
-  credential, not per-user identity.
+The exposure boundary is **layered**; no single control is treated as proof that
+a caller is trusted. Loopback/private-network binding by itself is **not** a
+caller boundary: a page on another site can cause the operator's browser to send
+requests to `127.0.0.1` or a private-network address (cross-origin requests and
+DNS-rebinding attacks), so a browser can reach the API even when the bound
+address is loopback. The controls below are mandatory in the default deployment,
+not optional hardening.
+
+- **Network boundary (primary, necessary but not sufficient)**: by default the
+  API and the dashboard bind to `127.0.0.1` (or the private Docker Compose
+  network) and are **not** published to public or host-facing interfaces.
+  Exposure beyond the local host is out of scope; a remote or shared deployment
+  requires adding authentication before it is permitted (a precondition, not an
+  option). This reduces the set of hosts that can originate packets, but it does
+  not by itself identify or authorize the *caller* (see the browser-request
+  defense below).
+
+- **Host/Origin allowlist (mandatory)**: the API and the dashboard reject any
+  request whose `Host` header is not in a closed, configured allowlist of the
+  exact `host:port` values the services are bound to (for example
+  `127.0.0.1:8080` and `localhost:8080`). A DNS-rebinding attack presents the
+  attacker's domain in the `Host` header, so it fails the allowlist even though
+  the underlying socket terminates on loopback. In addition, for any request
+  that carries an `Origin` or `Sec-Fetch-Site` header (i.e. a browser-initiated
+  request), the API requires `Origin` to match the exact scheme + host + port of
+  the served dashboard; a cross-origin browser request is rejected with
+  `403 forbidden`. The API does not emit permissive CORS headers
+  (`Access-Control-Allow-Origin: *`); it emits CORS allow headers only for the
+  exact dashboard origin, so a foreign page cannot read any response.
+
+- **CSRF protection for state changes (mandatory)**: every state-changing
+  request (`POST`, `PUT`, `PATCH`, `DELETE`) must carry proof of same-origin
+  intent that a cross-site page cannot forge. The API requires one of: (a) a
+  custom request header that forces a CORS preflight (for example
+  `X-Lakehouse-CSRF: 1`), whose preflight is rejected for any non-allowlisted
+  origin, or (b) an unguessable CSRF token issued by the API and bound to the
+  operator's session (synchronizer token or double-submit cookie), presented on
+  every mutation. Read-only `GET`/`HEAD` requests have no side effects and are
+  covered by the Host/Origin allowlist plus same-origin CORS; they are not
+  exempt from the Host/Origin allowlist.
+
+- **Deployment token (optional hardening)**: the API MAY additionally be
+  configured with a single static deployment token (`API_TOKEN`, supplied via
+  environment/secret). When set, every request must present it as a bearer
+  credential; a missing or invalid token returns `401 unauthorized`. Because the
+  token is carried in the `Authorization` header (or an equivalent
+  same-origin-only credential store), a cross-site page cannot learn or attach
+  it, so it independently defeats cross-origin mutations. This is one shared
+  operator credential, not per-user identity.
+
 - The token is never embedded in the static dashboard bundle. In the default
   single-host Compose deployment the dashboard is served same-origin and relies
-  on the network boundary; if token authentication is enabled, the token is
-  provided to the operator's browser session at runtime (for example, via a
-  same-origin login/session route that keeps the credential server-side), never
-  baked into client-visible data.
+  on the Host/Origin allowlist plus CSRF protection (not on loopback alone); if
+  token authentication is enabled, the token is provided to the operator's
+  browser session at runtime (for example, via a same-origin login/session route
+  that keeps the credential server-side), never baked into client-visible data.
 
 ### 15.3 Authorization
 
 - There is **no per-user authorization** in v1: an authenticated caller is the
   operator and may perform any operation.
-- `forbidden` (403) is reserved and is produced only by deployment policy gates
-  that are independent of caller identity — for example, refusing to archive a
-  dataset with in-flight jobs, or refusing a mutation on an immutable version.
+- `forbidden` (403) is reserved and is produced by (a) the mandatory
+  browser-request defense — a request rejected by the Host/Origin allowlist or
+  CSRF protection (§15.2) — and (b) deployment policy gates that are
+  independent of caller identity, for example refusing to archive a dataset with
+  in-flight jobs, or refusing a mutation on an immutable version.
 - Both `unauthorized` and `forbidden` are defined now (rather than added later)
   so the error contract (§11) and its meaning are stable when per-user authn/z
   is introduced in a future release.
@@ -990,6 +1132,19 @@ limit; multi-tenant identity and per-user authorization are out of scope (§1).
 
 - With token authentication disabled, the API answers only on the configured
   bind address; a request from outside that boundary cannot reach it.
+- **Host allowlist**: a request whose `Host` header is the attacker's domain
+  (a DNS-rebinding simulation) or any value not in the allowlist returns
+  `403 forbidden` and is not processed, even though the TCP connection
+  terminates on the loopback interface.
+- **Origin allowlist**: a browser-initiated request whose `Origin` is a foreign
+  origin returns `403 forbidden`; a request whose `Origin` is the exact
+  dashboard origin is accepted; and the API's CORS allow headers name only that
+  exact origin (never `*`).
+- **CSRF**: a state-changing request without the required CSRF proof (custom
+  header or valid CSRF token) returns `403 forbidden` and causes no state
+  change; the same request with valid proof succeeds. A companion test issues a
+  state-changing request from a simulated cross-site page (foreign `Origin` plus
+  no CSRF proof) and asserts it is rejected with no side effect.
 - With token authentication enabled, requests without a token return `401`, and
   requests with a wrong token return `401`.
 - A policy-gated operation (e.g., archive with in-flight jobs) returns `403`
