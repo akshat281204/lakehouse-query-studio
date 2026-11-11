@@ -50,8 +50,8 @@ storage (immutable data); in-memory state is always reconstructible.
 | dataset | PostgreSQL | id (UUID), namespace_id, name, source_prefix, format, status, created_at, updated_at | ACTIVE, ARCHIVED |
 | dataset_version | PostgreSQL | id, dataset_id, version (monotonic int), object_prefix, format, partition_columns, status, schema_snapshot_id, error_summary, created_at | READY, FAILED |
 | schema_column | PostgreSQL | id, version_id, position, name, type, nullable, is_partition | — (rows) |
-| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
-| query_job | PostgreSQL | id (UUID), statement (verbatim SQL text), statement_hash, dataset_version_ids, status, failure_reason, retryable, rows_returned, bytes_scanned, result_ref, plan_summary, attempt, fencing_token, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED, TIMED_OUT (state model §13) |
+| ingestion_job | PostgreSQL | id (UUID), dataset_id, target_version, kind (register\|convert), status, input_ref, failure_reason, retryable, error_summary, retry_of, attempt, fencing_token, timestamps, lease_owner, lease_expires_at, write_credential_expires_at | SUCCEEDED, FAILED, CANCELLED (state model §6.1) |
+| query_job | PostgreSQL | id (UUID), statement (verbatim SQL text), statement_hash, dataset_version_ids, status, failure_reason, retryable, rows_returned, truncated, bytes_scanned, result_ref, plan_summary, attempt, fencing_token, timestamps, lease_owner, lease_expires_at | SUCCEEDED, FAILED, CANCELLED, TIMED_OUT (state model §13) |
 | object (Parquet) | object store | key under `lake/…` | — (immutable) |
 | spooled result | object store | key under `exports/…/attempt=<n>/…` | — (TTL-expired) |
 
@@ -59,7 +59,10 @@ storage (immutable data); in-memory state is always reconstructible.
 §13: `attempt` is a monotonically increasing integer incremented on every job
 claim, and `fencing_token` is a random value regenerated on every claim. Only the
 holder of a job's current `fencing_token` may transition it or publish its
-output.
+output. `write_credential_expires_at` (ingestion jobs only) is the expiry of the
+attempt-scoped, short-lived object-store write credential that authorizes writes
+to `staging/` and `lake/`; it is the single authority for the write-quiescence
+guarantee in §4 rule 8 and §6.1.
 
 ### 3.2 Dataset lifecycle
 
@@ -90,7 +93,7 @@ Version status: `PENDING → BUILDING → READY | FAILED`.
 | (new) | ingestion/registration requested | PENDING | version row created, schema not yet exposed |
 | PENDING | worker picks up job | BUILDING | schema inspection (register) or conversion (convert) in progress |
 | BUILDING | all Parquet written + schema captured + catalog committed in one transaction | READY | becomes queryable atomically (§6) |
-| BUILDING | unrecoverable error or cancellation | FAILED | error_summary set; staging objects cleaned; never READY |
+| BUILDING | unrecoverable error or cancellation | FAILED | error_summary set; never READY; staging and attempt-prefix objects reclaimed by the stale-attempt sweeper after write-quiescence (§4 rules 6 and 8), not at the transition itself |
 
 - `READY` is the only state in which a version is exposed to the query engine
   or the dataset browser's schema/preview.
@@ -102,21 +105,63 @@ Version status: `PENDING → BUILDING → READY | FAILED`.
 ## 4. Object key layout
 
 All keys are relative to the configured bucket. Layout is ASCII, URL-safe, and
-deterministic; dataset and namespace are slug-normalized before use in keys.
+deterministic. Namespace and dataset key components are **not** produced by
+ad-hoc normalization: the API requires each name to already be in the canonical
+key grammar — lowercase ASCII `[a-z0-9-]`, no leading/trailing hyphen, at most
+63 characters — and rejects any other name. The key component is the name
+itself, so the mapping from name to key component is the identity function and
+therefore injective: two distinct accepted names can never share a key prefix.
 
 ```
 # Converted / registered Parquet (immutable, the query source; attempt-isolated)
-lake/<namespace>/<dataset>/version=<n>/attempt=<n>/[col=value/...]/part-<uuid>.parquet
+#   partition segments are percent-encoded name=value pairs (§4.1)
+lake/<namespace>/<dataset>/version=<n>/attempt=<n>/[<enc-col>=<enc-value>/...]/part-<uuid>.parquet
 
 # Original uploads (retained only when retention is enabled)
 uploads/<namespace>/<dataset>/<job-id>/<sanitized-original-name>
 
-# Ingestion staging (temporary; cleaned on success or failure; attempt-scoped)
+# Ingestion staging (temporary, attempt-scoped; removed on success, reclaimed by the sweeper after write-quiescence on failure/cancel/crash)
 staging/<namespace>/<dataset>/<job-id>/attempt=<n>/part-<uuid>.parquet
 
 # Spooled query results (temporary; TTL; attempt-scoped)
 exports/<namespace>/<query-id>/attempt=<n>/result.parquet
 ```
+
+### 4.1 Partition key encoding (normative)
+
+Hive-style partition directories are `name=value/` segments, but partition
+column names and values are unrestricted UTF-8 strings that may contain `/`,
+`=`, `%`, spaces, or non-ASCII bytes, so raw names and values cannot be used as
+path components without making the key grammar ambiguous. Every partition
+segment is produced by one reversible encoding applied to both the column name
+and the value:
+
+- `enc(s)` percent-encodes the UTF-8 bytes of `s`, leaving only the unreserved
+  bytes `[A-Za-z0-9._~-]` unchanged and escaping every other byte — including
+  `/` (`%2F`), `=` (`%3D`), `%` (`%25`), `+`, space, and every non-ASCII byte —
+  as an uppercase `%HH` sequence. `enc` is injective.
+- A **null** partition value is encoded as the reserved token `%00`. The value
+  domain excludes U+0000 (NUL): ingestion rejects any partition value containing
+  NUL, so no real value can encode to `%00`. Decoding therefore maps `%00` to
+  null and every other encoded string back to its exact original value, making
+  the mapping reversible over the allowed domain.
+- A partition segment is `enc(name)=enc(value)`, where partition column names are
+  non-empty. Because `enc` never emits `/` or `=`, each segment contains exactly
+  one `=` and `/` occurs only as a segment separator, so parsing splits on the
+  single `=` and percent-decodes each side. Segments are written in the
+  dataset-declared partition column order, so the decoded column of each segment
+  is recovered from its position as well as its name.
+- Encoding is applied by the worker at write time and reversed at catalog/read
+  time; the catalog's `schema_column` and partition metadata store the decoded
+  name and value, never the encoded form.
+
+**Testability.** Tests must cover: round-trip `decode(enc(s)) == s` over a corpus
+including `/`, `=`, `%`, `+`, spaces, the empty string, and non-ASCII/Unicode
+(CJK, combining marks, emoji); `enc` of any such value contains no unescaped `/`
+or `=`; null round-trips to `%00` and back; and two distinct values never share
+an encoded segment. Namespace and dataset components are already
+ASCII-restricted (§4), so partition names and values are the only user-controlled
+path components and use this rule.
 
 The `attempt=<n>/` segment on `staging/`, `lake/`, and `exports/` keys is the
 job's attempt counter (§6.1, §13); every (re)claim writes under its own attempt
@@ -125,7 +170,8 @@ clobber, a live attempt's output. A `dataset_version` becomes queryable only
 when its fenced catalog commit records the winning attempt's prefix in
 `object_prefix`; a losing/stale attempt prefix of a `READY` version, and every
 attempt prefix of a `FAILED` version, are unreferenced and are removed by the
-cleanup sweeper once the version is terminal (rule 6). CSV export is streamed
+cleanup sweeper once the version is terminal and the attempt's write credential
+has expired (rules 6 and 8). CSV export is streamed
 from the spool and is not a separate object (§9).
 
 Rules:
@@ -133,9 +179,9 @@ Rules:
 1. `lake/`, `uploads/`, `staging/`, and `exports/` are disjoint top-level
    prefixes; query execution is scoped to `lake/` only, and result serving is
    scoped to the single query's `exports/` prefix (§8, §9).
-2. Hive-style partition directories are `col=value/` segments in the
-   dataset-declared partition order; unpartitioned datasets write files directly
-   under `version=<n>/attempt=<n>/`.
+2. Hive-style partition directories are percent-encoded `enc(name)=enc(value)/`
+   segments (§4.1) in the dataset-declared partition order; unpartitioned
+   datasets write files directly under `version=<n>/attempt=<n>/`.
 3. Part files are written once and never mutated; a version commit is a
    fenced catalog pointer update to the winning attempt prefix, not an object
    rewrite.
@@ -164,12 +210,33 @@ Rules:
    fenced `BUILDING → READY` commit holds while it records `object_prefix`),
    re-reads the version's `status` and `object_prefix` under that lock,
    recomputes the abandoned set from rule 6, and only then deletes those
-   prefixes. Because publication acquires the same lock before making a version
+   prefixes (subject to the write-quiescence precondition in rule 8). Because
+   publication acquires the same lock before making a version
    `READY`, the state the sweeper re-checked cannot change to reference a prefix
    between the re-check and the delete. The sweep is idempotent (deleting an
    already-deleted prefix is a no-op) and may run on any schedule; each pass
    recomputes the abandoned set from the catalog, so a crashed sweeper re-runs
    safely.
+8. **Cleanup waits for write-quiescence (no writes after delete)**: the sweeper
+   deletes an abandoned attempt prefix only after it can prove that no credential
+   remains that could write to it. Ingestion writes to `lake/` and `staging/` are
+   authorized solely by an attempt-scoped, short-lived STS credential whose
+   maximum lifetime equals the attempt's job lease (so it expires no later than
+   `lease_expires_at`); there is no long-lived, deployment-wide `lake/` write
+   credential on the ingestion path. The claim stores that credential's expiry in
+   `write_credential_expires_at` (§3.1). The sweeper deletes an abandoned attempt
+   prefix only when `now() > write_credential_expires_at + CLEANUP_GRACE`, where
+   `CLEANUP_GRACE` (default a few seconds) bounds an already-accepted, in-flight
+   single-part PutObject. After the credential has expired the object store
+   rejects any further authenticated write to that prefix, so a delayed (fenced)
+   worker cannot write after the sweeper's delete; the grace only covers a write
+   accepted before expiry. Fencing governs *publication* (the token check in
+   §6.1); credential expiry is what governs *writes*. Revocation is optional
+   hardening that shortens the window: if the STS provider supports per-session
+   revocation, the fencing transaction also revokes the attempt credential and
+   sets `write_credential_expires_at = now()`; otherwise the sweeper waits for
+   natural expiry plus `CLEANUP_GRACE`. A version in `PENDING`/`BUILDING` has no
+   expired-credential abandoned prefix and is never swept (rule 6).
 
 ## 5. Catalog and version semantics
 
@@ -184,8 +251,10 @@ Rules:
 - Uniqueness: `(namespace, dataset name)` is unique across **all** datasets,
   active and archived. Dataset names are never reused: archiving reserves the
   name permanently (§3.2), so `lake/<namespace>/<dataset>/…` keys can never
-  collide with an archived dataset's objects. Version number is unique per
-  dataset; job ids are UUIDs.
+  collide with an archived dataset's objects. Uniqueness is enforced on the
+  canonical name, which is also the literal key component (§4), so there is no
+  normalization step that could map two distinct names to one prefix. Version
+  number is unique per dataset; job ids are UUIDs.
 
 ## 6. Ingestion behavior
 
@@ -193,7 +262,7 @@ Two kinds of ingestion job:
 
 | Kind | Input | Action | Output |
 |---|---|---|---|
-| `register` | an existing Parquet prefix in the object store | validate prefix, inspect schema, capture partition metadata | version `READY` pointing at the existing prefix (objects are copied into `lake/…` when not already there, so a stable `lake/` view exists) |
+| `register` | an existing Parquet prefix in the object store | validate prefix, inspect schema, capture partition metadata, then materialize the version under its canonical attempt prefix | version `READY` whose `object_prefix` is its own `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/` prefix (source objects are copied there; copying may be skipped only when the source prefix is byte-for-byte the target canonical attempt prefix, e.g. a resumed same-attempt write) |
 | `convert` | uploaded CSV/JSON/JSONL | validate, infer schema, convert to Parquet under staging, then commit | version `READY` with new `lake/…` objects |
 
 Common rules:
@@ -208,10 +277,19 @@ Common rules:
   fenced catalog commit (§6.1): the version becomes `READY` and its
   `object_prefix` points at the winning attempt prefix in one conditional
   transaction. A partial or losing attempt is never referenced; its objects are
-  removed by the stale-attempt sweeper once the version is terminal (§4 rule 6),
+  removed by the stale-attempt sweeper once the version is terminal and the
+  attempt's write credential has expired (§4 rules 6 and 8),
   never while it is `PENDING`/`BUILDING`. A partial version is never exposed as
   `READY`.
-- Failure leaves no dangling staging objects and no `READY` version.
+- Failure never leaves a `READY` version; a partial version is never exposed as
+  `READY`. Staging and `lake/…/version=<n>/attempt=<n>/` objects of a failed,
+  cancelled, or crashed attempt are reclaimed **only** by the stale-attempt
+  sweeper after write-quiescence — `write_credential_expires_at + CLEANUP_GRACE`
+  (§4 rules 6 and 8) — never at the cancel/fail transition itself, which occurs
+  while the attempt write credential may still authorize writes. (Staging of a
+  *successful* attempt is removed by the transitioning worker after conversion
+  completes: it is the sole holder of the attempt credential and has stopped
+  writing, so no further staging write can occur.)
 - Partition columns are explicit and user-selected with a safe default (no
   partitioning, or only low-cardinality columns); high-cardinality partitioning
   is not applied by default.
@@ -222,37 +300,46 @@ Ingestion status: `QUEUED → RUNNING → SUCCEEDED | FAILED | CANCELLED`. The j
 is the unit of work; its target version is the artifact it produces or fails to
 produce, and the two states move together.
 
-Every `ingestion_job` carries two lease-fencing fields (inventoried in §3.1) that
-make stale-worker commits impossible:
+Every `ingestion_job` carries two lease-fencing fields and one write-quiescence
+field (inventoried in §3.1). The fencing fields make stale-worker *commits*
+impossible; the write-credential expiry makes stale-worker *writes* impossible
+(§4 rule 8):
 
 - `attempt` — a monotonically increasing integer, incremented on every job
   claim. The initial claim is attempt 1.
 - `fencing_token` — a random value (UUID) regenerated on every claim. Only the
   holder of the job's **current** `fencing_token` may transition the job or its
   target version out of a non-terminal state.
+- `write_credential_expires_at` — the expiry of the attempt-scoped, short-lived
+  write credential that authorizes this attempt's writes to `staging/` and
+  `lake/`; its maximum lifetime equals the attempt's job lease, so it expires no
+  later than `lease_expires_at`. The stale-attempt sweeper deletes an abandoned
+  attempt prefix only after this time plus `CLEANUP_GRACE` (§4 rule 8).
 
 All worker-initiated transitions and the final commit are **conditional** on the
 token and the expected current status, for example
 `UPDATE … WHERE id = ? AND fencing_token = ? AND status = 'RUNNING'`. A
 conditional update that affects **zero rows** means the worker has been fenced —
-its token is no longer current — and it **must** abort: it discards local state,
-deletes its own attempt's `staging/…/attempt=<n>/` and any objects it wrote under
-its own `lake/…/version=<n>/attempt=<n>/` prefix, and never transitions state.
-The stale-attempt sweeper (§4 rule 6) is the backstop that reclaims an orphaned
-attempt prefix when a fenced worker's own self-delete is interrupted. Expiry is
-the *trigger* for fencing, but the fence is
-*enforced* at commit time by the token check, so a merely delayed (not dead)
-worker is fenced the instant a recovery pass re-claims its job, before it can
-commit a stale result.
+its token is no longer current — and it **must** abort: it discards local state
+and never transitions state. While its own attempt-scoped write credential is
+still valid, it also best-effort deletes its own `staging/…/attempt=<n>/` and any
+objects it wrote under its own `lake/…/version=<n>/attempt=<n>/` prefix; this
+self-delete is a courtesy, not the guarantee. The stale-attempt sweeper
+(§4 rules 6 and 8) is the authoritative backstop that reclaims an orphaned
+attempt prefix — but only after the attempt's write credential has expired plus
+`CLEANUP_GRACE`, so the sweeper never races a still-credentialed writer. Expiry
+is the *trigger* for fencing, but the fence is *enforced* at commit time by the
+token check, so a merely delayed (not dead) worker is fenced the instant a
+recovery pass re-claims its job, before it can commit a stale result.
 
 | From | Event | To | Notes |
 |---|---|---|---|
 | (new) | ingestion requested (`register` or `convert`) | QUEUED | `ingestion_job` row created with `attempt = 0` and no token; target `dataset_version` created as `PENDING`; `retry_of` set when this is a retry |
-| QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=?, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'`; exactly one winner; version `PENDING` → `BUILDING` |
-| RUNNING | all Parquet written to `lake/…/version=<n>/attempt=<n>/` + schema captured, then commit | SUCCEEDED | one conditional transaction sets the version `READY` with `object_prefix` = this attempt's prefix and the job `SUCCEEDED`, both `WHERE … fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort, delete this attempt's prefixes (§4 rule 6 sweeps any straggler) |
-| RUNNING | cancel accepted | CANCELLED | conditional on token; staging and this attempt's lake prefix cleaned; version → `FAILED` with `error_summary = "cancelled"` |
-| RUNNING | unrecoverable error | FAILED | conditional on token; `failure_reason` + `error_summary` set; staging and this attempt's lake prefix cleaned; version → `FAILED` |
-| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token (increments `attempt`, clears `fencing_token`) **and atomically marks the target version `FAILED`** in one transaction; the old worker is fenced by the token change |
+| QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=?, attempt=attempt+1, fencing_token=<fresh UUID>, write_credential_expires_at=? WHERE id=? AND status='QUEUED'`; exactly one winner; the worker obtains an attempt-scoped write credential whose TTL equals the lease and records its expiry; version `PENDING` → `BUILDING` |
+| RUNNING | all Parquet written to `lake/…/version=<n>/attempt=<n>/` + schema captured, then commit | SUCCEEDED | one conditional transaction sets the version `READY` with `object_prefix` = this attempt's prefix and the job `SUCCEEDED`, both `WHERE … fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort (rules 6 and 8 sweep any straggler after write-credential expiry) |
+| RUNNING | cancel accepted | CANCELLED | conditional on token; version → `FAILED` with `error_summary = "cancelled"`. No object deletion here: cancellation occurs while the attempt write credential may still authorize writes, so staging/lake reclamation is deferred to the stale-attempt sweeper, which deletes only after write-quiescence — `write_credential_expires_at + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
+| RUNNING | unrecoverable error | FAILED | conditional on token; `failure_reason` + `error_summary` set; version → `FAILED`. No object deletion here: staging/lake reclamation is deferred to the stale-attempt sweeper after write-quiescence — `write_credential_expires_at + CLEANUP_GRACE`, shortened by revoking the attempt credential where supported (§4 rules 6 and 8) |
+| RUNNING | lease expires (worker crashed or partitioned) | FAILED (retryable) | recovery pass invalidates the token (increments `attempt`, clears `fencing_token`), sets `write_credential_expires_at = now()` (revoking the attempt credential where supported) **and atomically marks the target version `FAILED`** in one transaction; the old worker is fenced by the token change and can no longer write (credential revoked/expired) |
 
 - `QUEUED` jobs survive worker restart: state lives in PostgreSQL and the queue
   is reconstructed by scanning for `QUEUED` rows.
@@ -260,19 +347,37 @@ commit a stale result.
   lease. A recovery pass (run by any worker's lease/heartbeat cycle) performs a
   single atomic transaction that (a) conditionally updates the job —
   `UPDATE … SET status='FAILED', failure_reason='worker_crash', retryable=true,
-  attempt=attempt+1, fencing_token=NULL, lease_owner=NULL, lease_expires_at=NULL
-  WHERE id=? AND status='RUNNING' AND lease_expires_at < now()` — and (b) in the
+  attempt=attempt+1, fencing_token=NULL, lease_owner=NULL, lease_expires_at=NULL,
+  write_credential_expires_at=now()
+  WHERE id=? AND status='RUNNING' AND lease_expires_at < now()` — (b) in the
   same transaction marks the target version
-  `FAILED WHERE id=<target_version> AND status='BUILDING'`. Job and version can
-  therefore never diverge: a crashed attempt cannot leave a permanently
-  `BUILDING` version. After the transaction commits, the pass deletes the old
-  attempt's `staging/` and `lake/…/version=<n>/attempt=<old>/` prefixes (safe
-  because the version is `FAILED`, i.e., its attempt prefixes are conclusively
-  abandoned per §4 rule 6). Because the old token no longer matches, any
-  later commit by the delayed worker affects zero rows and is detected; the
-  worker aborts without transitioning state. Interrupted jobs are never silently
-  `SUCCEEDED`, and a partitioned-but-alive worker cannot overwrite the terminal
-  state that the recovery pass set.
+  `FAILED WHERE id=<target_version> AND status='BUILDING'`, and (c) revokes the
+  attempt's write credential when the STS provider supports per-session
+  revocation (otherwise the recorded expiry is the authoritative bound). Job and
+  version can therefore never diverge: a crashed attempt cannot leave a
+  permanently `BUILDING` version. Deletion of the old attempt's `staging/` and
+  `lake/…/version=<n>/attempt=<old>/` prefixes is **not** done by this pass; it
+  is deferred to the stale-attempt sweeper, which deletes only after
+  `write_credential_expires_at + CLEANUP_GRACE` (§4 rule 8). Fencing the token
+  stops the delayed worker from *publishing*; expiry/revocation of the
+  attempt-scoped write credential is what stops it from *writing*, so the sweeper
+  never deletes a prefix a still-credentialed writer can write to, and a delayed
+  worker whose credential has expired cannot write after the delete. Because the
+  old token no longer matches, any later commit by the delayed worker affects
+  zero rows and is detected; the worker aborts without transitioning state.
+  Interrupted jobs are never silently `SUCCEEDED`, and a partitioned-but-alive
+  worker cannot overwrite the terminal state the recovery pass set or write into
+  a swept prefix after its credential has expired.
+- **Delayed-worker / delete race test**: an adversarial test fences an attempt
+  (invalidates the token, marks the version `FAILED`, sets
+  `write_credential_expires_at` in the past and/or revokes the credential), keeps
+  the "stale" worker alive and issuing `PutObject` to its old attempt prefix,
+  runs the sweeper, and asserts that (1) every post-fence write is rejected by
+  the object store with an authorization error, (2) the sweeper's delete leaves
+  the prefix empty and no new object appears afterward, and (3) no orphan object
+  is observable after the sweeper completes. A companion test asserts that a live
+  (`BUILDING`) attempt's prefix is never deleted while its credential is
+  unexpired.
 
 ### 6.2 Retry and version numbering
 
@@ -286,9 +391,12 @@ commit a stale result.
 - Retry is offered only for `FAILED` jobs marked `retryable` (worker crash,
   transient object-store error). A `CANCELLED` job is terminal and not retried;
   the operator submits a fresh ingestion instead.
-- A retried job writes to a fresh `staging/…/attempt=<n>/` directory; any stale
-  staging prefix from a crashed attempt is cleaned by the recovery pass before
-  the retry runs. Because each job — and each attempt within a job — has its own
+- A retried job writes to a fresh `staging/…/attempt=<n>/` directory under a new
+  job id, so it never collides with a crashed attempt's staging prefix; any stale
+  staging prefix from a crashed attempt is reclaimed by the stale-attempt sweeper
+  once the attempt's write credential has expired (§4 rules 6 and 8), never by
+  the recovery pass and never while a still-credentialed writer could write to
+  it. Because each job — and each attempt within a job — has its own
   `fencing_token` and its own attempt-scoped staging prefix, a stale worker from
   a prior attempt can neither publish objects under the new attempt's prefix nor
   transition the new job/version: its conditional commits match zero rows and
@@ -487,7 +595,7 @@ the boundary.
    's3://<bucket>/lake/…/version=<n>/attempt=<n>/'`). A secret scope is a path
    **prefix**, not a glob: the `SCOPE` therefore ends at `attempt=<n>/` (no `*`
    or `**` suffix), so the matching read URL
-   `s3://<bucket>/lake/…/version=<n>/attempt=<n>/[col=value/…]part-<uuid>.parquet`
+   `s3://<bucket>/lake/…/version=<n>/attempt=<n>/[<enc-col>=<enc-value>/…]part-<uuid>.parquet`
    always begins with it. DuckDB's Secrets Manager selects a secret only when its scope
    is the longest-prefix match for the path being read; every read outside the
    granted prefixes has **no matching secret** and — because no unscoped or
@@ -607,12 +715,22 @@ never observe.
   responses. They are injected server-side and never appear in SQL text.
 - Credential classes, by function:
 
-  - **Ingest** (trusted worker code, operator-driven): a least-privilege
-    credential that may read the source prefixes it is told to read (`uploads/`
-    and/or an existing Parquet prefix) and write `staging/` and `lake/`.
-    Ingestion input is the operator's, not untrusted SQL, so a deployment-scoped
-    ingest credential is acceptable; a per-job-scoped variant is optional
-    hardening, not required.
+  - **Ingest** (trusted worker code, operator-driven): split into a *read* and a
+    *write* capability so that stale-attempt cleanup is safe (§4 rule 8).
+    The **read** side may use a least-privilege, deployment-scoped credential to
+    read the source prefixes it is told to read (`uploads/` and/or an existing
+    Parquet prefix); ingestion input is the operator's, not untrusted SQL, so
+    scoping the *read* per job is optional hardening, not required. The **write**
+    side (`staging/` and `lake/`) is **always** an attempt-scoped, short-lived
+    STS credential whose policy allows write to exactly this attempt's
+    `staging/<namespace>/<dataset>/<job-id>/attempt=<n>/` and
+    `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/` prefixes and whose
+    maximum lifetime equals the attempt's job lease (recorded as
+    `write_credential_expires_at`, §3.1). There is **no** long-lived,
+    deployment-wide `lake/` or `staging/` write credential on the ingestion path;
+    this is what lets the sweeper guarantee "no writes after delete" (§4 rule 8,
+    §6.1) — a fenced/delayed worker loses the ability to write the moment its
+    attempt credential expires or is revoked.
   - **Query (read)** (per query, short-lived, prefix-scoped): before execution
     the worker obtains an STS credential whose policy allows read of **exactly
     the committed attempt prefixes
@@ -667,8 +785,16 @@ never observe.
 - Paging returns a bounded page (default limit 1,000; hard max 10,000), read
   from the spool with the scoped read credential.
 - Row bound: a query returns at most `MAX_RESULT_ROWS` (default 10,000, hard
-  max 100,000). Rows beyond the bound are dropped and `truncated:true` is
-  recorded; the engine stops early once the bound is reached.
+  max 100,000) rows to the client. To make `truncated` exact, the engine
+  materializes at most `MAX_RESULT_ROWS + 1` rows: if a
+  (`MAX_RESULT_ROWS + 1`)-th row is produced, it is discarded and
+  `truncated:true` is recorded; otherwise `truncated:false`. The probe row is
+  never returned, never written to the spool, and never counted in
+  `rows_returned`; execution stops as soon as the (`MAX_RESULT_ROWS + 1`)-th row
+  is produced, so a result with exactly `MAX_RESULT_ROWS` rows is
+  distinguishable from one with more rows. `rows_returned` is the count actually
+  returned (at most `MAX_RESULT_ROWS`) and `truncated` is an independent boolean,
+  so the two are never conflated.
 - CSV export streams a bounded CSV (default max 50,000 rows, capped by the
   result bound) directly from the spool to the client; no separate `export.csv`
   object is written, so no export-write credential is needed.
@@ -688,7 +814,7 @@ never observe.
 |---|---|
 | `lake/` Parquet objects | Retained for the life of the deployment. Archive does **not** delete them (unarchive is reversible); no automatic deletion in v1. Hard delete/GC is out of scope. |
 | Original uploads | Deleted after `READY` unless `retain_original=true` |
-| `staging/` objects | Deleted immediately on success or failure |
+| `staging/` objects | Successful attempt: removed by the transitioning worker after conversion completes. Failed/cancelled/crashed attempt: reclaimed only by the stale-attempt sweeper after `write_credential_expires_at + CLEANUP_GRACE` (§4 rules 6 and 8) — never at the cancel/fail transition itself |
 | `exports/` (results/exports) | TTL default 24h, swept |
 | query_job history rows | Bounded retention (default 30 days, configurable); the SQL statement is retained for the job's full lifetime and is never purged or overwritten before the job reaches a terminal state; after that it follows the history retention window (configurable), while the statement hash is always kept |
 | Failed version error summaries | Retained with the version for its lifetime (archive does not delete version rows) |
@@ -775,7 +901,7 @@ and must abort without publishing results.
 |---|---|---|---|
 | (new) | submit validated | QUEUED | durable row (`attempt=0`, no token); the full SQL statement is persisted in `statement` and its hash in `statement_hash` — the worker executes the persisted statement, never a reconstruction from the hash |
 | QUEUED | worker claims the job | RUNNING | conditional `UPDATE … SET status='RUNNING', lease_owner=?, lease_expires_at=?, attempt=attempt+1, fencing_token=<fresh UUID> WHERE id=? AND status='QUEUED'` |
-| RUNNING | results committed to object store + row marked | SUCCEEDED | worker writes the spool to `exports/…/attempt=<n>/result.parquet`, then one conditional update `SET status='SUCCEEDED', result_ref=?, rows_returned=?, … WHERE id=? AND fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort (spool left to TTL, never referenced) |
+| RUNNING | results committed to object store + row marked | SUCCEEDED | worker writes the spool to `exports/…/attempt=<n>/result.parquet`, then one conditional update `SET status='SUCCEEDED', result_ref=?, rows_returned=?, truncated=?, … WHERE id=? AND fencing_token=? AND status='RUNNING'`; zero rows → fenced, abort (spool left to TTL, never referenced) |
 | RUNNING | cancel accepted | CANCELLED | conditional on token; observable and persisted |
 | RUNNING | timeout exceeded | TIMED_OUT | conditional on token; distinct from FAILED |
 | RUNNING | engine/object-store error | FAILED | conditional on token; `failure_reason` set (engine_error, object_store, resource_exceeded, …) |

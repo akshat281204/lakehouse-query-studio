@@ -44,10 +44,13 @@ history. The first release runs entirely under Docker Compose.
    `fencing_token`) sets the version `READY` with `object_prefix` pointing at
    that attempt prefix. A fenced worker's commit matches zero rows and it aborts
    without making the attempt visible; the stale-attempt sweeper removes only
-   conclusively abandoned (terminal) attempt prefixes, serialized against the
-   publish commit (`docs/design.md` §4 rules 6–7). On failure, staging objects
-   are removed, the attempt prefix is removed, and the version is marked
-   `FAILED` with an error summary.
+   conclusively abandoned (terminal) attempt prefixes whose attempt-scoped write
+   credential has expired plus a grace margin, serialized against the publish
+   commit (`docs/design.md` §4 rules 6–8). On failure the version is marked
+   `FAILED` with an error summary; staging and attempt-prefix objects are
+   reclaimed by the sweeper only after write-quiescence (the attempt's write
+   credential has expired or been revoked), never by a still-credentialed
+   delayed worker's race (`docs/design.md` §6.1).
 
 ### 3.2 Query execution
 
@@ -67,7 +70,8 @@ history. The first release runs entirely under Docker Compose.
    filesystem disabled (see `docs/design.md` §7.4).
 3. The worker spools results to
    `exports/<namespace>/<query-id>/attempt=<n>/result.parquet` on a separate
-   write-scoped connection, records row/byte counts (and bytes scanned / plan
+   write-scoped connection, records `rows_returned`, `truncated`, and byte
+   counts (and bytes scanned / plan
    summary when the engine exposes them), and marks the job `SUCCEEDED` only
    after results and state are committed — the `SUCCEEDED` transition is a
    conditional update on the current `fencing_token`, so a fenced worker's commit
@@ -93,9 +97,9 @@ history. The first release runs entirely under Docker Compose.
   requeued (query), never silently succeeded (`docs/design.md` §6.1, §13).
 - Result spools are attempt-isolated (`exports/…/attempt=<n>/`); a stale
   attempt's objects are never referenced and are reclaimed by TTL.
-- Object-store or engine failures surface as `unavailable`/`bad_gateway`-style
-  errors mapped to the error contract, and ingestion failures are retry-safe
-  (fresh staging, no duplicate visible version).
+- Object-store or engine failures surface as `unavailable` (503) or `internal`
+  (500) errors under the `docs/design.md` §11 error contract, and ingestion
+  failures are retry-safe (fresh staging, no duplicate visible version).
 - The query engine is isolated behind `internal/query.Engine`; DuckDB is
   single-node, and a future distributed engine would replace only that
   boundary.
@@ -112,8 +116,11 @@ history. The first release runs entirely under Docker Compose.
   of allowed references to their registered prefixes, a per-query prefix-scoped
   S3 credential, and a read-only execution connection with the local filesystem
   disabled and configuration locked (see `docs/design.md` §7).
-- **Object access**: ingest uses a least-privilege worker credential (read
-  uploads/source, write staging/lake); each query uses a short-lived credential
+- **Object access**: ingest uses a least-privilege worker credential to **read**
+  uploads/source, and an **attempt-scoped, short-lived** write credential for
+  `staging/`/`lake/` whose expiry is recorded as `write_credential_expires_at` so
+  the stale-attempt sweeper can guarantee no writes after delete (`docs/design.md`
+  §4 rule 8, §8); each query uses a short-lived credential
   scoped to exactly the committed attempt prefixes
   `lake/<namespace>/<dataset>/version=<n>/attempt=<n>/` it references (read),
   registered as a prefix-scoped DuckDB secret with ambient
