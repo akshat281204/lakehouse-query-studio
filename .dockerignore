@@ -1,0 +1,15 @@
+.git
+.github
+.gitignore
+.opencode
+.review
+.stack
+docs
+plan
+*.md
+.env
+.env.*
+web
+node_modules
+bin
+coverage
