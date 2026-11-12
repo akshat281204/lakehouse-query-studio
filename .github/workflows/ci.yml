@@ -34,9 +34,9 @@ jobs:
         working-directory: web
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v8
         with:
-          version: v1.64.8
+          version: v2.15.0
           args: --timeout=5m ./cmd/... ./internal/...
 
       - name: Verify
