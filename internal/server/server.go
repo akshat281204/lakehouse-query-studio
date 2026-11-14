@@ -72,12 +72,12 @@ func New(cfg *config.Config, log *slog.Logger, deps Deps) *Server {
 
 // Handler exposes the HTTP handler for tests.
 func (s *Server) Handler() http.Handler {
-	var h http.Handler = guard.Middleware(guard.Config{
+	h := http.Handler(guard.Middleware(guard.Config{
 		AllowedHosts:   s.cfg.AllowedHosts,
 		AllowedOrigins: s.cfg.AllowedOrigins,
 		Token:          s.cfg.APIToken,
 		TokenExempt:    []string{"/healthz"},
-	}, s.routes())
+	}, s.routes()))
 	if s.deps.Metrics != nil {
 		// Outermost, so refused requests are counted too (route "unmatched").
 		h = s.deps.Metrics.Instrument(h)

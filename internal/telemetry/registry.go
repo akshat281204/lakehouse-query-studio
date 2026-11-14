@@ -66,7 +66,7 @@ func (f family) labelStr(values []string, extra ...string) string {
 }
 
 func (f family) header(w io.Writer) {
-	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", f.name, f.help, f.name, f.kind)
+	wf(w, "# HELP %s %s\n# TYPE %s %s\n", f.name, f.help, f.name, f.kind)
 }
 
 // Counter is a monotonically increasing labelled counter.
@@ -181,10 +181,10 @@ func (r *Registry) NewCounter(name, help string, labels []string, allowed [][]st
 		defer c.mu.Unlock()
 		ids := sortedKeys(c.vals)
 		if len(ids) == 0 && len(labels) == 0 {
-			fmt.Fprintf(w, "%s 0\n", name)
+			wf(w, "%s 0\n", name)
 		}
 		for _, id := range ids {
-			fmt.Fprintf(w, "%s%s %s\n", name, c.f.labelStr(c.keys[id]), num(c.vals[id]))
+			wf(w, "%s%s %s\n", name, c.f.labelStr(c.keys[id]), num(c.vals[id]))
 		}
 	})
 	return c
@@ -199,10 +199,10 @@ func (r *Registry) NewGauge(name, help string, labels []string, allowed [][]stri
 		defer g.mu.Unlock()
 		ids := sortedKeys(g.vals)
 		if len(ids) == 0 && len(labels) == 0 {
-			fmt.Fprintf(w, "%s 0\n", name)
+			wf(w, "%s 0\n", name)
 		}
 		for _, id := range ids {
-			fmt.Fprintf(w, "%s%s %s\n", name, g.f.labelStr(g.keys[id]), num(g.vals[id]))
+			wf(w, "%s%s %s\n", name, g.f.labelStr(g.keys[id]), num(g.vals[id]))
 		}
 	})
 	return g
@@ -224,11 +224,11 @@ func (r *Registry) NewHistogram(name, help string, buckets []float64, labels []s
 		for _, id := range ids {
 			c := h.counts[id]
 			for i, b := range h.buckets {
-				fmt.Fprintf(w, "%s_bucket%s %d\n", name, h.f.labelStr(h.keys[id], fmt.Sprintf(`le="%s"`, num(b))), c[i])
+				wf(w, "%s_bucket%s %d\n", name, h.f.labelStr(h.keys[id], fmt.Sprintf(`le="%s"`, num(b))), c[i])
 			}
-			fmt.Fprintf(w, "%s_bucket%s %d\n", name, h.f.labelStr(h.keys[id], `le="+Inf"`), c[len(h.buckets)])
-			fmt.Fprintf(w, "%s_sum%s %s\n", name, h.f.labelStr(h.keys[id]), num(h.sums[id]))
-			fmt.Fprintf(w, "%s_count%s %d\n", name, h.f.labelStr(h.keys[id]), c[len(h.buckets)])
+			wf(w, "%s_bucket%s %d\n", name, h.f.labelStr(h.keys[id], `le="+Inf"`), c[len(h.buckets)])
+			wf(w, "%s_sum%s %s\n", name, h.f.labelStr(h.keys[id]), num(h.sums[id]))
+			wf(w, "%s_count%s %d\n", name, h.f.labelStr(h.keys[id]), c[len(h.buckets)])
 		}
 	})
 	return h
@@ -243,6 +243,10 @@ func (r *Registry) Render(w io.Writer) {
 		r.render[n](w)
 	}
 }
+
+// wf writes a formatted line to w. Metrics are rendered into an in-memory
+// buffer or an HTTP response; a failed write has nothing useful to recover.
+func wf(w io.Writer, format string, a ...any) { _, _ = fmt.Fprintf(w, format, a...) }
 
 func sortedKeys(m map[string]float64) []string {
 	out := make([]string, 0, len(m))
