@@ -14,12 +14,13 @@ import (
 type Memory struct {
 	mu   sync.Mutex
 	data map[string][]byte
+	mod  map[string]time.Time
 	// Gets counts whole-object reads, so tests can prove nothing was fetched.
 	Gets int
 }
 
 // NewMemory returns an empty in-memory store.
-func NewMemory() *Memory { return &Memory{data: map[string][]byte{}} }
+func NewMemory() *Memory { return &Memory{data: map[string][]byte{}, mod: map[string]time.Time{}} }
 
 var _ ReadWriter = (*Memory)(nil)
 
@@ -45,7 +46,7 @@ func (m *Memory) List(_ context.Context, opts ListOptions) (ListResult, error) {
 	var res ListResult
 	for _, k := range m.Keys(opts.Prefix) {
 		m.mu.Lock()
-		res.Objects = append(res.Objects, Object{Key: k, Size: int64(len(m.data[k])), LastModified: time.Unix(0, 0)})
+		res.Objects = append(res.Objects, Object{Key: k, Size: int64(len(m.data[k])), LastModified: m.mod[k]})
 		m.mu.Unlock()
 	}
 	return res, nil
@@ -74,6 +75,7 @@ func (m *Memory) Put(_ context.Context, key string, data []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.data[key] = append([]byte(nil), data...)
+	m.mod[key] = time.Now()
 	return nil
 }
 
@@ -97,5 +99,14 @@ func (m *Memory) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.data, key)
+	delete(m.mod, key)
 	return nil
+}
+
+// SetModTime overrides an object's modification time (tests of age-based
+// sweeps). A zero time simulates an unknown age.
+func (m *Memory) SetModTime(key string, t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.mod[key] = t
 }

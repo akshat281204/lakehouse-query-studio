@@ -256,6 +256,56 @@ func (m *MemoryQueryStore) RequestCancel(_ context.Context, id string) (QueryJob
 	return cloneQuery(q), nil
 }
 
+func (m *MemoryQueryStore) Stats(_ context.Context) (QueueStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := QueueStats{IngestQueued: m.IngestQueued}
+	for _, j := range m.jobs {
+		switch j.Status {
+		case QueryQueued:
+			st.QueryQueued++
+		case QueryRunning:
+			st.QueryRunning++
+		}
+	}
+	return st, nil
+}
+
+func (m *MemoryQueryStore) ExpireResults(_ context.Context, cutoff time.Time) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var refs []string
+	for _, q := range m.jobs {
+		if q.Status == QuerySucceeded && q.ResultRef != "" && q.FinishedAt != nil && q.FinishedAt.Before(cutoff) {
+			refs = append(refs, q.ResultRef)
+			q.ResultRef, q.ResultBytes = "", nil
+		}
+	}
+	return refs, nil
+}
+
+func (m *MemoryQueryStore) PurgeHistory(_ context.Context, cutoff time.Time) (int, []string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var refs []string
+	n := 0
+	var keep []string
+	for _, id := range m.order {
+		q := m.jobs[id]
+		if IsTerminalQuery(q.Status) && q.FinishedAt != nil && q.FinishedAt.Before(cutoff) {
+			if q.ResultRef != "" {
+				refs = append(refs, q.ResultRef)
+			}
+			delete(m.jobs, id)
+			n++
+			continue
+		}
+		keep = append(keep, id)
+	}
+	m.order = keep
+	return n, refs, nil
+}
+
 // ExpireLease forces the lease of a RUNNING query into the past (tests).
 func (m *MemoryQueryStore) ExpireLease(id string) {
 	m.mu.Lock()

@@ -22,6 +22,7 @@ import (
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
 	"github.com/akshat281204/lakehouse-query-studio/internal/query"
 	"github.com/akshat281204/lakehouse-query-studio/internal/server"
+	"github.com/akshat281204/lakehouse-query-studio/internal/telemetry"
 )
 
 func main() {
@@ -93,7 +94,10 @@ func run() error {
 	}
 	defer func() { _ = validator.Close() }()
 
+	metrics := telemetry.New(server.Version)
+
 	srv := server.New(cfg, log, server.Deps{
+		Metrics: metrics,
 		Ready:   buildReady(cfg, db),
 		Catalog: catalogStore,
 		Objects: objects,

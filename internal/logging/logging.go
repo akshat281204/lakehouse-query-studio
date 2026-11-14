@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
 	"strings"
 )
 
@@ -55,6 +56,12 @@ func parseLevel(level string) (slog.Level, error) {
 // redacted from log output.
 func sensitive(key string) bool {
 	k := strings.ToLower(key)
+	// Query text must never be logged. Exact keys only: "statement_hash" is
+	// the safe, intended identifier.
+	switch k {
+	case "statement", "sql", "query_text", "stmt", "query_sql":
+		return true
+	}
 	for _, frag := range []string{
 		"password", "secret", "token", "credential", "authorization",
 		"api_key", "apikey", "access_key", "secret_key", "private_key",
@@ -64,6 +71,18 @@ func sensitive(key string) bool {
 		}
 	}
 	return false
+}
+
+// urlCreds matches the userinfo of a URL (scheme://user:password@host).
+var urlCreds = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.\-]*://)[^/\s:@]*:[^/\s@]*@`)
+
+// scrubURLCredentials masks credentials embedded in URLs, which libraries
+// (database drivers in particular) sometimes echo inside error strings.
+func scrubURLCredentials(s string) string {
+	if !strings.Contains(s, "@") {
+		return s
+	}
+	return urlCreds.ReplaceAllString(s, "${1}[REDACTED]@")
 }
 
 // redactingHandler wraps a slog.Handler and masks the values of sensitive
@@ -103,6 +122,14 @@ func redactAttr(a slog.Attr) slog.Attr {
 	if sensitive(a.Key) {
 		a.Value = slog.StringValue("[REDACTED]")
 		return a
+	}
+	switch a.Value.Kind() {
+	case slog.KindString:
+		a.Value = slog.StringValue(scrubURLCredentials(a.Value.String()))
+	case slog.KindAny:
+		if err, ok := a.Value.Any().(error); ok && err != nil {
+			a.Value = slog.StringValue(scrubURLCredentials(err.Error()))
+		}
 	}
 	if a.Value.Kind() == slog.KindGroup {
 		group := a.Value.Group()

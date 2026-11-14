@@ -16,6 +16,7 @@ import (
 	"github.com/akshat281204/lakehouse-query-studio/internal/catalog"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
 	"github.com/akshat281204/lakehouse-query-studio/internal/parquet"
+	"github.com/akshat281204/lakehouse-query-studio/internal/telemetry"
 )
 
 // maxStagedFiles bounds how many objects one query may stage.
@@ -55,6 +56,8 @@ type Runner struct {
 	Owner     string
 	Cfg       RunnerConfig
 	Log       *slog.Logger
+	// Metrics is optional; every recorded label comes from a closed set.
+	Metrics *telemetry.Metrics
 }
 
 // NewRunner builds a Runner, applying defaults for zero config fields.
@@ -117,6 +120,9 @@ func (c RunnerConfig) Validate() error {
 func (r *Runner) Run(ctx context.Context) {
 	if n := CleanStaleScratch(r.Cfg.TmpDir, time.Hour); n > 0 {
 		r.Log.Warn("removed stale query scratch directories", "count", n)
+	}
+	if r.Metrics != nil {
+		r.Metrics.WorkerSlots.Set(float64(r.Cfg.Workers))
 	}
 	slots := make(chan struct{}, r.Cfg.Workers)
 	var wg sync.WaitGroup
@@ -181,6 +187,10 @@ func ResultKey(queryID string, attempt int) string {
 // or shutting down). It never logs SQL text or credentials.
 func (r *Runner) Process(ctx context.Context, job catalog.QueryJob) {
 	start := time.Now()
+	if r.Metrics != nil {
+		r.Metrics.WorkerInflight.Add(1)
+		defer r.Metrics.WorkerInflight.Add(-1)
+	}
 	jobCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
@@ -199,9 +209,11 @@ func (r *Runner) Process(ctx context.Context, job catalog.QueryJob) {
 	switch {
 	case errors.Is(cause, errFenced):
 		r.Log.Warn("query fenced, discarding work", "query", job.ID, "attempt", job.Attempt)
+		r.count("abandoned", "", dur)
 		return
 	case ctx.Err() != nil && err != nil:
 		r.Log.Info("query interrupted by shutdown; it will be requeued after its lease expires", "query", job.ID)
+		r.count("abandoned", "", dur)
 		return
 	}
 
@@ -314,6 +326,19 @@ func (r *Runner) heartbeat(ctx context.Context, job catalog.QueryJob, cancel con
 	}
 }
 
+// count records a finished attempt in metrics (outcome and reason are closed
+// sets; duration is wall time from claim).
+func (r *Runner) count(outcome, reason string, dur time.Duration) {
+	if r.Metrics == nil {
+		return
+	}
+	r.Metrics.QueryJobs.Inc(outcome)
+	if reason != "" {
+		r.Metrics.QueryFailures.Inc(reason)
+	}
+	r.Metrics.QueryDuration.Observe(dur.Seconds())
+}
+
 func (r *Runner) succeed(ctx context.Context, job catalog.QueryJob, res *spooled, staged int64, dur time.Duration) {
 	err := r.Store.Succeed(ctx, job.ID, job.FencingToken, catalog.QueryResult{
 		ResultRef: res.key, RowsReturned: int64(res.rows), Truncated: res.truncated,
@@ -323,10 +348,16 @@ func (r *Runner) succeed(ctx context.Context, job catalog.QueryJob, res *spooled
 		// Lost the race: our spool is attempt-scoped and never referenced.
 		_ = r.Objects.Delete(ctx, res.key)
 		r.Log.Warn("query result fenced", "query", job.ID)
+		r.count("abandoned", "", dur)
 		return
 	}
 	if err != nil {
 		r.Log.Error("recording query success failed", "query", job.ID, "error", "store error")
+		return
+	}
+	r.count("succeeded", "", dur)
+	if r.Metrics != nil {
+		r.Metrics.QueryRowsReturned.Add(float64(res.rows))
 	}
 	r.Log.Info("query succeeded", "query", job.ID, "rows", res.rows, "truncated", res.truncated,
 		"duration_ms", dur.Milliseconds(), "statement_hash", job.StatementHash)
@@ -336,12 +367,14 @@ func (r *Runner) finish(ctx context.Context, job catalog.QueryJob, status, reaso
 	err := r.Store.Finish(ctx, job.ID, job.FencingToken, status, reason, summary, dur)
 	if errors.Is(err, catalog.ErrFenced) {
 		r.Log.Warn("query finish fenced", "query", job.ID)
+		r.count("abandoned", "", dur)
 		return
 	}
 	if err != nil {
 		r.Log.Error("recording query end failed", "query", job.ID, "error", "store error")
 		return
 	}
+	r.count(map[string]string{catalog.QueryFailed: "failed", catalog.QueryCancelled: "cancelled", catalog.QueryTimedOut: "timed_out"}[status], reason, dur)
 	r.Log.Info("query finished", "query", job.ID, "status", status, "reason", reason,
 		"duration_ms", dur.Milliseconds(), "statement_hash", job.StatementHash)
 }
