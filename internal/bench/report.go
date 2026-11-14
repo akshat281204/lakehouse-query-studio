@@ -180,58 +180,62 @@ func absF(v float64) float64 {
 	return v
 }
 
+// wf writes a formatted line; the report goes to a file or buffer, and a failed
+// write is reported when the file is closed.
+func wf(w io.Writer, format string, a ...any) { _, _ = fmt.Fprintf(w, format, a...) }
+
 // Markdown renders the report as GitHub-flavoured Markdown.
 func (r *Report) Markdown(w io.Writer) {
 	e := r.Environment
-	fmt.Fprintf(w, "### Environment\n\n| | |\n|---|---|\n")
-	fmt.Fprintf(w, "| Generated | %s |\n| OS / arch | %s / %s |\n| CPU | %s (%d logical) |\n| Memory | %.1f GiB |\n",
+	wf(w, "### Environment\n\n| | |\n|---|---|\n")
+	wf(w, "| Generated | %s |\n| OS / arch | %s / %s |\n| CPU | %s (%d logical) |\n| Memory | %.1f GiB |\n",
 		r.GeneratedAt.Format(time.RFC3339), e.GOOS, e.GOARCH, e.CPUModel, e.LogicalCPUs, float64(e.MemoryBytes)/(1<<30))
-	fmt.Fprintf(w, "| Go | %s |\n| DuckDB | %s |\n| Commit | `%s` (dirty: %v) |\n| Object store | %s |\n| OS cache | %s |\n\n",
+	wf(w, "| Go | %s |\n| DuckDB | %s |\n| Commit | `%s` (dirty: %v) |\n| Object store | %s |\n| OS cache | %s |\n\n",
 		e.GoVersion, e.DuckDB, e.Commit, e.Dirty, r.Config.ObjectStore, e.OSCache)
 
 	c := r.Config
-	fmt.Fprintf(w, "### Configuration\n\nScale %.3g (TPC-H-like, seed %d), %d warm iterations per query. Query limits: timeout %s, %d threads, memory %s, max rows %d, max result bytes %d, max scan bytes %d. %s\n\n",
+	wf(w, "### Configuration\n\nScale %.3g (TPC-H-like, seed %d), %d warm iterations per query. Query limits: timeout %s, %d threads, memory %s, max rows %d, max result bytes %d, max scan bytes %d. %s\n\n",
 		c.Scale, c.Seed, c.Iterations, c.Limits.Timeout, c.Limits.Threads, c.Limits.MemoryLimit, c.Limits.MaxRows, c.Limits.MaxResultBytes, c.Limits.MaxScanBytes, c.LimitsNote)
 
-	fmt.Fprintf(w, "### Dataset\n\n| Table | Rows | Files | Size |\n|---|---:|---:|---:|\n")
+	wf(w, "### Dataset\n\n| Table | Rows | Files | Size |\n|---|---:|---:|---:|\n")
 	for _, t := range r.Dataset.Tables {
-		fmt.Fprintf(w, "| %s | %d | %d | %.1f MiB |\n", t.Name, t.Rows, t.Files, float64(t.Bytes)/(1<<20))
+		wf(w, "| %s | %d | %d | %.1f MiB |\n", t.Name, t.Rows, t.Files, float64(t.Bytes)/(1<<20))
 	}
 
-	fmt.Fprintf(w, "\n### Query latency (single client, end to end, ms)\n\n")
-	fmt.Fprintf(w, "n = %d warm runs per query; with so few samples p95/p99 are at or near the maximum. Every result was checked against ground truth computed by the generator.\n\n", c.Iterations)
-	fmt.Fprintf(w, "| Query | first | p50 | p95 | p99 | max | stage p50 | execute p50 | spool p50 | rows | staged MiB |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	wf(w, "\n### Query latency (single client, end to end, ms)\n\n")
+	wf(w, "n = %d warm runs per query; with so few samples p95/p99 are at or near the maximum. Every result was checked against ground truth computed by the generator.\n\n", c.Iterations)
+	wf(w, "| Query | first | p50 | p95 | p99 | max | stage p50 | execute p50 | spool p50 | rows | staged MiB |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, q := range r.Queries {
-		fmt.Fprintf(w, "| %s | %.0f | %.0f | %.0f | %.0f | %.0f | %.0f | %.0f | %.0f | %d%s | %.1f |\n",
+		wf(w, "| %s | %.0f | %.0f | %.0f | %.0f | %.0f | %.0f | %.0f | %.0f | %d%s | %.1f |\n",
 			q.ID, q.FirstMs, q.Warm.P50Ms, q.Warm.P95Ms, q.Warm.P99Ms, q.Warm.MaxMs, q.WarmStage.P50Ms,
 			q.WarmExecute.P50Ms, q.WarmSpool.P50Ms, q.RowsReturned, map[bool]string{true: " (trunc.)"}[q.Truncated],
 			float64(q.BytesStaged)/(1<<20))
 	}
 
-	fmt.Fprintf(w, "\n### Throughput under concurrency\n\n| Workers | Queries | Wall s | Queries/s | p50 ms | p95 ms | p99 ms | Failed |\n|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	wf(w, "\n### Throughput under concurrency\n\n| Workers | Queries | Wall s | Queries/s | p50 ms | p95 ms | p99 ms | Failed |\n|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, k := range r.Concurrency {
-		fmt.Fprintf(w, "| %d | %d | %.2f | %.2f | %.0f | %.0f | %.0f | %d |\n", k.Workers, k.Queries, k.WallSeconds,
+		wf(w, "| %d | %d | %.2f | %.2f | %.0f | %.0f | %.0f | %d |\n", k.Workers, k.Queries, k.WallSeconds,
 			k.QueriesPerS, k.Latency.P50Ms, k.Latency.P95Ms, k.Latency.P99Ms, k.Failed)
 	}
 
-	fmt.Fprintf(w, "\n### Partitioned vs unpartitioned\n\n| Comparison | flat p50 ms | partitioned p50 ms | flat execute p50 | partitioned execute p50 | bytes staged (flat / partitioned) | End-to-end verdict | Execute-only verdict |\n|---|---:|---:|---:|---:|---|---|---|\n")
+	wf(w, "\n### Partitioned vs unpartitioned\n\n| Comparison | flat p50 ms | partitioned p50 ms | flat execute p50 | partitioned execute p50 | bytes staged (flat / partitioned) | End-to-end verdict | Execute-only verdict |\n|---|---:|---:|---:|---:|---|---|---|\n")
 	for _, p := range r.Partitioning {
-		fmt.Fprintf(w, "| %s | %.0f | %.0f | %.0f | %.0f | %d / %d | %s | %s |\n", p.Pair, p.FlatP50Ms, p.PartitionedP50Ms,
+		wf(w, "| %s | %.0f | %.0f | %.0f | %.0f | %d / %d | %s | %s |\n", p.Pair, p.FlatP50Ms, p.PartitionedP50Ms,
 			p.FlatExecP50Ms, p.PartExecP50Ms, p.FlatBytesStaged, p.PartBytesStaged, p.Verdict, p.ExecVerdict)
 	}
 
-	fmt.Fprintf(w, "\n### Ingestion throughput (CSV -> Parquet)\n\n| Rows | Input MiB | Output MiB | Files | Seconds | Rows/s | Input MiB/s | Partition |\n|---:|---:|---:|---:|---:|---:|---:|---|\n")
+	wf(w, "\n### Ingestion throughput (CSV -> Parquet)\n\n| Rows | Input MiB | Output MiB | Files | Seconds | Rows/s | Input MiB/s | Partition |\n|---:|---:|---:|---:|---:|---:|---:|---|\n")
 	for _, i := range r.Ingest {
 		part := i.PartitionColumn
 		if part == "" {
 			part = "none"
 		}
-		fmt.Fprintf(w, "| %d | %.1f | %.1f | %d | %.2f | %.0f | %.1f | %s |\n", i.Rows, float64(i.InputBytes)/(1<<20),
+		wf(w, "| %d | %.1f | %.1f | %d | %.2f | %.0f | %.1f | %s |\n", i.Rows, float64(i.InputBytes)/(1<<20),
 			float64(i.OutputBytes)/(1<<20), i.OutputFiles, i.Seconds, i.RowsPerSecond, i.InputMiBPerSec, part)
 	}
-	fmt.Fprintf(w, "\n### Limitations of this run\n\n")
+	wf(w, "\n### Limitations of this run\n\n")
 	for _, l := range r.Limitations {
-		fmt.Fprintf(w, "- %s\n", l)
+		wf(w, "- %s\n", l)
 	}
 	_ = strings.TrimSpace
 }
