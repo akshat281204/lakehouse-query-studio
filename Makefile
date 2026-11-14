@@ -5,12 +5,12 @@ WEB_DIR := web
 
 # Scope Go tooling to first-party packages so generated/vendored trees
 # (web/node_modules, web/dist) are never scanned.
-GO_PACKAGES := ./cmd/... ./internal/...
-GO_SOURCES := $(shell find cmd internal -type f -name '*.go')
+GO_PACKAGES := ./cmd/... ./internal/... ./test/...
+GO_SOURCES := $(shell find cmd internal test -type f -name '*.go')
 
 .DEFAULT_GOAL := verify
 
-.PHONY: up down run web genenv test test-integration verify \
+.PHONY: up down run web genenv test test-integration verify bench bench-sf1 \
         fmt vet lint go-test web-test go-build web-build typecheck build
 
 # --- Local stack -----------------------------------------------------------
@@ -60,6 +60,12 @@ test: go-test web-test # Run Go and web unit tests
 
 test-integration: # Run Postgres-backed integration tests (needs TEST_POSTGRES_URL)
 	$(GO) test -tags integration -count=1 $(GO_PACKAGES)
+
+bench: # Benchmark at the default scale (~600k lineitem rows); writes docs/results/
+	$(GO) run ./cmd/bench -scale 0.1 -iterations 15 -out docs/results/bench-sf0.1.json -md docs/results/bench-sf0.1.md
+
+bench-sf1: # Opt-in larger run (~6M lineitem rows, needs ~2 GiB free RAM and several minutes)
+	$(GO) run ./cmd/bench -scale 1 -iterations 15 -concurrency-queries 16 -out docs/results/bench-sf1.json -md docs/results/bench-sf1.md
 
 go-test:
 	$(GO) test -race $(GO_PACKAGES)

@@ -58,6 +58,18 @@ type Runner struct {
 	Log       *slog.Logger
 	// Metrics is optional; every recorded label comes from a closed set.
 	Metrics *telemetry.Metrics
+	// OnTimings, if set, is called after each executed query with where its
+	// time went. Used by the benchmark; carries no statement text.
+	OnTimings func(Timings)
+}
+
+// Timings breaks one query's wall time into its stages.
+type Timings struct {
+	Stage       time.Duration // download dataset files to local scratch
+	Execute     time.Duration // DuckDB execution and result materialization
+	Spool       time.Duration // encode and write the result
+	BytesStaged int64
+	Err         error
 }
 
 // NewRunner builds a Runner, applying defaults for zero config fields.
@@ -419,6 +431,11 @@ func (r *Runner) execute(ctx context.Context, job catalog.QueryJob) (*spooled, i
 	}
 
 	var staged int64
+	var tm Timings
+	if r.OnTimings != nil {
+		defer func() { tm.BytesStaged = staged; r.OnTimings(tm) }()
+	}
+	stageStart := time.Now()
 	req := Request{Statement: job.Statement, WorkDir: work, Limits: r.Cfg.Limits}
 	for i, id := range order {
 		rel, err := r.Store.RelationByVersionID(ctx, id)
@@ -439,11 +456,17 @@ func (r *Runner) execute(ctx context.Context, job catalog.QueryJob) (*spooled, i
 		req.Sources = append(req.Sources, *src)
 	}
 
+	tm.Stage = time.Since(stageStart)
+	execStart := time.Now()
 	res, err := r.Engine.Execute(ctx, req)
+	tm.Execute = time.Since(execStart)
 	if err != nil {
+		tm.Err = err
 		return nil, staged, err
 	}
+	spoolStart := time.Now()
 	sp, err := r.spool(ctx, job, res)
+	tm.Spool, tm.Err = time.Since(spoolStart), err
 	return sp, staged, err
 }
 
