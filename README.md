@@ -21,7 +21,7 @@ storage, not a distributed database.
 | `web/` | React + TypeScript + Vite dashboard with a typed API client |
 | `docker-compose.yml` | Local Postgres, MinIO, API, worker, and web |
 | `Makefile` | `up`, `down`, `run`, `web`, `test`, `verify` targets |
-| `docs/` | Design contract (phase 0), catalog (phase 2), ingestion (phase 3), queries (phase 4) |
+| `docs/` | Design contract (phase 0), catalog (phase 2), ingestion (phase 3), queries (phase 4), dashboard (phase 5) |
 
 ## Prerequisites
 
@@ -99,6 +99,10 @@ make verify
 plus web ESLint, Go unit/race tests (`go test -race ./...`) and web tests
 (Vitest), web typechecking (`tsc`), and Go build (`go build ./...`) plus the web
 production build. **It does not require a running MinIO or PostgreSQL instance.**
+
+`make web-build` also runs `scripts/check-bundle.sh`, which fails if the bundle
+or web source could expose credentials or use browser storage. See
+`docs/dashboard.md`.
 
 Individual targets: `make test` (Go + web tests), `make run` (API on the host),
 and `make web` (Vite dev server with hot reload).
