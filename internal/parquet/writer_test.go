@@ -1,8 +1,11 @@
 package parquet
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"testing"
 )
 
@@ -73,5 +76,58 @@ func TestEncodeRejectsBadInput(t *testing.T) {
 	}
 	if _, err := Encode([]WriteColumn{{Name: "a", Type: TypeInt64}}, [][]any{{"x"}}); !errors.Is(err, ErrWrite) {
 		t.Errorf("wrong type: %v", err)
+	}
+}
+
+type bytesReader []byte
+
+func (b bytesReader) Range(_ context.Context, _ string, off, n int64) (io.ReadCloser, error) {
+	if off+n > int64(len(b)) {
+		n = int64(len(b)) - off
+	}
+	return io.NopCloser(bytes.NewReader(b[off : off+n])), nil
+}
+
+func TestReadRowsWindow(t *testing.T) {
+	cols := []WriteColumn{
+		{Name: "id", Type: TypeInt64},
+		{Name: "s", Type: TypeString, Nullable: true},
+		{Name: "f", Type: TypeDouble, Nullable: true},
+		{Name: "b", Type: TypeBoolean},
+	}
+	var rows [][]any
+	for i := 0; i < 250; i++ {
+		var s, f any
+		if i%3 != 0 {
+			s = fmt.Sprintf("v%d", i)
+			f = float64(i) / 2
+		}
+		rows = append(rows, []any{int64(i), s, f, i%2 == 0})
+	}
+	data, err := Encode(cols, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadRows(context.Background(), bytesReader(data), "k", int64(len(data)), 100, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NumRows != 250 || len(got.Rows) != 50 {
+		t.Fatalf("numRows=%d rows=%d", got.NumRows, len(got.Rows))
+	}
+	first := got.Rows[0]
+	if first["id"] != int64(100) || first["s"] != "v100" || first["f"] != 50.0 || first["b"] != true {
+		t.Fatalf("row 100 = %v", first)
+	}
+	if got.Rows[2]["s"] != nil || got.Rows[2]["id"] != int64(102) {
+		t.Fatalf("row 102 should have null s: %v", got.Rows[2])
+	}
+	tail, err := ReadRows(context.Background(), bytesReader(data), "k", int64(len(data)), 240, 100)
+	if err != nil || len(tail.Rows) != 10 {
+		t.Fatalf("tail rows=%d err=%v", len(tail.Rows), err)
+	}
+	past, err := ReadRows(context.Background(), bytesReader(data), "k", int64(len(data)), 999, 10)
+	if err != nil || len(past.Rows) != 0 {
+		t.Fatalf("past end: %v %v", past, err)
 	}
 }

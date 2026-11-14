@@ -15,6 +15,7 @@ import (
 	"github.com/akshat281204/lakehouse-query-studio/internal/config"
 	"github.com/akshat281204/lakehouse-query-studio/internal/health"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
+	"github.com/akshat281204/lakehouse-query-studio/internal/query"
 )
 
 // Version is the reported service version. It may be overridden at build time
@@ -36,6 +37,13 @@ type Deps struct {
 	// optional; when either is nil those endpoints report unavailable.
 	Ingest catalog.IngestStore
 	Writer objectstore.ReadWriter
+
+	// Queries and Validator enable the query endpoints. When either is nil
+	// those endpoints report unavailable. QueryLimits bounds result paging,
+	// export and queue depth.
+	Queries     catalog.QueryStore
+	Validator   *query.Validator
+	QueryLimits api.QueryLimits
 }
 
 // Server owns the HTTP server and its routes.
@@ -70,11 +78,15 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
 	datasets := api.New(s.deps.Catalog, s.deps.Objects,
-		api.WithIngest(api.IngestDeps{Jobs: s.deps.Ingest, Objects: s.deps.Writer}))
+		api.WithIngest(api.IngestDeps{Jobs: s.deps.Ingest, Objects: s.deps.Writer}),
+		api.WithQueries(api.QueryDeps{Store: s.deps.Queries, Validator: s.deps.Validator,
+			Objects: s.deps.Objects, Limits: s.deps.QueryLimits}))
 	mux.Handle("/api/v1/datasets", datasets)
 	mux.Handle("/api/v1/datasets/", datasets)
 	mux.Handle("/api/v1/ingestions", datasets)
 	mux.Handle("/api/v1/ingestions/", datasets)
+	mux.Handle("/api/v1/queries", datasets)
+	mux.Handle("/api/v1/queries/", datasets)
 	return mux
 }
 

@@ -1,7 +1,9 @@
-// Command worker runs the asynchronous ingestion jobs: it claims uploaded
-// CSV/JSON/JSONL conversion jobs from PostgreSQL, writes versioned Parquet to
-// object storage, and publishes the dataset version atomically. Query
-// execution joins this process in a later phase.
+// Command worker runs the asynchronous jobs. Two independent pools share the
+// process: ingestion (claims uploaded CSV/JSON/JSONL conversion jobs, writes
+// versioned Parquet, publishes the dataset version atomically) and queries
+// (claims durable query jobs, stages the referenced Parquet files, executes
+// one validated read-only statement on single-node DuckDB, and spools the
+// bounded result).
 package main
 
 import (
@@ -10,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -20,6 +23,7 @@ import (
 	"github.com/akshat281204/lakehouse-query-studio/internal/ingest"
 	"github.com/akshat281204/lakehouse-query-studio/internal/logging"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
+	"github.com/akshat281204/lakehouse-query-studio/internal/query"
 )
 
 func main() {
@@ -77,8 +81,30 @@ func run() error {
 	owner := fmt.Sprintf("%s-%d", host, os.Getpid())
 	runner := ingest.NewRunner(catalog.NewPostgresIngestStore(db), objects, owner, log)
 
-	log.Info("worker started", "owner", owner)
-	runner.Run(ctx)
+	q := cfg.Query
+	validator, err := query.NewValidator()
+	if err != nil {
+		return fmt.Errorf("sql validator: %w", err)
+	}
+	defer func() { _ = validator.Close() }()
+	queryRunner, err := query.NewRunner(catalog.NewPostgresQueryStore(db), objects, query.NewDuckDB(), validator, owner,
+		query.RunnerConfig{
+			Workers: q.Workers, Lease: q.Lease, Heartbeat: q.Heartbeat, TmpDir: q.TmpDir,
+			Limits: query.Limits{
+				Timeout: q.Timeout, MaxRows: q.MaxRows, MaxResultBytes: q.MaxResultBytes,
+				MaxRowBytes: q.MaxRowBytes, MaxScanBytes: q.MaxScanBytes, Threads: q.Threads, MemoryLimit: q.Memory,
+			},
+		}, log)
+	if err != nil {
+		return fmt.Errorf("query runner: %w", err)
+	}
+
+	log.Info("worker started", "owner", owner, "query_workers", q.Workers)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); runner.Run(ctx) }()
+	go func() { defer wg.Done(); queryRunner.Run(ctx) }()
+	wg.Wait()
 	log.Info("worker shutting down")
 	return nil
 }
