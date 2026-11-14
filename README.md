@@ -94,7 +94,7 @@ production build. **It does not require a running MinIO or PostgreSQL instance.*
 Individual targets: `make test` (Go + web tests), `make run` (API on the host),
 and `make web` (Vite dev server with hot reload).
 
-## API (phase 1)
+## API
 
 - `GET /` — service metadata (`{ "service": "lakehouse-api", "version": … }`)
 - `GET /api/v1/info` — service metadata for the web app (same payload as `/`);
@@ -103,8 +103,18 @@ and `make web` (Vite dev server with hot reload).
 - `GET /healthz` — liveness (`{ "status": "ok" }`)
 - `GET /readyz` — readiness; reports each dependency (`postgres`, `minio`) and
   returns `200` only when all are healthy, otherwise `503`
+- `POST /api/v1/datasets` — register an existing Parquet prefix
+  (`{ "name": "sales", "prefix": "data/sales" }`)
+- `GET /api/v1/datasets` — paged, searchable dataset list (`offset`, `limit`,
+  `q`)
+- `GET /api/v1/datasets/{id}` — dataset detail with latest version and schema
+- `GET /api/v1/datasets/{id}/schema` — schema columns
+- `GET /api/v1/datasets/{id}/preview` — bounded sample rows
 
-Later phases add the versioned dataset and query API under `/api/v1`.
+The dataset endpoints return `503 unavailable` when PostgreSQL or MinIO is not
+configured. All non-2xx responses use a single error envelope
+(`{ "error": { "code", "message", "details" } }`); see `docs/design.md` §11 and
+`docs/catalog.md`.
 
 ## CI
 
