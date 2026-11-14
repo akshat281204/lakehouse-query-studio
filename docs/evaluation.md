@@ -7,7 +7,7 @@ the machine below and say nothing about other hardware. Raw results are in
 ## How to reproduce
 
 ```bash
-make verify                    # includes the fault tests (no MinIO, no large fixtures)
+make verify                    # includes the fault tests (no object store, no large fixtures)
 make bench                     # ~600k lineitem rows, about 10 s; writes docs/results/bench-sf0.1.*
 make bench-sf1                 # opt-in: ~6M lineitem rows, several minutes, ~2 GiB RAM
 make test-integration          # opt-in: adds Postgres-backed tests (needs TEST_POSTGRES_URL)
@@ -144,7 +144,7 @@ SF1 run (independent repeat of the same upload):
 1. **Staging dominates at scale.** At SF1-like, staging is most of a query's latency (e.g. q1:
    about 630 ms staging vs about 80 ms execution) because every query downloads every file of every
    dataset it names. DuckDB execution itself is tens to low hundreds of milliseconds. The
-   in-memory store excludes network cost, so against real S3/MinIO staging would be slower, not
+   in-memory store excludes network cost, so against a real S3-compatible store staging would be slower, not
    faster. This is the largest performance cost of the current design (DuckDB reads local files,
    not S3; see `docs/queries.md`).
 2. **No partition-pruning benefit was measured.** The whole dataset is staged either way (the
@@ -197,9 +197,9 @@ Findings from these tests that changed the product:
 * An ingestion attempt that dies leaves its `lake/.../attempt=N/` objects behind. They are
   unreferenced and never queried (asserted above), but they are not reclaimed; only `exports/` and
   `staging/` are swept.
-* MinIO was not available in the build environment, so the "object store down" cases use the
-  injected-fault in-memory store, not a stopped MinIO container. The S3 client keeps its own
-  HTTP-level tests, and `cmd/bench -s3` exists but has not been run.
+* The "object store down" cases use the injected-fault in-memory store, not a stopped object-store
+  container. The S3 client has HTTP-level tests and an opt-in integration test against a real
+  S3-compatible server (SeaweedFS); `cmd/bench -s3` exists but has not been run against one.
 
 ## Limitations of this evaluation
 

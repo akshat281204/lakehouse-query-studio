@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # The query engine is single-node DuckDB, linked in through cgo. DuckDB's
 # bundled static libraries are built against glibc, so both stages are Debian
 # based (not Alpine/musl) and the build needs a C/C++ toolchain, which the

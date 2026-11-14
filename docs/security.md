@@ -55,11 +55,14 @@ which prefix:
 The worker uses the query credential for query reads and result spools when
 `QUERY_MINIO_*` is set, so a bug in the query path cannot write datasets.
 
-**Not verified / not done:** the policy files are validated structurally and by
-the test above, but were **not applied to a real MinIO** (the image cannot be
-pulled in the build environment). The default Compose file still gives every
-service the MinIO root credential; applying the policies means creating three
-service accounts and setting each service's `MINIO_ACCESS_KEY/SECRET_KEY`.
+**Not verified / not done:** the policy files are in AWS-IAM/MinIO syntax and are
+validated structurally and by the test above, but were **not applied to any
+real server**. The default Compose store (SeaweedFS) is configured with a single
+admin identity that every service shares, so least privilege is **not enforced
+by default**. Enforcing it means creating three service identities in your
+store with equivalent permissions and setting each service's
+`MINIO_ACCESS_KEY/SECRET_KEY` (SeaweedFS uses its own identity `actions` format
+rather than IAM policy JSON).
 Per-query STS credentials (design §7.4/§8) are not implemented; DuckDB itself
 never holds a credential (it reads staged local files).
 
@@ -78,7 +81,7 @@ statement text, object keys, ids and raw paths never appear.
 | `lqs_query_duration_seconds`, `lqs_query_cancel_requests_total`, `lqs_query_rows_returned_total` | — |
 | `lqs_ingest_jobs_total` / `_duration_seconds` | `outcome` |
 | `lqs_queue_depth` | `kind`, `state` |
-| `lqs_dependency_up` | `dependency` (`postgres`, `minio`) |
+| `lqs_dependency_up` | `dependency` (`postgres`, `objectstore`) |
 | `lqs_worker_up`, `lqs_worker_inflight_queries`, `lqs_worker_query_slots` | — |
 | `lqs_sweeper_deleted_total` | `kind` |
 | `lqs_build_info` | `version` |

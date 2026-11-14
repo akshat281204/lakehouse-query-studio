@@ -43,6 +43,12 @@ if [ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]; then
 fi
 
 umask 077
+# Keep any other settings the user added to an existing .env (ports, limits...).
+MANAGED='POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|MINIO_ROOT_USER|MINIO_ROOT_PASSWORD|MINIO_BUCKET|GRAFANA_ADMIN_PASSWORD|LOG_LEVEL'
+EXTRA=""
+if [ -f "$ENV_FILE" ]; then
+    EXTRA="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" | grep -v -E "^($MANAGED)=" || true)"
+fi
 {
     printf 'POSTGRES_USER=%s\n' "$POSTGRES_USER"
     printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
@@ -52,6 +58,8 @@ umask 077
     printf 'MINIO_BUCKET=%s\n' "$MINIO_BUCKET"
     printf 'GRAFANA_ADMIN_PASSWORD=%s\n' "$GRAFANA_ADMIN_PASSWORD"
     printf 'LOG_LEVEL=%s\n' "$LOG_LEVEL"
+    [ -n "$EXTRA" ] && printf '%s\n' "$EXTRA"
+    true
 } > "$ENV_FILE"
 
 # S3 identity for the local object store (SeaweedFS), derived from the same

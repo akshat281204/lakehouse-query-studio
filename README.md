@@ -1,187 +1,192 @@
 # Lakehouse Query Studio
 
 A local-first analytical query workbench over S3-compatible object storage.
-Users store or register Parquet datasets in S3/MinIO, discover them in a web
-dashboard, and run bounded SQL against them from an embedded query platform.
-The initial engine is **single-node DuckDB**: this is a query layer over object
-storage, not a distributed database.
+Upload CSV/JSON/JSONL or register existing Parquet, then run **bounded,
+read-only SQL** against it from a web dashboard. Queries are durable
+background jobs executed by **single-node DuckDB**.
 
-> **Single-node limit.** The first release runs exactly one DuckDB node and does
-> not shard, replicate, or scale out. It must not be described as a distributed
-> OLAP database. The query engine sits behind `internal/query.Engine` (added in
-> a later phase) so a measured need could justify a distributed engine later.
+> **Single-node limit.** One DuckDB node, one API, one worker. It does not
+> shard, replicate or scale out, and it is not a distributed OLAP database. The
+> engine sits behind `internal/query.Engine` so a measured need could justify
+> another engine later.
 
-## Repository layout
+<p align="center">
+  <img src="docs/images/overview-light.png" alt="Overview dashboard (light theme)" width="49%">
+  <img src="docs/images/overview-dark.png" alt="Overview dashboard (dark theme)" width="49%">
+</p>
+<p align="center">
+  <img src="docs/images/workbench-results.png" alt="SQL workbench with results" width="49%">
+  <img src="docs/images/workbench-chart.png" alt="SQL workbench chart" width="49%">
+</p>
 
-| Path | Purpose |
+## Quick start
+
+Needs **Docker** (Compose v2), **Go 1.25+ with a C/C++ compiler** (DuckDB is
+linked in through cgo) and `make`.
+
+```bash
+make demo
+```
+
+`make demo` generates local credentials, builds and starts the stack, waits for
+it to be healthy, loads a small deterministic sample dataset (`demo-sales`),
+runs a representative SQL query, checks the answer against values computed
+independently of the query engine, and prints the dashboard URL:
+
+```
+• loading the sample dataset "demo-sales" (2000 rows)...
+  dataset is READY
+• running a representative query:
+    SELECT region, count(*) AS orders, sum(quantity * unit_price) AS revenue FROM "demo-sales" ...
+   REGION   ORDERS     REVENUE
+    LATAM      515   710698.30
+    ...
+  verified against values computed independently of the query engine
+  Dashboard:  http://localhost:5173/
+```
+
+It is bounded (5-minute budget), safe to rerun (an already-loaded dataset is
+reused, nothing is duplicated), and **never deletes anything**. `make down`
+stops the stack and keeps your data; `docker compose down -v` also deletes the
+stack's volumes, so run it only if you want that. See
+[`docs/runbook.md`](docs/runbook.md) for ports, troubleshooting and what was and
+was not exercised when this was validated.
+
+## What is implemented
+
+Each row says how to check it.
+
+| Capability | Check it with |
 |---|---|
-| `cmd/api` | Go control-plane process (health, readiness, config) |
-| `cmd/worker` | Worker: ingestion jobs (phase 3) and query jobs on DuckDB (phase 4) |
-| `internal/` | Shared Go packages: config, logging, health, server |
-| `web/` | React + TypeScript + Vite dashboard with a typed API client |
-| `docker-compose.yml` | Local Postgres, MinIO, API, worker, and web |
-| `Makefile` | `up`, `down`, `run`, `web`, `test`, `verify` targets |
-| `docs/` | Design contract (phase 0), catalog (phase 2), ingestion (phase 3), queries (phase 4), dashboard (phase 5), security and operations (phase 6), evaluation (phase 7) |
-
-## Prerequisites
-
-- **Go** 1.25 or newer, with **cgo** and a C/C++ compiler (the DuckDB engine is linked in)
-- **Node.js** 22 and **npm** 11
-- **Docker** with the Compose v2 plugin (`docker compose`)
-- **golangci-lint** (optional; `make verify` falls back to `go vet` when absent)
-
-## Clean start
-
-```bash
-make up
-```
-
-`make up` first writes a gitignored `.env` with freshly generated local
-credentials (via `scripts/genenv.sh`), then builds and starts PostgreSQL, MinIO,
-the API, the worker placeholder, and the web dashboard, and waits for the
-dependency services to become healthy. Once up:
-
-- Dashboard: <http://localhost:5173>
-- API: <http://localhost:8080> (see `/healthz` and `/readyz`)
-- MinIO console: <http://localhost:9001>
-
-No credentials are committed to the repository: the local PostgreSQL and MinIO
-secrets are generated on first boot into a gitignored `.env`. All published
-ports are bound to `127.0.0.1` only. Do not expose these ports or reuse local
-credentials in a shared deployment.
-
-Stop the stack with `make down`. Named volumes (`pgdata`, `miniodata`) persist
-data across restarts.
-
-## Configuration
-
-The API and worker read configuration from environment variables. Secrets are
-never committed: `make up` generates a gitignored `.env` with random local
-credentials via `scripts/genenv.sh`. [`.env.example`](.env.example) is a
-reference that lists the variables; its secret fields are intentionally blank,
-and the generator fills any blank secret it finds. To pin your own values, copy
-`.env.example` to `.env` and fill the blank fields before running `make up`.
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `HTTP_ADDR` | `:8080` | API listen address |
-| `SHUTDOWN_TIMEOUT` | `10s` | Graceful-shutdown budget |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
-| `LOG_FORMAT` | `json` | `json` or `text` |
-| `POSTGRES_URL` | _(empty)_ | PostgreSQL URL (`postgres://…`). Empty disables the check |
-| `MINIO_ENDPOINT` | `localhost:9000` | Object-store endpoint (`host:port`) |
-| `MINIO_ACCESS_KEY` | _(empty)_ | Object-store access key (server-side only) |
-| `MINIO_SECRET_KEY` | _(empty)_ | Object-store secret key (server-side only) |
-| `MINIO_BUCKET` | `lakehouse` | Object-store bucket |
-| `MINIO_USE_SSL` | `false` | Use HTTPS for the object store |
-| `API_TOKEN` | _(empty)_ | Optional single deployment token |
-| `QUERY_WORKERS` | `2` | Concurrent running queries (1–16) |
-| `QUERY_TIMEOUT` | `60s` | Query execution budget (max 300s) |
-| `QUERY_LEASE_DURATION` | `120s` | Query lease (max 600s); heartbeat is a third of it |
-| `MAX_RESULT_ROWS` / `MAX_RESULT_BYTES` / `MAX_ROW_BYTES` | `10000` / `268435456` / `1048576` | Result bounds; byte values are integer bytes (hard max 100000 / 1 GiB / 16 MiB) |
-| `MAX_PAGE_BYTES` / `MAX_EXPORT_BYTES` / `MAX_EXPORT_ROWS` | `4194304` / `67108864` / `50000` | Paging and CSV export bounds (integer bytes) |
-| `MAX_SCAN_BYTES` | `1073741824` | Dataset bytes a single query may stage (integer bytes) |
-| `QUEUE_DEPTH` | `100` | Combined queued query + ingestion jobs |
-| `DUCKDB_THREADS` / `DUCKDB_MEMORY` | `min(4, cpus)` / `2GiB` | Per-query DuckDB budgets |
-| `QUERY_TMP_DIR` | OS temp dir | Parent of per-query scratch directories |
-| `ALLOWED_HOSTS` / `ALLOWED_ORIGINS` | loopback + dashboard | Closed lists of accepted `Host` and `Origin` values |
-| `QUERY_MINIO_ACCESS_KEY` / `QUERY_MINIO_SECRET_KEY` | _(empty)_ | Optional separate object-store credential for query reads and result spools |
-| `EXPORT_TTL` / `HISTORY_RETENTION` / `STAGING_TTL` / `SWEEP_INTERVAL` | `24h` / `720h` / `24h` / `10m` | Retention and cleanup |
-| `METRICS_ADDR` | `127.0.0.1:9100` | Worker `/metrics` listen address |
-
-Secrets are never committed, logged, or shipped to the browser bundle. Logging
-is structured (`log/slog`) and redacts sensitive fields.
-
-## Verification
-
-```bash
-make verify
-```
-
-`make verify` runs, in order: Go formatting (`gofmt`) and web formatting
-(Prettier), `go vet`, the Go linter (golangci-lint when available, else `go vet`)
-plus web ESLint, Go unit/race tests (`go test -race ./...`) and web tests
-(Vitest), web typechecking (`tsc`), and Go build (`go build ./...`) plus the web
-production build. **It does not require a running MinIO or PostgreSQL instance.**
-
-`make web-build` also runs `scripts/check-bundle.sh`, which fails if the bundle
-or web source could expose credentials or use browser storage. See
-`docs/dashboard.md`.
-
-Individual targets: `make test` (Go + web tests), `make run` (API on the host),
-and `make web` (Vite dev server with hot reload).
-
-## API
-
-- `GET /` — service metadata (`{ "service": "lakehouse-api", "version": … }`)
-- `GET /api/v1/info` — service metadata for the web app (same payload as `/`);
-  the dashboard calls this route because `/` is served as the frontend entry
-  point by both the Vite dev server and the nginx SPA fallback
-- `GET /healthz` — liveness (`{ "status": "ok" }`)
-- `GET /metrics` — Prometheus metrics (bounded label sets; see `docs/security.md`)
-- `GET /readyz` — readiness; reports each dependency (`postgres`, `minio`) and
-  returns `200` only when all are healthy, otherwise `503`
-- `POST /api/v1/datasets` — register an existing Parquet prefix
-  (`{ "name": "sales", "prefix": "data/sales" }`)
-- `GET /api/v1/datasets` — paged, searchable dataset list (`offset`, `limit`,
-  `q`)
-- `GET /api/v1/datasets/{id}` — dataset detail with latest version and schema
-- `GET /api/v1/datasets/{id}/schema` — schema columns
-- `GET /api/v1/datasets/{id}/preview` — bounded sample rows
-- `POST /api/v1/ingestions/inspect` — infer the schema of a CSV/JSON/JSONL body
-  without storing it
-- `POST /api/v1/ingestions?name=&filename=&partitionColumns=` — upload a file
-  (raw body, up to 64 MiB) and queue a conversion job (`202`)
-- `GET /api/v1/ingestions`, `GET /api/v1/ingestions/{id}` — list/poll jobs
-- `POST /api/v1/ingestions/{id}/retry` — retry a failed, retryable job
-
-- `POST /api/v1/queries` — queue one read-only SQL statement (`202`)
-- `GET /api/v1/queries`, `GET /api/v1/queries/{id}` — history and status
-- `POST /api/v1/queries/{id}/cancel` — cancel a queued or running query
-- `GET /api/v1/queries/{id}/results?offset=&limit=` — paged, byte-bounded rows
-- `GET /api/v1/queries/{id}/export` — bounded CSV download
-
-Every request passes the browser-request guard: a `Host` allowlist, `Origin` and
-`Sec-Fetch-Site` checks, and an `X-Lakehouse-CSRF: 1` header on every mutation.
-See `docs/security.md` for the guard, least-privilege object-store policies,
-metrics, retention, and the opt-in operations dashboard
-(`docker compose --profile ops up -d`).
-
-See `docs/queries.md` for the SQL boundary, limits, job lifecycle, and
-deviations from the phase-0 contract.
-
-See `docs/ingestion.md` for limits, partitioning, recovery, and known
-deviations from the phase-0 contract.
-
-The dataset endpoints return `503 unavailable` when PostgreSQL or MinIO is not
-configured. All non-2xx responses use a single error envelope
-(`{ "error": { "code", "message", "details" } }`); see `docs/design.md` §11 and
-`docs/catalog.md`.
+| Register an existing Parquet prefix; browse schema and preview rows | `go test ./internal/catalog ./internal/api` |
+| Upload CSV/JSON/JSONL: type inference, optional hive partitioning, versioned Parquet, leased/fenced ingestion jobs with retry | `go test ./internal/ingest` · [`docs/ingestion.md`](docs/ingestion.md) |
+| One read-only SQL statement over registered datasets, parsed by DuckDB's own parser against closed allowlists, run on a sealed read-only engine; escapes, local files, extensions and arbitrary paths denied | `go test ./internal/query` · [`docs/queries.md`](docs/queries.md) |
+| Durable async query jobs: submit, poll, cancel, timeout, crash recovery, no false terminal states | `go test ./test/faults` |
+| Paged results, bounded CSV export, expiring result spools | `go test ./internal/api ./internal/sweeper` |
+| Browser protection: Host allowlist, Origin/`Sec-Fetch-Site`, CSRF header, exact-origin CORS, optional bearer token | `go test ./internal/guard ./internal/server` · [`docs/security.md`](docs/security.md) |
+| Bounded-cardinality metrics, structured logs, opt-in Prometheus + Grafana | `go test ./internal/telemetry` · `docker compose --profile ops up -d` |
+| Dashboard: overview (KPIs, activity, latency, outcomes, failures, health), datasets, upload, SQL workbench with charts, history | `make web-test` · [`docs/dashboard.md`](docs/dashboard.md) |
+| Reproducible benchmarks and failure-recovery tests | `make bench` · [`docs/evaluation.md`](docs/evaluation.md) |
+| Real S3 client (SigV4) against a real S3-compatible server | see "Verification" below |
 
 ## Measured performance
 
-Measured on one machine (Apple M4, 16 GiB, DuckDB v1.4.1, in-memory object store, not
-isolated) with a seeded TPC-H-*like* workload (not TPC-H). Full method, raw results and
-limitations: [`docs/evaluation.md`](docs/evaluation.md). Reproduce with `make bench`
-(`make bench-sf1` for the larger run).
+Measured on one machine (Apple M4, 16 GiB, DuckDB v1.4.1, in-memory object
+store, not isolated) with a seeded TPC-H-*like* workload (not TPC-H). Full
+method, raw results and limitations: [`docs/evaluation.md`](docs/evaluation.md).
+Reproduce with `make bench` (`make bench-sf1` for the larger run).
 
 | Workload | Query p50 (single client, end to end) | Notes |
 |---|---|---|
 | ~600k lineitem rows (50 MiB) | 12-32 ms across the query set | Concurrency 1 to 2 workers: ~39 to ~70 queries/s |
 | ~6M lineitem rows (504 MiB) | 28-1000 ms; selective scans ~700 ms | Staging is most of the time; ~1.2 queries/s at every concurrency level |
 
-* Every query downloads (stages) all files of the datasets it names before DuckDB runs, and that
-  copy dominates latency at the larger scale. There is no cache.
-* **No benefit from partitioning was measured**: the same bytes are staged and DuckDB execute time
-  was equal or worse with the hive-partitioned layout.
+* Every query downloads (stages) all files of the datasets it names before
+  DuckDB runs, and that copy dominates latency at the larger scale. There is no cache.
+* **No benefit from partitioning was measured**: the same bytes are staged and
+  DuckDB execute time was equal or worse with the hive-partitioned layout.
 * CSV to Parquet ingestion ran at roughly 40-50 MiB/s (about 760k-875k rows/s) in this setup.
 
-Failure recovery (object store down, corrupt input, worker restarts, API restart, timeout,
-cancel, oversized results, export expiry) is covered by `test/faults`, which asserts persisted
-job and catalog state and object-store contents; it runs in `make verify`.
+## What this is not
 
-## CI
+* Not distributed, not multi-tenant, not a hosted service. There is no per-user
+  authorization: the caller is a trusted operator behind a loopback-bound stack.
+* Not a general SQL engine: a single `SELECT` only; no writes, DDL, `COPY`,
+  `ATTACH`, extension loading or table functions other than `unnest`.
+* No per-query scoped object-store credentials, no OpenTelemetry tracing, and the
+  least-privilege object-store policies in `ops/minio-policies/` are not
+  enforced by default (see [`docs/security.md`](docs/security.md)).
+* No partition pruning at the storage layer; no result or data cache.
+* The Parquet writer supports boolean, int64, double and string, uncompressed.
+* No performance claim here goes beyond the measured table above.
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the same `make
-verify` verification on Go and web code on every push to `main` and every pull
-request, plus golangci-lint for Go.
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `cmd/api` | HTTP API: datasets, ingestions, queries, stats, health, metrics |
+| `cmd/worker` | Ingestion pool and query pool (DuckDB), retention sweeper, `/metrics` |
+| `cmd/demo` | The demo driver behind `make demo` |
+| `cmd/bench` | Benchmark runner (writes JSON and Markdown) |
+| `internal/` | `catalog`, `ingest`, `query`, `parquet`, `objectstore`, `guard`, `telemetry`, `sweeper`, `server`, `api`, `config`, `bench`, `demo` |
+| `web/` | React + TypeScript dashboard (Vite) with a typed API client |
+| `test/faults/` | End-to-end failure-recovery tests |
+| `migrations/` | PostgreSQL schema migrations |
+| `ops/` | Prometheus and Grafana configuration, object-store policy examples |
+| `docs/` | Architecture, queries, ingestion, security, dashboard, evaluation, runbook, design contract |
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `make demo` | Start the stack, load sample data, run and verify a query |
+| `make up` / `make down` | Start / stop the stack (data is kept) |
+| `make verify` | Format, vet, lint, Go and web tests, typecheck, builds, bundle-secret check |
+| `make test-integration` | Adds PostgreSQL-backed tests (needs `TEST_POSTGRES_URL`) |
+| `make bench` / `make bench-sf1` | Benchmarks at ~600k / ~6M lineitem rows |
+| `make run` / `make web` | API / Vite dev server on the host |
+
+## Configuration
+
+Set in the environment (Compose reads a gitignored `.env`; `make up` generates
+local credentials into it and preserves any other keys you add). Secrets are
+never committed, logged, or shipped to the browser. The `MINIO_*` names are
+historical: they configure **any S3-compatible store**.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HTTP_ADDR` | `:8080` | API listen address |
+| `POSTGRES_URL` | _(empty)_ | PostgreSQL URL (`postgres://…`) |
+| `MINIO_ENDPOINT` | `localhost:9000` | S3 endpoint (`host:port`, path-style) |
+| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | _(empty)_ | S3 credentials (server-side only) |
+| `MINIO_BUCKET` / `MINIO_USE_SSL` | `lakehouse` / `false` | Bucket; use HTTPS |
+| `API_TOKEN` | _(empty)_ | Optional bearer token for non-browser clients (>= 16 chars) |
+| `ALLOWED_HOSTS` / `ALLOWED_ORIGINS` | loopback + dashboard | Closed `Host` / `Origin` allowlists |
+| `LOG_LEVEL` / `LOG_FORMAT` | `info` / `json` | Logging |
+| `QUERY_WORKERS` | `2` | Concurrent running queries (1-16) |
+| `QUERY_TIMEOUT` | `60s` | Execution budget (max 300s) |
+| `QUERY_LEASE_DURATION` | `120s` | Query lease (max 600s) |
+| `MAX_RESULT_ROWS` / `MAX_RESULT_BYTES` / `MAX_ROW_BYTES` | `10000` / `268435456` / `1048576` | Result bounds (byte values are integers; hard max 100000 / 1 GiB / 16 MiB) |
+| `MAX_PAGE_BYTES` / `MAX_EXPORT_BYTES` / `MAX_EXPORT_ROWS` | `4194304` / `67108864` / `50000` | Paging and CSV export bounds |
+| `MAX_SCAN_BYTES` | `1073741824` | Dataset bytes one query may stage |
+| `QUEUE_DEPTH` | `100` | Combined queued query + ingestion jobs |
+| `DUCKDB_THREADS` / `DUCKDB_MEMORY` | `min(4, cpus)` / `2GiB` | Per-query DuckDB budgets |
+| `QUERY_TMP_DIR` | OS temp dir | Per-query scratch parent |
+| `QUERY_MINIO_ACCESS_KEY` / `QUERY_MINIO_SECRET_KEY` | _(empty)_ | Optional separate credential for query reads and result spools |
+| `EXPORT_TTL` / `HISTORY_RETENTION` / `STAGING_TTL` / `SWEEP_INTERVAL` | `24h` / `720h` / `24h` / `10m` | Retention and cleanup |
+| `METRICS_ADDR` | `127.0.0.1:9100` | Worker `/metrics` |
+| `API_HOST_PORT` / `WEB_HOST_PORT` / `S3_HOST_PORT` / `POSTGRES_HOST_PORT` | `8080` / `5173` / `8333` / `55432` | Compose host ports (all bound to `127.0.0.1`) |
+
+## API
+
+All routes are under the browser-request guard (mutations need
+`X-Lakehouse-CSRF: 1`). Errors use one envelope
+(`{ "error": { "code", "message", "details" } }`).
+
+- `GET /healthz`, `GET /readyz` (per-dependency: `postgres`, `objectstore`), `GET /metrics`, `GET /api/v1/info`
+- `POST|GET /api/v1/datasets`, `GET /api/v1/datasets/{id}[/schema|/preview]`
+- `POST /api/v1/ingestions/inspect`, `POST|GET /api/v1/ingestions`, `GET /api/v1/ingestions/{id}`, `POST /api/v1/ingestions/{id}/retry`
+- `POST|GET /api/v1/queries`, `GET /api/v1/queries/{id}`, `POST /api/v1/queries/{id}/cancel`, `GET /api/v1/queries/{id}/results`, `GET /api/v1/queries/{id}/export`
+- `GET /api/v1/stats?window=1h|6h|24h|7d` — aggregates for the Overview, from the durable job records
+
+## Verification
+
+```bash
+make verify            # no database or object store needed
+make test-integration  # needs TEST_POSTGRES_URL (a throwaway PostgreSQL)
+
+# Real S3-compatible server (opt-in): any store works; SeaweedFS shown.
+TEST_S3_ENDPOINT=127.0.0.1:18333 TEST_S3_ACCESS_KEY=<key> TEST_S3_SECRET_KEY=<secret> \
+  go test -tags integration -run S3Real ./internal/objectstore
+```
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `make verify` and
+golangci-lint on every push to `main` and every pull request.
+
+## Documentation
+
+[`docs/runbook.md`](docs/runbook.md) · [`docs/architecture.md`](docs/architecture.md) ·
+[`docs/queries.md`](docs/queries.md) · [`docs/ingestion.md`](docs/ingestion.md) ·
+[`docs/security.md`](docs/security.md) · [`docs/dashboard.md`](docs/dashboard.md) ·
+[`docs/evaluation.md`](docs/evaluation.md) · [`docs/catalog.md`](docs/catalog.md) ·
+[`docs/design.md`](docs/design.md) (Phase 0 contract)

@@ -10,7 +10,7 @@ GO_SOURCES := $(shell find cmd internal test -type f -name '*.go')
 
 .DEFAULT_GOAL := verify
 
-.PHONY: up down run web genenv test test-integration verify bench bench-sf1 \
+.PHONY: up down run web genenv test test-integration verify bench bench-sf1 demo \
         fmt vet lint go-test web-test go-build web-build typecheck build
 
 # --- Local stack -----------------------------------------------------------
@@ -20,6 +20,10 @@ genenv: # Generate a gitignored .env with random local-only credentials
 
 up: genenv # Start the full local stack (Postgres, MinIO, API, worker, web)
 	docker compose up -d --build
+
+demo: genenv # Start the stack, load a sample dataset, run a query, print the dashboard URL
+	docker compose up -d --build --wait --wait-timeout 300
+	@set -a; [ -f .env ] && . ./.env; set +a; $(GO) run ./cmd/demo
 
 down: # Stop and remove the local stack
 	docker compose down

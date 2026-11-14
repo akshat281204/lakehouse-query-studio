@@ -106,9 +106,12 @@ describe('UploadPage', () => {
   it('uploads with partitions and follows the job to success', async () => {
     mockedApi.inspectUpload.mockResolvedValue(inspected)
     mockedApi.uploadDataset.mockResolvedValue(job({ status: 'QUEUED' }))
-    mockedApi.getIngestion
-      .mockResolvedValueOnce(job({ status: 'RUNNING', attempt: 1 }))
-      .mockResolvedValue(job({ status: 'SUCCEEDED', attempt: 1 }))
+    // The job stays RUNNING until the test has observed that state; a fixed
+    // RUNNING-then-SUCCEEDED sequence races the observer on a loaded machine.
+    let finished = false
+    mockedApi.getIngestion.mockImplementation(async () =>
+      job({ status: finished ? 'SUCCEEDED' : 'RUNNING', attempt: 1 }),
+    )
     const onOpen = vi.fn()
     render(<UploadPage onOpenDataset={onOpen} pollMs={5} />)
     const file = await pickFile()
@@ -124,6 +127,7 @@ describe('UploadPage', () => {
       }),
     )
     expect(await screen.findByText('Converting to Parquet…')).toBeVisible()
+    finished = true
     const open = await screen.findByText('Open dataset')
     fireEvent.click(open)
     expect(onOpen).toHaveBeenCalledWith('d1')

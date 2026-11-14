@@ -43,6 +43,8 @@ browser insertion, and the highlighter (round-trips any input).
 the `fetch` boundary through: pick a dataset → run SQL → results → chart →
 export link → history → rerun, plus denial and overview.
 
-**Not covered:** a real-browser end-to-end run against the full stack. It needs
-the compose stack including MinIO, whose image could not be pulled in the build
-environment, so the flow test above runs in jsdom with a fake API instead.
+**Real-browser coverage:** the automated flow test runs in jsdom against a fake
+API. The dashboard has additionally been loaded in headless Chrome against a
+live API, worker, PostgreSQL and S3-compatible store to produce the screenshots
+in `docs/images/` and to check layout in light and dark themes; there is no
+automated browser test suite.

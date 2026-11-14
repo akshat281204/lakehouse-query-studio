@@ -170,7 +170,9 @@ and `autocomplete`; no extension is loaded or installable at query time.
   stale worker, repeated-death failure, cancel, combined queue depth under
   racing submits, relation resolution, and a real DuckDB query joining a
   hive-partitioned registered dataset with a flat one.
-* **Not covered here:** a MinIO-backed run (the MinIO image could not be pulled
-  in the build environment), so object storage is the in-memory store in these
-  tests and the S3 client keeps its own HTTP-level tests; a full
-  `docker compose up` run; the dashboard (phase 5).
+* **Object storage in these tests** is the in-memory store. The real S3 client
+  is covered separately by HTTP-level tests and, since phase 8, an opt-in
+  integration test against a real S3-compatible server (SeaweedFS); the
+  end-to-end demo (`make demo`) was run against real PostgreSQL, a real
+  S3-compatible store and real DuckDB (see `docs/runbook.md` for exactly what
+  was and was not exercised).

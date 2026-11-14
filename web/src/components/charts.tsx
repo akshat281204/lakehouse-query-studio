@@ -1,5 +1,5 @@
 import type { HistogramBucket, TimelineBucket } from '../api/types'
-import { compact, ms } from '../lib/format'
+import { compact } from '../lib/format'
 
 /** Stacked bars of query activity over time (succeeded / failed / cancelled). */
 export function ActivityChart({
@@ -168,8 +168,9 @@ export function LatencyHistogram({ buckets }: { buckets: HistogramBucket[] }) {
   const max = Math.max(1, ...buckets.map((b) => b.count))
   const bw = (W - pad.l - pad.r) / buckets.length
   const total = buckets.reduce((a, b) => a + b.count, 0)
+  const bound = (v: number) => (v >= 1000 ? `${v / 1000}s` : `${v}ms`)
   const label = (b: HistogramBucket, i: number) =>
-    b.leMs === 0 ? `>${ms(buckets[i - 1]?.leMs ?? 0)}` : `≤${ms(b.leMs)}`
+    b.leMs === 0 ? `>${bound(buckets[i - 1]?.leMs ?? 0)}` : `≤${bound(b.leMs)}`
   return (
     <svg
       viewBox={`0 0 ${W} ${H}`}
