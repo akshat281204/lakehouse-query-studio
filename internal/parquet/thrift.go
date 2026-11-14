@@ -235,7 +235,9 @@ func (r *compactReader) skipMap() error {
 }
 
 func (r *compactReader) skipStruct() error {
+	savedID := r.lastID
 	r.lastID = 0
+	defer func() { r.lastID = savedID }()
 	for {
 		_, typ, err := r.readFieldHeader()
 		if err != nil {

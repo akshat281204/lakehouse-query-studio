@@ -211,7 +211,9 @@ type dictionaryPageHeader struct {
 
 func parsePageHeader(b []byte) (pageHeader, int, error) {
 	r := newCompactReader(b)
+	savedID := r.lastID
 	r.lastID = 0
+	defer func() { r.lastID = savedID }()
 	hdr := pageHeader{}
 	for {
 		id, typ, err := r.readFieldHeader()
@@ -274,7 +276,9 @@ func (r *compactReader) readDataPageHeader(typ byte) (dataPageHeader, error) {
 	if typ != tStruct {
 		return dataPageHeader{}, unexpectedType("data_page_header", typ)
 	}
+	savedID := r.lastID
 	r.lastID = 0
+	defer func() { r.lastID = savedID }()
 	dp := dataPageHeader{}
 	for {
 		id, typ, err := r.readFieldHeader()
@@ -303,7 +307,9 @@ func (r *compactReader) readDataPageHeaderV2(typ byte) (dataPageHeaderV2, error)
 	if typ != tStruct {
 		return dataPageHeaderV2{}, unexpectedType("data_page_header_v2", typ)
 	}
+	savedID := r.lastID
 	r.lastID = 0
+	defer func() { r.lastID = savedID }()
 	dp := dataPageHeaderV2{}
 	for {
 		id, typ, err := r.readFieldHeader()
@@ -342,7 +348,9 @@ func (r *compactReader) readDictionaryPageHeader(typ byte) (dictionaryPageHeader
 	if typ != tStruct {
 		return dictionaryPageHeader{}, unexpectedType("dictionary_page_header", typ)
 	}
+	savedID := r.lastID
 	r.lastID = 0
+	defer func() { r.lastID = savedID }()
 	dp := dictionaryPageHeader{}
 	for {
 		id, typ, err := r.readFieldHeader()
@@ -627,7 +635,7 @@ func decodeRLELevels(data []byte, bitWidth, total, keep int) ([]uint32, int, err
 		if err != nil {
 			return nil, 0, err
 		}
-		isRLE := header&1 == 1
+		isRLE := header&1 == 0
 		runLen := int(header >> 1)
 		if isRLE {
 			val, err := d.readRLEValue(bitWidth)

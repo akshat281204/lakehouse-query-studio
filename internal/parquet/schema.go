@@ -190,7 +190,9 @@ func readRange(ctx context.Context, r ObjectReader, key string, offset, length i
 
 func parseFileMetaData(b []byte) (*fileMetaData, error) {
 	r := newCompactReader(b)
+	savedID := r.lastID
 	r.lastID = 0
+	defer func() { r.lastID = savedID }()
 	meta := &fileMetaData{}
 	for {
 		id, typ, err := r.readFieldHeader()
@@ -259,7 +261,9 @@ func (r *compactReader) readSchemaElements(typ byte) ([]schemaElement, error) {
 }
 
 func (r *compactReader) readSchemaElement() (schemaElement, error) {
+	savedID := r.lastID
 	r.lastID = 0
+	defer func() { r.lastID = savedID }()
 	e := schemaElement{repetitionType: 1}
 	for {
 		id, typ, err := r.readFieldHeader()
@@ -334,7 +338,9 @@ func (r *compactReader) readRowGroups(typ byte) ([]rowGroup, error) {
 }
 
 func (r *compactReader) readRowGroup() (rowGroup, error) {
+	savedID := r.lastID
 	r.lastID = 0
+	defer func() { r.lastID = savedID }()
 	g := rowGroup{}
 	for {
 		id, typ, err := r.readFieldHeader()
@@ -390,7 +396,9 @@ func (r *compactReader) readColumnChunks(typ byte) ([]columnChunk, error) {
 }
 
 func (r *compactReader) readColumnChunk() (columnChunk, error) {
+	savedID := r.lastID
 	r.lastID = 0
+	defer func() { r.lastID = savedID }()
 	c := columnChunk{}
 	for {
 		id, typ, err := r.readFieldHeader()
@@ -420,7 +428,9 @@ func (r *compactReader) readColumnMetaData(typ byte) (columnMetaData, error) {
 	if typ != tStruct {
 		return columnMetaData{}, unexpectedType("column meta_data", typ)
 	}
+	savedID := r.lastID
 	r.lastID = 0
+	defer func() { r.lastID = savedID }()
 	m := columnMetaData{}
 	for {
 		id, typ, err := r.readFieldHeader()
