@@ -159,3 +159,78 @@ func TestClientRangeNotFound(t *testing.T) {
 		t.Fatalf("Range() error = %v, want ErrNotFound", err)
 	}
 }
+
+func TestPutGetDelete(t *testing.T) {
+	store := map[string][]byte{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			b, _ := io.ReadAll(r.Body)
+			if r.Header.Get("X-Amz-Content-Sha256") != sha256Hex(b) {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			store[r.URL.Path] = b
+		case http.MethodGet:
+			b, ok := store[r.URL.Path]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write(b)
+		case http.MethodDelete:
+			delete(store, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(Config{Endpoint: strings.TrimPrefix(srv.URL, "http://"), AccessKey: "a", SecretKey: "s", Bucket: "b"})
+	ctx := context.Background()
+	if err := c.Put(ctx, "dir/x y.txt", []byte("hello")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	got, err := c.Get(ctx, "dir/x y.txt", 100)
+	if err != nil || string(got) != "hello" {
+		t.Fatalf("Get = %q, %v", got, err)
+	}
+	if _, err := c.Get(ctx, "dir/x y.txt", 2); err != ErrTooLarge {
+		t.Errorf("Get bound err = %v, want ErrTooLarge", err)
+	}
+	if err := c.Delete(ctx, "dir/x y.txt"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := c.Delete(ctx, "dir/x y.txt"); err != nil {
+		t.Fatalf("Delete missing: %v", err)
+	}
+	if _, err := c.Get(ctx, "dir/x y.txt", 100); err != ErrNotFound {
+		t.Errorf("Get missing err = %v", err)
+	}
+}
+
+func TestEnsureBucket(t *testing.T) {
+	status := http.StatusOK
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/b" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(status)
+	}))
+	defer srv.Close()
+	c := New(Config{Endpoint: strings.TrimPrefix(srv.URL, "http://"), AccessKey: "a", SecretKey: "s", Bucket: "b"})
+	for _, s := range []int{http.StatusOK, http.StatusConflict} {
+		status = s
+		if err := c.EnsureBucket(context.Background()); err != nil {
+			t.Errorf("status %d: %v", s, err)
+		}
+	}
+	status = http.StatusForbidden
+	if err := c.EnsureBucket(context.Background()); err != ErrAccessDenied {
+		t.Errorf("forbidden err = %v", err)
+	}
+}

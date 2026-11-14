@@ -31,6 +31,11 @@ type Deps struct {
 	Ready   ReadyFunc
 	Catalog catalog.Store
 	Objects objectstore.Store
+
+	// Ingest and Writer enable the upload/ingestion endpoints. Both are
+	// optional; when either is nil those endpoints report unavailable.
+	Ingest catalog.IngestStore
+	Writer objectstore.ReadWriter
 }
 
 // Server owns the HTTP server and its routes.
@@ -64,9 +69,12 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
-	datasets := api.New(s.deps.Catalog, s.deps.Objects)
+	datasets := api.New(s.deps.Catalog, s.deps.Objects,
+		api.WithIngest(api.IngestDeps{Jobs: s.deps.Ingest, Objects: s.deps.Writer}))
 	mux.Handle("/api/v1/datasets", datasets)
 	mux.Handle("/api/v1/datasets/", datasets)
+	mux.Handle("/api/v1/ingestions", datasets)
+	mux.Handle("/api/v1/ingestions/", datasets)
 	return mux
 }
 

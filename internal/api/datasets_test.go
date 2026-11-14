@@ -49,6 +49,13 @@ func (f *fakeStore) GetLatestVersion(_ context.Context, datasetID string) (catal
 	return catalog.DatasetVersion{}, catalog.ErrNotFound
 }
 
+func (f *fakeStore) GetLatestReadyVersion(_ context.Context, datasetID string) (catalog.DatasetVersion, error) {
+	if v, ok := f.versions[datasetID]; ok && v.Status == catalog.VersionReady {
+		return v, nil
+	}
+	return catalog.DatasetVersion{}, catalog.ErrNotFound
+}
+
 func (f *fakeStore) GetSchema(_ context.Context, versionID string) ([]catalog.SchemaColumn, error) {
 	if cols, ok := f.schema[versionID]; ok {
 		return cols, nil
@@ -189,7 +196,7 @@ func TestGetNotFound(t *testing.T) {
 func TestSchema(t *testing.T) {
 	store := &fakeStore{
 		datasets: []catalog.Dataset{{ID: "d1", Name: "sales"}},
-		versions: map[string]catalog.DatasetVersion{"d1": {ID: "v1", Version: 1}},
+		versions: map[string]catalog.DatasetVersion{"d1": {ID: "v1", Version: 1, Status: "READY"}},
 		schema: map[string][]catalog.SchemaColumn{
 			"v1": {{Position: 0, Name: "id", Type: "int64", Nullable: false}},
 		},
@@ -214,7 +221,7 @@ func TestSchema(t *testing.T) {
 func TestPreviewEmptyPrefix(t *testing.T) {
 	store := &fakeStore{
 		datasets: []catalog.Dataset{{ID: "d1", Name: "sales"}},
-		versions: map[string]catalog.DatasetVersion{"d1": {ID: "v1", Version: 1, ObjectPrefix: "data/sales"}},
+		versions: map[string]catalog.DatasetVersion{"d1": {ID: "v1", Version: 1, Status: "READY", ObjectPrefix: "data/sales"}},
 	}
 	h := New(store, &fakeObjects{}) // no parquet objects
 	rec := httptest.NewRecorder()
