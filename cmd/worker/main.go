@@ -9,7 +9,11 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -20,10 +24,13 @@ import (
 
 	"github.com/akshat281204/lakehouse-query-studio/internal/catalog"
 	"github.com/akshat281204/lakehouse-query-studio/internal/config"
+	"github.com/akshat281204/lakehouse-query-studio/internal/guard"
 	"github.com/akshat281204/lakehouse-query-studio/internal/ingest"
 	"github.com/akshat281204/lakehouse-query-studio/internal/logging"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
 	"github.com/akshat281204/lakehouse-query-studio/internal/query"
+	"github.com/akshat281204/lakehouse-query-studio/internal/sweeper"
+	"github.com/akshat281204/lakehouse-query-studio/internal/telemetry"
 )
 
 func main() {
@@ -87,7 +94,16 @@ func run() error {
 		return fmt.Errorf("sql validator: %w", err)
 	}
 	defer func() { _ = validator.Close() }()
-	queryRunner, err := query.NewRunner(catalog.NewPostgresQueryStore(db), objects, query.NewDuckDB(), validator, owner,
+	// Query reads and result spooling can use a credential that cannot write
+	// lake/ or staging/ (see docs/security.md); ingestion keeps its own.
+	queryObjects := objects
+	if cfg.QueryMinIOAccessKey != "" {
+		queryObjects = objectstore.New(objectstore.Config{
+			Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.QueryMinIOAccessKey, SecretKey: cfg.QueryMinIOSecretKey,
+			Bucket: cfg.MinIOBucket, Region: "us-east-1", UseSSL: cfg.MinIOUseSSL,
+		})
+	}
+	queryRunner, err := query.NewRunner(catalog.NewPostgresQueryStore(db), queryObjects, query.NewDuckDB(), validator, owner,
 		query.RunnerConfig{
 			Workers: q.Workers, Lease: q.Lease, Heartbeat: q.Heartbeat, TmpDir: q.TmpDir,
 			Limits: query.Limits{
@@ -99,14 +115,61 @@ func run() error {
 		return fmt.Errorf("query runner: %w", err)
 	}
 
+	metrics := telemetry.New("worker")
+	metrics.WorkerUp.Set(1)
+	runner.Metrics = metrics
+	queryRunner.Metrics = metrics
+
+	sw := &sweeper.Sweeper{
+		Store: catalog.NewPostgresQueryStore(db), Objects: objects, Log: log, Metrics: metrics,
+		Cfg: sweeper.Config{
+			ExportTTL: cfg.Retention.ExportTTL, HistoryRetention: cfg.Retention.HistoryRetention,
+			StagingTTL: cfg.Retention.StagingTTL, Interval: cfg.Retention.SweepInterval,
+		},
+	}
+
 	log.Info("worker started", "owner", owner, "query_workers", q.Workers)
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() { defer wg.Done(); runner.Run(ctx) }()
 	go func() { defer wg.Done(); queryRunner.Run(ctx) }()
+	go func() { defer wg.Done(); sw.Run(ctx) }()
+	if cfg.MetricsAddr != "" {
+		wg.Add(1)
+		go func() { defer wg.Done(); serveMetrics(ctx, cfg, log, metrics) }()
+	}
 	wg.Wait()
+	metrics.WorkerUp.Set(0)
 	log.Info("worker shutting down")
 	return nil
+}
+
+// serveMetrics exposes /metrics (and nothing else) behind the same Host guard
+// as the API. The port is not published by the Compose file.
+func serveMetrics(ctx context.Context, cfg *config.Config, log *slog.Logger, m *telemetry.Metrics) {
+	_, port, err := net.SplitHostPort(cfg.MetricsAddr)
+	if err != nil {
+		log.Error("invalid METRICS_ADDR; metrics disabled")
+		return
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", m.Handler(nil))
+	hosts := []string{"worker:" + port, "localhost:" + port, "127.0.0.1:" + port}
+	srv := &http.Server{
+		Addr:              cfg.MetricsAddr,
+		Handler:           guard.Middleware(guard.Config{AllowedHosts: hosts, Token: cfg.APIToken}, mux),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	}()
+	log.Info("worker metrics listening", "addr", cfg.MetricsAddr)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Error("metrics server stopped", "error", "listen failed")
+	}
 }
 
 func migrateWithRetry(ctx context.Context, db *sql.DB) error {

@@ -110,6 +110,11 @@ type Relation struct {
 	HivePartitioned bool
 }
 
+// QueueStats counts jobs by kind and state, for queue-depth metrics.
+type QueueStats struct {
+	QueryQueued, QueryRunning, IngestQueued, IngestRunning int
+}
+
 // QueryStore is the durable query-job surface used by the API and worker.
 type QueryStore interface {
 	// ResolveRelation maps `<dataset>` (latest READY version) or
@@ -135,6 +140,15 @@ type QueryStore interface {
 	Succeed(ctx context.Context, id, token string, r QueryResult) error
 	// Finish records FAILED, CANCELLED or TIMED_OUT conditional on the token.
 	Finish(ctx context.Context, id, token, status, reason, summary string, d time.Duration) error
+	// ExpireResults clears the result reference of SUCCEEDED queries finished
+	// before cutoff and returns the spool keys, so the API answers
+	// `result_expired` and the caller can delete the objects.
+	ExpireResults(ctx context.Context, cutoff time.Time) ([]string, error)
+	// PurgeHistory deletes terminal queries finished before cutoff (statement
+	// text included) and returns any spool keys they still referenced.
+	PurgeHistory(ctx context.Context, cutoff time.Time) (deleted int, refs []string, err error)
+	// Stats returns current queue depths (queries and ingestion jobs).
+	Stats(ctx context.Context) (QueueStats, error)
 	// RequestCancel cancels a QUEUED query immediately, or flags a RUNNING one
 	// for its worker to stop. Terminal queries return ErrInvalidState.
 	RequestCancel(ctx context.Context, id string) (QueryJob, error)

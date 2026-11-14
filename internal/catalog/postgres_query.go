@@ -359,3 +359,80 @@ func (s *postgresQueryStore) RequestCancel(ctx context.Context, id string) (Quer
 	}
 	return q, nil
 }
+
+func (s *postgresQueryStore) Stats(ctx context.Context) (QueueStats, error) {
+	var st QueueStats
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+		  (SELECT count(*) FROM query_jobs WHERE status = 'QUEUED'),
+		  (SELECT count(*) FROM query_jobs WHERE status = 'RUNNING'),
+		  (SELECT count(*) FROM ingestion_jobs WHERE status = 'QUEUED'),
+		  (SELECT count(*) FROM ingestion_jobs WHERE status = 'RUNNING')`).
+		Scan(&st.QueryQueued, &st.QueryRunning, &st.IngestQueued, &st.IngestRunning)
+	if err != nil {
+		return QueueStats{}, fmt.Errorf("queue stats: %w", err)
+	}
+	return st, nil
+}
+
+func collectRefs(rows *sql.Rows) ([]string, error) {
+	defer func() { _ = rows.Close() }()
+	var refs []string
+	for rows.Next() {
+		var ref sql.NullString
+		if err := rows.Scan(&ref); err != nil {
+			return nil, err
+		}
+		if ref.Valid && ref.String != "" {
+			refs = append(refs, ref.String)
+		}
+	}
+	return refs, rows.Err()
+}
+
+func (s *postgresQueryStore) ExpireResults(ctx context.Context, cutoff time.Time) ([]string, error) {
+	// RETURNING an UPDATE yields the new (NULL) value, so capture the old refs
+	// in a CTE and join them to the rows actually updated.
+	rows, err := s.db.QueryContext(ctx, `
+		WITH old AS (
+		    SELECT id, result_ref FROM query_jobs
+		    WHERE status = 'SUCCEEDED' AND result_ref IS NOT NULL AND finished_at < $1
+		    FOR UPDATE
+		), upd AS (
+		    UPDATE query_jobs j SET result_ref = NULL, result_bytes = NULL
+		    FROM old WHERE j.id = old.id RETURNING j.id
+		)
+		SELECT old.result_ref FROM old JOIN upd ON upd.id = old.id`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("expire results: %w", err)
+	}
+	refs, err := collectRefs(rows)
+	if err != nil {
+		return nil, fmt.Errorf("expire results: %w", err)
+	}
+	return refs, nil
+}
+
+func (s *postgresQueryStore) PurgeHistory(ctx context.Context, cutoff time.Time) (int, []string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		DELETE FROM query_jobs
+		WHERE status IN ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT') AND finished_at < $1
+		RETURNING result_ref`, cutoff)
+	if err != nil {
+		return 0, nil, fmt.Errorf("purge history: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	n := 0
+	var refs []string
+	for rows.Next() {
+		var ref sql.NullString
+		if err := rows.Scan(&ref); err != nil {
+			return 0, nil, err
+		}
+		n++
+		if ref.Valid && ref.String != "" {
+			refs = append(refs, ref.String)
+		}
+	}
+	return n, refs, rows.Err()
+}
