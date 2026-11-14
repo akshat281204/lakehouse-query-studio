@@ -105,14 +105,9 @@ func (d *rleDecoder) decodeValues(bitWidth int, count int) ([]uint32, error) {
 			}
 			continue
 		}
-		bw64, err := d.readVarint()
-		if err != nil {
-			return nil, err
-		}
-		bw := int(bw64)
 		n := runLen * 8
 		for i := 0; i < n && len(out) < count; i++ {
-			v, err := d.readBits(bw)
+			v, err := d.readBits(bitWidth)
 			if err != nil {
 				return nil, err
 			}

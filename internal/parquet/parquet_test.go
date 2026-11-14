@@ -274,7 +274,10 @@ func buildFile(cols []testColumn, rows [][]any) []byte {
 		}
 		var levelBytes []byte
 		if c.nullable {
-			levelBytes = rleEncodeRuns(1, defLevels)
+			enc := rleEncodeRuns(1, defLevels)
+			var l [4]byte
+			binary.LittleEndian.PutUint32(l[:], uint32(len(enc)))
+			levelBytes = append(l[:], enc...)
 		}
 		valueBytes := plainEncode(c.typ, values)
 		page := buildDataPage(int32(numRows), encodingPlain, levelBytes, valueBytes)
@@ -384,7 +387,7 @@ func TestDecodeRLE(t *testing.T) {
 
 func TestDecodeRLEBitPacked(t *testing.T) {
 	// One bit-packed group of 8 values of bit width 2.
-	got, err := decodeRLE([]byte{0x02, 0x02, 0xE4, 0xE4}, 2, 8)
+	got, err := decodeRLE([]byte{0x02, 0xE4, 0xE4}, 2, 8)
 	if err != nil {
 		t.Fatalf("decodeRLE() error = %v", err)
 	}
