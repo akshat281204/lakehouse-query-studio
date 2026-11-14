@@ -30,10 +30,22 @@ export class ApiError extends Error {
 
 const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? ''
 
+/**
+ * Every state-changing request carries this header. A cross-site page cannot
+ * add it without a CORS preflight, which the API refuses for foreign origins.
+ */
+export const CSRF_HEADER = 'X-Lakehouse-CSRF'
+
+function withCsrf(init?: RequestInit): RequestInit | undefined {
+  const method = (init?.method ?? 'GET').toUpperCase()
+  if (method === 'GET' || method === 'HEAD') return init
+  return { ...init, headers: { ...init?.headers, [CSRF_HEADER]: '1' } }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response
   try {
-    res = await fetch(`${BASE_URL}${path}`, init)
+    res = await fetch(`${BASE_URL}${path}`, withCsrf(init))
   } catch (err) {
     throw new ApiError(0, 'network', `request failed: ${String(err)}`)
   }
