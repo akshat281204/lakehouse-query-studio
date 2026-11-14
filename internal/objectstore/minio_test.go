@@ -138,7 +138,7 @@ func TestClientRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Range() error = %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	got, err := io.ReadAll(rc)
 	if err != nil {
 		t.Fatalf("read range: %v", err)
