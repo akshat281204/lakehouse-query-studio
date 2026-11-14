@@ -130,7 +130,7 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
         </div>
       </header>
 
-      <form className="upload-form" onSubmit={handleSubmit}>
+      <form className="upload-form card" onSubmit={handleSubmit}>
         <label className="field">
           <span>File (.csv, .json, .jsonl)</span>
           <input

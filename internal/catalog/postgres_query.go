@@ -436,3 +436,58 @@ func (s *postgresQueryStore) PurgeHistory(ctx context.Context, cutoff time.Time)
 	}
 	return n, refs, rows.Err()
 }
+
+// summaryRowLimit bounds the rows aggregated for one summary.
+const summaryRowLimit = 50_000
+
+func (s *postgresQueryStore) Summary(ctx context.Context, window time.Duration, buckets int) (Summary, error) {
+	now := time.Now().UTC()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT created_at, status, duration_ms, COALESCE(failure_reason, ''), rows_returned, bytes_staged
+		FROM query_jobs WHERE created_at >= $1 ORDER BY created_at DESC LIMIT $2`, now.Add(-window), summaryRowLimit+1)
+	if err != nil {
+		return Summary{}, fmt.Errorf("summary query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var data []SummaryRow
+	for rows.Next() {
+		var r SummaryRow
+		var d, n, b sql.NullInt64
+		if err := rows.Scan(&r.CreatedAt, &r.Status, &d, &r.FailureReason, &n, &b); err != nil {
+			return Summary{}, fmt.Errorf("scan summary: %w", err)
+		}
+		if d.Valid {
+			r.DurationMs = &d.Int64
+		}
+		if n.Valid {
+			r.RowsReturned = &n.Int64
+		}
+		if b.Valid {
+			r.BytesStaged = &b.Int64
+		}
+		data = append(data, r)
+	}
+	if err := rows.Err(); err != nil {
+		return Summary{}, err
+	}
+	truncated := len(data) > summaryRowLimit
+	if truncated {
+		data = data[:summaryRowLimit]
+	}
+	sum := BuildSummary(data, window, buckets, now)
+	sum.Truncated = truncated
+
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT count(*),
+		       count(*) FILTER (WHERE status = 'SUCCEEDED'),
+		       count(*) FILTER (WHERE status = 'FAILED'),
+		       count(*) FILTER (WHERE status IN ('QUEUED','RUNNING'))
+		FROM ingestion_jobs WHERE created_at >= $1 OR status IN ('QUEUED','RUNNING')`, now.Add(-window)).
+		Scan(&sum.Ingestions.Total, &sum.Ingestions.Succeeded, &sum.Ingestions.Failed, &sum.Ingestions.Active); err != nil {
+		return Summary{}, fmt.Errorf("summary ingestions: %w", err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM datasets WHERE status = 'ACTIVE'`).Scan(&sum.Datasets); err != nil {
+		return Summary{}, fmt.Errorf("summary datasets: %w", err)
+	}
+	return sum, nil
+}

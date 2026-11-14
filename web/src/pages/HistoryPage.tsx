@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, ApiError } from '../api/client'
 import type { QueryJob } from '../api/types'
-import { formatDuration } from '../lib/format'
+import { formatDuration, timeAgo } from '../lib/format'
 
 interface HistoryPageProps {
   onRerun: (statement: string) => void
@@ -10,6 +10,8 @@ interface HistoryPageProps {
 export function HistoryPage({ onRerun }: HistoryPageProps) {
   const [jobs, setJobs] = useState<QueryJob[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [filter, setFilter] = useState<string>('ALL')
+  const [search, setSearch] = useState('')
 
   useEffect(() => {
     api
@@ -19,6 +21,23 @@ export function HistoryPage({ onRerun }: HistoryPageProps) {
         setError(e instanceof ApiError ? e.message : String(e)),
       )
   }, [])
+
+  const FILTERS: { key: string; label: string }[] = [
+    { key: 'ALL', label: 'All' },
+    { key: 'SUCCEEDED', label: 'Succeeded' },
+    { key: 'FAILED', label: 'Failed' },
+    { key: 'CANCELLED', label: 'Cancelled' },
+    { key: 'ACTIVE', label: 'Active' },
+  ]
+  const visible = (jobs ?? []).filter((j) => {
+    if (filter === 'ACTIVE' && !['QUEUED', 'RUNNING'].includes(j.status))
+      return false
+    if (filter === 'FAILED' && !['FAILED', 'TIMED_OUT'].includes(j.status))
+      return false
+    if (!['ALL', 'ACTIVE', 'FAILED'].includes(filter) && j.status !== filter)
+      return false
+    return !search || j.statement.toLowerCase().includes(search.toLowerCase())
+  })
 
   return (
     <main className="page">
@@ -35,9 +54,38 @@ export function HistoryPage({ onRerun }: HistoryPageProps) {
       ) : null}
       {!error && jobs === null ? <p>Loading history…</p> : null}
       {jobs && jobs.length === 0 ? (
-        <p>No queries yet. Run one from the SQL workbench.</p>
+        <p className="empty">No queries yet. Run one from the SQL workbench.</p>
       ) : null}
       {jobs && jobs.length > 0 ? (
+        <div className="filter-bar">
+          <div className="segmented" role="group" aria-label="Status filter">
+            {FILTERS.map((f) => (
+              <button
+                key={f.key}
+                type="button"
+                aria-pressed={filter === f.key}
+                onClick={() => setFilter(f.key)}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+          <input
+            aria-label="Search statements"
+            className="search-input inline"
+            placeholder="Search statements"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <span className="muted">
+            {visible.length} of {jobs.length}
+          </span>
+        </div>
+      ) : null}
+      {jobs && jobs.length > 0 && visible.length === 0 ? (
+        <p className="empty">No queries match this filter.</p>
+      ) : null}
+      {jobs && visible.length > 0 ? (
         <table className="data-table">
           <thead>
             <tr>
@@ -50,7 +98,7 @@ export function HistoryPage({ onRerun }: HistoryPageProps) {
             </tr>
           </thead>
           <tbody>
-            {jobs.map((j) => (
+            {visible.map((j) => (
               <tr key={j.id}>
                 <td>
                   <code className="statement">
@@ -63,15 +111,21 @@ export function HistoryPage({ onRerun }: HistoryPageProps) {
                   <span
                     className={`status status-${j.status.toLowerCase().replace('_', '-')}`}
                   >
-                    {j.status}
+                    {j.status.replace('_', ' ')}
                   </span>
                 </td>
                 <td>{formatDuration(j.durationMs)}</td>
                 <td>{j.rowsReturned ?? '—'}</td>
-                <td>{new Date(j.createdAt).toLocaleString()}</td>
+                <td title={new Date(j.createdAt).toLocaleString()}>
+                  {timeAgo(j.createdAt)}
+                </td>
                 <td>
                   {/* Rerun re-submits through the normal validated path as a new job. */}
-                  <button type="button" onClick={() => onRerun(j.statement)}>
+                  <button
+                    type="button"
+                    className="btn-small"
+                    onClick={() => onRerun(j.statement)}
+                  >
                     Rerun
                   </button>
                 </td>

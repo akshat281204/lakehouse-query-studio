@@ -24,7 +24,7 @@ var (
 		"POST /api/v1/ingestions/inspect", "POST /api/v1/ingestions", "GET /api/v1/ingestions",
 		"GET /api/v1/ingestions/{id}", "POST /api/v1/ingestions/{id}/retry",
 		"POST /api/v1/queries", "GET /api/v1/queries", "GET /api/v1/queries/{id}",
-		"POST /api/v1/queries/{id}/cancel", "GET /api/v1/queries/{id}/results", "GET /api/v1/queries/{id}/export",
+		"POST /api/v1/queries/{id}/cancel", "GET /api/v1/stats", "GET /api/v1/queries/{id}/results", "GET /api/v1/queries/{id}/export",
 	}
 )
 

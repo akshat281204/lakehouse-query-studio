@@ -432,3 +432,38 @@ func TestPGRetentionAndStats(t *testing.T) {
 		}
 	}
 }
+
+func TestPGSummaryAggregatesRealRows(t *testing.T) {
+	db := pg(t)
+	ctx := context.Background()
+	pgRegister(t, db, "sum-ds", "data/sum", nil, []catalog.SchemaColumn{{Name: "id", Type: "int64"}})
+	store := catalog.NewPostgresQueryStore(db)
+	ok := func(dur int64, rows int64) {
+		id := newUUIDT(t)
+		_, _ = store.Submit(ctx, catalog.SubmitQuery{ID: id, Statement: "SELECT 1", StatementHash: "h"})
+		j, _ := store.ClaimQuery(ctx, "w", time.Minute)
+		_ = store.Succeed(ctx, j.ID, j.FencingToken, catalog.QueryResult{ResultRef: "exports/x", RowsReturned: rows, ResultBytes: 1, BytesStaged: 10, Duration: time.Duration(dur) * time.Millisecond})
+	}
+	ok(20, 3)
+	ok(80, 4)
+	id := newUUIDT(t)
+	_, _ = store.Submit(ctx, catalog.SubmitQuery{ID: id, Statement: "SELECT 2", StatementHash: "h"})
+	j, _ := store.ClaimQuery(ctx, "w", time.Minute)
+	_ = store.Finish(ctx, j.ID, j.FencingToken, catalog.QueryFailed, catalog.ReasonEngineError, "boom", time.Millisecond)
+	_, _ = store.Submit(ctx, catalog.SubmitQuery{ID: newUUIDT(t), Statement: "SELECT 3", StatementHash: "h"})
+
+	s, err := store.Summary(ctx, time.Hour, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := s.Queries
+	if q.Total != 4 || q.Succeeded != 2 || q.Failed != 1 || q.Queued != 1 || q.RowsReturned != 7 || q.BytesStaged != 20 {
+		t.Fatalf("%+v", q)
+	}
+	if q.P50Ms != 20 || q.MaxMs != 80 {
+		t.Fatalf("latency %+v", q)
+	}
+	if s.Datasets != 1 || len(s.Timeline) != 12 || len(s.FailureReasons) != 1 {
+		t.Fatalf("datasets=%d timeline=%d reasons=%v", s.Datasets, len(s.Timeline), s.FailureReasons)
+	}
+}

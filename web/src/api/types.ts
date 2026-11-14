@@ -191,3 +191,58 @@ export interface QueryResults {
   totalRows: number
   truncated: boolean
 }
+
+export interface QueryTotals {
+  total: number
+  succeeded: number
+  failed: number
+  cancelled: number
+  timedOut: number
+  queued: number
+  running: number
+  rowsReturned: number
+  bytesStaged: number
+  avgMs: number
+  p50Ms: number
+  p95Ms: number
+  p99Ms: number
+  maxMs: number
+}
+
+export interface TimelineBucket {
+  start: string
+  succeeded: number
+  failed: number
+  cancelled: number
+  p50Ms: number
+}
+
+export interface HistogramBucket {
+  /** Upper bound in ms; 0 means "slower than every bound". */
+  leMs: number
+  count: number
+}
+
+export interface ReasonCount {
+  reason: string
+  count: number
+}
+
+export interface Summary {
+  windowSeconds: number
+  generatedAt: string
+  queries: QueryTotals
+  timeline: TimelineBucket[]
+  latencyHistogram: HistogramBucket[]
+  failureReasons: ReasonCount[]
+  ingestions: {
+    total: number
+    succeeded: number
+    failed: number
+    active: number
+  }
+  datasets: number
+  truncated: boolean
+}
+
+export type StatsWindow = '1h' | '6h' | '24h' | '7d'

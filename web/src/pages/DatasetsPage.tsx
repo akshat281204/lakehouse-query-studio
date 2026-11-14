@@ -113,7 +113,14 @@ export function DatasetsPage({ onOpen }: DatasetsPageProps) {
                 className="dataset-item"
                 onClick={() => onOpen(d.id)}
               >
-                <span className="dataset-name">{d.name}</span>
+                <span className="dataset-top">
+                  <span className="dataset-name">{d.name}</span>
+                  <span
+                    className={`status status-${(d.versionStatus ?? 'ready').toLowerCase()}`}
+                  >
+                    {d.versionStatus ?? 'READY'}
+                  </span>
+                </span>
                 <span className="dataset-meta">
                   {d.sourcePrefix} · {d.format}
                   {d.version !== undefined ? ` · v${d.version}` : ''}

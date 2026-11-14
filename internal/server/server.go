@@ -106,6 +106,7 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("/api/v1/ingestions/", datasets)
 	mux.Handle("/api/v1/queries", datasets)
 	mux.Handle("/api/v1/queries/", datasets)
+	mux.Handle("/api/v1/stats", datasets)
 	return mux
 }
 

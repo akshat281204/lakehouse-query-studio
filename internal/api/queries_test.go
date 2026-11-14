@@ -437,3 +437,43 @@ func TestQueryEndpointsUnavailableWithoutDependencies(t *testing.T) {
 		}
 	}
 }
+
+func TestStatsEndpointReflectsRealQueryActivity(t *testing.T) {
+	e := newQueryEnv(t, nil, nil)
+	e.submit("SELECT id FROM sales")
+	e.submit("SELECT nope FROM sales")
+	e.runAll()
+	e.submit("SELECT 1") // stays queued
+
+	rec := e.do("GET", "/api/v1/stats?window=1h", "")
+	if rec.Code != 200 || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("%d %v", rec.Code, rec.Header())
+	}
+	var s catalog.Summary
+	if err := json.Unmarshal(rec.Body.Bytes(), &s); err != nil {
+		t.Fatal(err)
+	}
+	if s.WindowSeconds != 3600 || len(s.Timeline) != 30 {
+		t.Fatalf("window/buckets: %d %d", s.WindowSeconds, len(s.Timeline))
+	}
+	q := s.Queries
+	if q.Total != 3 || q.Succeeded != 1 || q.Failed != 1 || q.Queued != 1 || q.RowsReturned != 3 {
+		t.Fatalf("%+v", q)
+	}
+	if len(s.FailureReasons) != 1 || s.FailureReasons[0].Reason != catalog.ReasonEngineError {
+		t.Fatalf("%+v", s.FailureReasons)
+	}
+	if strings.Contains(rec.Body.String(), "SELECT") {
+		t.Fatalf("stats must not carry statement text: %s", rec.Body.String())
+	}
+	for _, w := range []string{"6h", "24h", "7d", ""} {
+		if r := e.do("GET", "/api/v1/stats?window="+w, ""); r.Code != 200 {
+			t.Errorf("window %q: %d", w, r.Code)
+		}
+	}
+	for _, w := range []string{"1y", "0", "-1h", "1h%3Bdrop"} {
+		if r := e.do("GET", "/api/v1/stats?window="+w, ""); r.Code != 400 {
+			t.Errorf("window %q: %d", w, r.Code)
+		}
+	}
+}

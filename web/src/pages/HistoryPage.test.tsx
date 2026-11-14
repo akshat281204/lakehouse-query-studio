@@ -61,4 +61,52 @@ describe('HistoryPage', () => {
     fireEvent.click(screen.getAllByRole('button', { name: 'Rerun' })[0])
     expect(onRerun).toHaveBeenCalledWith('SELECT count(*) FROM sales')
   })
+
+  it('filters by status and searches statement text', async () => {
+    m.listQueries.mockResolvedValue({
+      queries: [
+        job({
+          id: 'a',
+          statement: 'SELECT count(*) FROM sales',
+          status: 'SUCCEEDED',
+        }),
+        job({ id: 'b', statement: 'SELECT nope FROM sales', status: 'FAILED' }),
+        job({
+          id: 'c',
+          statement: 'SELECT slow FROM events',
+          status: 'TIMED_OUT',
+        }),
+        job({
+          id: 'd',
+          statement: 'SELECT live FROM events',
+          status: 'RUNNING',
+        }),
+      ],
+      offset: 0,
+      limit: 50,
+    })
+    render(<HistoryPage onRerun={() => {}} />)
+    expect(await screen.findByText('4 of 4')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Failed' }))
+    expect(screen.getByText('2 of 4')).toBeInTheDocument() // FAILED + TIMED_OUT
+    expect(screen.queryByText('SELECT count(*) FROM sales')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Active' }))
+    expect(screen.getByText('SELECT live FROM events')).toBeInTheDocument()
+    expect(screen.getByText('1 of 4')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'All' }))
+    fireEvent.change(screen.getByLabelText('Search statements'), {
+      target: { value: 'EVENTS' },
+    })
+    expect(screen.getByText('2 of 4')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('Search statements'), {
+      target: { value: 'zzz' },
+    })
+    expect(
+      screen.getByText(/no queries match this filter/i),
+    ).toBeInTheDocument()
+  })
 })

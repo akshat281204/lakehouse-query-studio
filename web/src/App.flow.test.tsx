@@ -80,6 +80,42 @@ function fakeApi(
       ],
     })
   }
+  if (path === '/api/v1/stats') {
+    return json({
+      windowSeconds: 86400,
+      generatedAt: '2025-01-01T00:00:00Z',
+      queries: {
+        total: 3,
+        succeeded: 3,
+        failed: 0,
+        cancelled: 0,
+        timedOut: 0,
+        queued: 0,
+        running: 0,
+        rowsReturned: 9,
+        bytesStaged: 1024,
+        avgMs: 10,
+        p50Ms: 10,
+        p95Ms: 12,
+        p99Ms: 12,
+        maxMs: 12,
+      },
+      timeline: [
+        {
+          start: '2025-01-01T00:00:00Z',
+          succeeded: 3,
+          failed: 0,
+          cancelled: 0,
+          p50Ms: 10,
+        },
+      ],
+      latencyHistogram: [{ leMs: 25, count: 3 }],
+      failureReasons: [],
+      ingestions: { total: 0, succeeded: 0, failed: 0, active: 0 },
+      datasets: 1,
+      truncated: false,
+    })
+  }
   if (path === '/api/v1/ingestions') return json({ jobs: [] })
   if (path === '/api/v1/queries' && method === 'POST') {
     const { statement } = JSON.parse(String(init?.body)) as {
@@ -204,6 +240,6 @@ describe('workbench flow', () => {
   it('renders the overview as the landing page', async () => {
     window.location.hash = '#/'
     render(<App />)
-    expect(await screen.findByTestId('stat-datasets')).toHaveTextContent('1')
+    expect(await screen.findByTestId('kpi-datasets')).toHaveTextContent('1')
   })
 })

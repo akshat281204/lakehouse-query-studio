@@ -74,7 +74,7 @@ func TestEveryRegisteredRouteHasADeclaredLabel(t *testing.T) {
 		{"POST", "/api/v1/ingestions/inspect"}, {"POST", "/api/v1/ingestions/abc/retry"},
 		{"GET", "/api/v1/queries"}, {"POST", "/api/v1/queries"}, {"GET", "/api/v1/queries/abc"},
 		{"POST", "/api/v1/queries/abc/cancel"}, {"GET", "/api/v1/queries/abc/results"},
-		{"GET", "/api/v1/queries/abc/export"}, {"GET", "/no/such/path/with-secret-sentinel"},
+		{"GET", "/api/v1/queries/abc/export"}, {"GET", "/api/v1/stats"}, {"GET", "/no/such/path/with-secret-sentinel"},
 	}
 	for _, p := range paths {
 		serve(s, p[0], p[1], "example.com", map[string]string{"X-Lakehouse-CSRF": "1"})

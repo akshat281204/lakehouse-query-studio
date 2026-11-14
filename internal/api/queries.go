@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/akshat281204/lakehouse-query-studio/internal/catalog"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
@@ -70,6 +71,7 @@ func (h *Handler) registerQueries(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/queries/{id}/cancel", h.handleCancelQuery)
 	mux.HandleFunc("GET /api/v1/queries/{id}/results", h.handleQueryResults)
 	mux.HandleFunc("GET /api/v1/queries/{id}/export", h.handleQueryExport)
+	mux.HandleFunc("GET /api/v1/stats", h.handleStats)
 }
 
 func (h *Handler) requireQueries(w http.ResponseWriter) bool {
@@ -430,4 +432,38 @@ func (h *Handler) handleQueryExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Export-Truncated", strconv.FormatBool(truncated))
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, &buf)
+}
+
+// statsWindows maps the accepted window names to a duration and a timeline
+// resolution (bucket count).
+var statsWindows = map[string]struct {
+	d       time.Duration
+	buckets int
+}{
+	"1h":  {time.Hour, 30},
+	"6h":  {6 * time.Hour, 36},
+	"24h": {24 * time.Hour, 24},
+	"7d":  {7 * 24 * time.Hour, 28},
+}
+
+func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
+	if !h.requireQueries(w) {
+		return
+	}
+	name := r.URL.Query().Get("window")
+	if name == "" {
+		name = "24h"
+	}
+	win, ok := statsWindows[name]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_argument", "window must be one of 1h, 6h, 24h, 7d")
+		return
+	}
+	sum, err := h.queries.Store.Summary(r.Context(), win.d, win.buckets)
+	if err != nil {
+		writeQueryError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, sum)
 }

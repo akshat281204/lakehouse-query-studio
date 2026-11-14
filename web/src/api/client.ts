@@ -10,6 +10,8 @@ import type {
   QueryJob,
   QueryListResponse,
   QueryResults,
+  StatsWindow,
+  Summary,
   ReadyResponse,
   SchemaResponse,
   ServiceInfo,
@@ -205,4 +207,7 @@ export const api = {
   /** Relative URL of the CSV download; the browser follows it directly. */
   queryExportUrl: (id: string) =>
     `${BASE_URL}/api/v1/queries/${encodeURIComponent(id)}/export`,
+
+  getStats: (window: StatsWindow = '24h') =>
+    request<Summary>(`/api/v1/stats?window=${window}`),
 }

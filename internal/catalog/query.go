@@ -147,6 +147,10 @@ type QueryStore interface {
 	// PurgeHistory deletes terminal queries finished before cutoff (statement
 	// text included) and returns any spool keys they still referenced.
 	PurgeHistory(ctx context.Context, cutoff time.Time) (deleted int, refs []string, err error)
+	// Summary aggregates the last `window` of activity for the dashboard
+	// (timeline in `buckets` slices). It reads at most 50,000 query jobs and
+	// sets Truncated when the window held more.
+	Summary(ctx context.Context, window time.Duration, buckets int) (Summary, error)
 	// Stats returns current queue depths (queries and ingestion jobs).
 	Stats(ctx context.Context) (QueueStats, error)
 	// RequestCancel cancels a QUEUED query immediately, or flags a RUNNING one

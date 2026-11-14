@@ -306,6 +306,19 @@ func (m *MemoryQueryStore) PurgeHistory(_ context.Context, cutoff time.Time) (in
 	return n, refs, nil
 }
 
+func (m *MemoryQueryStore) Summary(_ context.Context, window time.Duration, buckets int) (Summary, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rows := make([]SummaryRow, 0, len(m.jobs))
+	for _, q := range m.jobs {
+		rows = append(rows, SummaryRow{CreatedAt: q.CreatedAt, Status: q.Status, DurationMs: q.DurationMs,
+			FailureReason: q.FailureReason, RowsReturned: q.RowsReturned, BytesStaged: q.BytesStaged})
+	}
+	sum := BuildSummary(rows, window, buckets, m.Now())
+	sum.Ingestions.Active = m.IngestQueued
+	return sum, nil
+}
+
 // ExpireLease forces the lease of a RUNNING query into the past (tests).
 func (m *MemoryQueryStore) ExpireLease(id string) {
 	m.mu.Lock()

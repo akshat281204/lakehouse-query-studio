@@ -54,4 +54,9 @@ umask 077
     printf 'LOG_LEVEL=%s\n' "$LOG_LEVEL"
 } > "$ENV_FILE"
 
+# S3 identity for the local object store (SeaweedFS), derived from the same
+# credentials the apps use. Gitignored; never committed.
+printf '{"identities":[{"name":"lakehouse","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}\n' \
+    "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" > .s3-config.json
+
 echo "Wrote $ENV_FILE with local-only random credentials (gitignored)."
