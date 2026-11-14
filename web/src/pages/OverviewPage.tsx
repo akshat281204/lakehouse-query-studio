@@ -12,6 +12,11 @@ interface Overview {
   errors: string[]
 }
 
+const DEP_LABELS: Record<string, string> = {
+  postgres: 'PostgreSQL',
+  objectstore: 'Object store',
+}
+
 const msg = (e: unknown) => (e instanceof ApiError ? e.message : String(e))
 
 export function OverviewPage() {
@@ -73,7 +78,10 @@ export function OverviewPage() {
   return (
     <main className="page">
       <header className="page-header">
-        <h1>Overview</h1>
+        <div>
+          <h1>Overview</h1>
+          <p>Service health and recent activity</p>
+        </div>
       </header>
       {o.errors.map((e) => (
         <p key={e} className="error" role="alert">
@@ -84,10 +92,10 @@ export function OverviewPage() {
       <section aria-label="Dependencies">
         <h2>Dependencies</h2>
         {o.ready ? (
-          <ul>
+          <ul className="dep-list">
             {Object.entries(o.ready.dependencies).map(([name, d]) => (
               <li key={name}>
-                {name}:{' '}
+                {DEP_LABELS[name] ?? name}
                 <span
                   className={`status status-${d.ok ? 'succeeded' : 'failed'}`}
                 >
@@ -109,7 +117,7 @@ export function OverviewPage() {
       <section aria-label="Summary" className="stat-grid">
         <div>
           <strong data-testid="stat-datasets">{o.datasetTotal ?? na}</strong>{' '}
-          datasets
+          {o.datasetTotal === 1 ? 'dataset' : 'datasets'}
         </div>
         <div>
           <strong data-testid="stat-active-queries">{activeQ ?? na}</strong>{' '}
@@ -135,9 +143,9 @@ export function OverviewPage() {
 
       <section aria-label="Recent queries">
         <h2>Recent queries</h2>
-        {q && q.length === 0 ? <p>No queries yet.</p> : null}
+        {q && q.length === 0 ? <p className="empty">No queries yet.</p> : null}
         {q && q.length > 0 ? (
-          <ul>
+          <ul className="recent-list">
             {q.slice(0, 5).map((j) => (
               <li key={j.id}>
                 <code className="statement">

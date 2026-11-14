@@ -14,7 +14,7 @@ var (
 	IngestOutcomes = []string{"succeeded", "failed", "abandoned"}
 	JobKinds       = []string{"query", "ingest"}
 	JobStates      = []string{"queued", "running"}
-	Dependencies   = []string{"postgres", "minio"}
+	Dependencies   = []string{"postgres", "objectstore"}
 	SweepKinds     = []string{"export", "staging", "history"}
 	StatusClasses  = []string{"2xx", "3xx", "4xx", "5xx"}
 	HTTPRoutes     = []string{

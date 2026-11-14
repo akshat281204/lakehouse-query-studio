@@ -23,7 +23,10 @@ export function HistoryPage({ onRerun }: HistoryPageProps) {
   return (
     <main className="page">
       <header className="page-header">
-        <h1>Query history</h1>
+        <div>
+          <h1>Query history</h1>
+          <p>Recent queries with status and duration</p>
+        </div>
       </header>
       {error ? (
         <p className="error" role="alert">

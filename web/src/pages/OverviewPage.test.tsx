@@ -35,7 +35,7 @@ describe('OverviewPage', () => {
   it('shows counts derived from API data', async () => {
     m.ready.mockResolvedValue({
       status: 'ok',
-      dependencies: { postgres: { ok: true }, minio: { ok: true } },
+      dependencies: { postgres: { ok: true }, objectstore: { ok: true } },
     })
     m.listDatasets.mockResolvedValue({
       datasets: [],
@@ -67,7 +67,7 @@ describe('OverviewPage', () => {
     expect(screen.getByTestId('stat-failed-queries')).toHaveTextContent('2')
     expect(screen.getByTestId('stat-active-ingestions')).toHaveTextContent('1')
     expect(screen.getByTestId('stat-failed-ingestions')).toHaveTextContent('1')
-    expect(screen.getByText('postgres:')).toBeInTheDocument()
+    expect(screen.getByText('PostgreSQL')).toBeInTheDocument()
     expect(screen.getByText('SELECT 5')).toBeInTheDocument()
   })
 
@@ -76,7 +76,7 @@ describe('OverviewPage', () => {
       status: 'not_ready',
       dependencies: {
         postgres: { ok: false, message: 'connection refused' },
-        minio: { ok: true },
+        objectstore: { ok: true },
       },
     })
     m.listDatasets.mockResolvedValue({

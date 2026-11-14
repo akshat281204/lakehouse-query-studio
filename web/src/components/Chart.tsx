@@ -103,7 +103,8 @@ export function Chart({ columns, rows }: ChartProps) {
                 width={step * 0.7}
                 y={Math.min(y(p.value), y(0))}
                 height={Math.abs(y(p.value) - y(0))}
-                fill="#2563eb"
+                className="chart-mark"
+                rx="3"
               >
                 <title>{`${p.label}: ${p.value}`}</title>
               </rect>
@@ -112,8 +113,8 @@ export function Chart({ columns, rows }: ChartProps) {
             <>
               <polyline
                 fill="none"
-                stroke="#2563eb"
-                strokeWidth="2"
+                className="chart-line"
+                strokeWidth="2.5"
                 points={points.map((p, i) => `${x(i)},${y(p.value)}`).join(' ')}
               />
               {points.map((p, i) => (
@@ -123,7 +124,7 @@ export function Chart({ columns, rows }: ChartProps) {
                   cx={x(i)}
                   cy={y(p.value)}
                   r="3"
-                  fill="#2563eb"
+                  className="chart-mark"
                 >
                   <title>{`${p.label}: ${p.value}`}</title>
                 </circle>

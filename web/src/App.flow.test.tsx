@@ -38,7 +38,7 @@ function fakeApi(
   if (path === '/readyz')
     return json({
       status: 'ok',
-      dependencies: { postgres: { ok: true }, minio: { ok: true } },
+      dependencies: { postgres: { ok: true }, objectstore: { ok: true } },
     })
   if (path === '/api/v1/datasets' && method === 'GET') {
     return json({

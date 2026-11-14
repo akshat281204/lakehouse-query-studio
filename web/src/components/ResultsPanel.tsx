@@ -1,10 +1,25 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, ApiError } from '../api/client'
-import type { QueryJob, QueryResults } from '../api/types'
+import type { CellValue, QueryJob, QueryResults } from '../api/types'
 import { formatBytes, formatDuration } from '../lib/format'
 import { Chart } from './Chart'
 
 const PAGE = 100
+
+const decimalFormat = new Intl.NumberFormat(undefined, {
+  maximumFractionDigits: 4,
+})
+
+/** Display form of a cell. Doubles are tidied (no float noise); integers and
+ * text are shown exactly. The CSV export and the stored result are unchanged. */
+function displayCell(v: CellValue, type: string): string {
+  if (typeof v === 'number' && type === 'double') {
+    return decimalFormat.format(v)
+  }
+  return String(v)
+}
+
+const isNumericType = (t: string) => t === 'int64' || t === 'double'
 
 interface ResultsPanelProps {
   job: QueryJob
@@ -76,7 +91,11 @@ export function ResultsPanel({ job }: ResultsPanelProps) {
                 <thead>
                   <tr>
                     {res.columns.map((c, i) => (
-                      <th key={i} title={c.type}>
+                      <th
+                        key={i}
+                        title={c.type}
+                        className={isNumericType(c.type) ? 'num' : undefined}
+                      >
                         {c.name}
                       </th>
                     ))}
@@ -86,11 +105,19 @@ export function ResultsPanel({ job }: ResultsPanelProps) {
                   {res.rows.map((r, ri) => (
                     <tr key={ri}>
                       {r.map((v, ci) => (
-                        <td key={ci}>
+                        <td
+                          key={ci}
+                          className={
+                            isNumericType(res.columns[ci].type)
+                              ? 'num'
+                              : undefined
+                          }
+                          title={v === null ? undefined : String(v)}
+                        >
                           {v === null ? (
                             <span className="muted">null</span>
                           ) : (
-                            String(v)
+                            displayCell(v, res.columns[ci].type)
                           )}
                         </td>
                       ))}

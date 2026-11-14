@@ -17,7 +17,7 @@ func metricsServer() (*Server, *catalog.MemoryQueryStore) {
 		Metrics: telemetry.New("test"),
 		Queries: store,
 		Ready: func(context.Context) map[string]health.Result {
-			return map[string]health.Result{"postgres": {OK: true}, "minio": {OK: false, Message: "down"}}
+			return map[string]health.Result{"postgres": {OK: true}, "objectstore": {OK: false, Message: "down"}}
 		},
 	})
 	return s, store
@@ -37,7 +37,7 @@ func TestMetricsEndpointExposesQueueDepthAndDependencies(t *testing.T) {
 		`lqs_queue_depth{kind="query",state="queued"} 1`,
 		`lqs_queue_depth{kind="ingest",state="queued"} 3`,
 		`lqs_dependency_up{dependency="postgres"} 1`,
-		`lqs_dependency_up{dependency="minio"} 0`,
+		`lqs_dependency_up{dependency="objectstore"} 0`,
 		`lqs_build_info{version="test"} 1`,
 	} {
 		if !strings.Contains(body, want) {

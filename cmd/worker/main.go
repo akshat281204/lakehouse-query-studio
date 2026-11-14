@@ -78,11 +78,9 @@ func run() error {
 		Region:    "us-east-1",
 		UseSSL:    cfg.MinIOUseSSL,
 	})
-	bctx, bcancel := context.WithTimeout(ctx, 10*time.Second)
-	if err := objects.EnsureBucket(bctx); err != nil {
+	if err := ensureBucket(ctx, objects, time.Minute); err != nil {
 		log.Warn("ensure bucket failed", "error", err.Error())
 	}
-	bcancel()
 
 	host, _ := os.Hostname()
 	owner := fmt.Sprintf("%s-%d", host, os.Getpid())
@@ -169,6 +167,24 @@ func serveMetrics(ctx context.Context, cfg *config.Config, log *slog.Logger, m *
 	log.Info("worker metrics listening", "addr", cfg.MetricsAddr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error("metrics server stopped", "error", "listen failed")
+	}
+}
+
+// ensureBucket creates the bucket, retrying while the store is starting.
+func ensureBucket(ctx context.Context, objects *objectstore.Client, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	for {
+		bctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := objects.EnsureBucket(bctx)
+		cancel()
+		if err == nil || ctx.Err() != nil || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 

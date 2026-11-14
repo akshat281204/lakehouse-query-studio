@@ -55,10 +55,12 @@ export function DatasetsPage({ onOpen }: DatasetsPageProps) {
   return (
     <main className="page">
       <header className="page-header">
-        <h1>Datasets</h1>
-        <p>
-          {total} dataset{total === 1 ? '' : 's'}
-        </p>
+        <div>
+          <h1>Datasets</h1>
+          <p>
+            {total} dataset{total === 1 ? '' : 's'}
+          </p>
+        </div>
       </header>
 
       <form className="register-form" onSubmit={handleSubmit}>

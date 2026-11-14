@@ -93,7 +93,12 @@ export function QueryPage({
   return (
     <main className="page query-page">
       <header className="page-header">
-        <h1>SQL workbench</h1>
+        <div>
+          <h1>SQL workbench</h1>
+          <p>
+            One read-only statement over your datasets, run as a durable job
+          </p>
+        </div>
       </header>
       <div className="workbench">
         <SchemaBrowser
@@ -111,6 +116,7 @@ export function QueryPage({
           <div className="toolbar">
             <button
               type="button"
+              className="btn-primary"
               onClick={() => void run(sql)}
               disabled={submitting || !sql.trim()}
             >
@@ -118,6 +124,7 @@ export function QueryPage({
             </button>
             <button
               type="button"
+              className="btn-danger"
               onClick={() => void cancel()}
               disabled={!active || job?.cancelRequested}
             >
