@@ -97,12 +97,40 @@ func applyMigration(ctx context.Context, db *sql.DB, name, body string) error {
 // The migration files in this repository do not contain semicolons inside
 // string literals, so a plain split is sufficient.
 func splitStatements(body string) []string {
-	parts := strings.Split(body, ";")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if s := strings.TrimSpace(p); s != "" {
+	// A small scanner rather than strings.Split: a ';' inside a '--' comment or a
+	// single-quoted literal must not end a statement. Dollar-quoting is not used
+	// by our migrations and is intentionally unsupported.
+	var out []string
+	var cur strings.Builder
+	flush := func() {
+		if s := strings.TrimSpace(cur.String()); s != "" {
 			out = append(out, s)
 		}
+		cur.Reset()
 	}
+	inQuote := false
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		switch {
+		case inQuote:
+			cur.WriteByte(c)
+			if c == '\'' {
+				inQuote = false // a doubled '' re-enters on the next byte
+			}
+		case c == '\'':
+			inQuote = true
+			cur.WriteByte(c)
+		case c == '-' && i+1 < len(body) && body[i+1] == '-':
+			for i < len(body) && body[i] != '\n' {
+				i++
+			}
+			cur.WriteByte('\n')
+		case c == ';':
+			flush()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	flush()
 	return out
 }
