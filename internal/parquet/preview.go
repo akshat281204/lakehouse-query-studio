@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -475,12 +476,19 @@ func decodeDataPageV1(dp *dataPageHeader, data []byte, leaf leafColumn, dict []a
 	valueOffset := 0
 	if leaf.maxDef > 0 {
 		bw := bitWidthFor(int(leaf.maxDef))
-		levels, offset, err := decodeRLELevels(data, bw, numValues, maxRows)
+		if len(data) < 4 {
+			return nil, fmt.Errorf("%w: truncated definition levels", ErrMalformed)
+		}
+		levelLen := int(binary.LittleEndian.Uint32(data[:4]))
+		if levelLen < 0 || 4+levelLen > len(data) {
+			return nil, fmt.Errorf("%w: invalid definition level length", ErrMalformed)
+		}
+		levels, _, err := decodeRLELevels(data[4:4+levelLen], bw, numValues, maxRows)
 		if err != nil {
 			return nil, err
 		}
 		defLevels = levels
-		valueOffset = offset
+		valueOffset = 4 + levelLen
 		nonNull = 0
 		for _, l := range defLevels {
 			if int32(l) == leaf.maxDef {
@@ -552,8 +560,14 @@ func decodeValues(data []byte, encoding int32, dict []any, typ int32, typeLength
 		if dict == nil {
 			return nil, fmt.Errorf("%w: missing dictionary", ErrMalformed)
 		}
-		bw := bitWidthFor(len(dict) - 1)
-		idx, err := decodeRLE(data, bw, count)
+		if len(data) < 1 {
+			return nil, fmt.Errorf("%w: missing dictionary index width", ErrMalformed)
+		}
+		bw := int(data[0])
+		if bw > 32 {
+			return nil, fmt.Errorf("%w: invalid dictionary index width", ErrMalformed)
+		}
+		idx, err := decodeRLE(data[1:], bw, count)
 		if err != nil {
 			return nil, err
 		}
@@ -632,14 +646,9 @@ func decodeRLELevels(data []byte, bitWidth, total, keep int) ([]uint32, int, err
 			remaining -= n
 			continue
 		}
-		bw64, err := d.readVarint()
-		if err != nil {
-			return nil, 0, err
-		}
-		bw := int(bw64)
 		n := runLen * 8
 		for i := 0; i < n; i++ {
-			v, err := d.readBits(bw)
+			v, err := d.readBits(bitWidth)
 			if err != nil {
 				return nil, 0, err
 			}
