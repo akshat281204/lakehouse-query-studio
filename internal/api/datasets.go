@@ -20,6 +20,7 @@ type Handler struct {
 	objects   objectstore.Store
 	registrar *catalog.Registrar
 	ingest    IngestDeps
+	queries   QueryDeps
 }
 
 // New builds the dataset handler. A nil store or object store reports
@@ -40,6 +41,7 @@ func New(store catalog.Store, objects objectstore.Store, opts ...Option) http.Ha
 	mux.HandleFunc("GET /api/v1/datasets/{id}/schema", h.handleSchema)
 	mux.HandleFunc("GET /api/v1/datasets/{id}/preview", h.handlePreview)
 	h.registerIngest(mux)
+	h.registerQueries(mux)
 	return mux
 }
 

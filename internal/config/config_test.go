@@ -144,3 +144,50 @@ func TestValidateAllowsEmptyPostgresURL(t *testing.T) {
 		t.Fatalf("Validate() with empty PostgresURL = %v, want nil", err)
 	}
 }
+
+func TestQueryConfigDefaultsMatchDesign(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := cfg.Query
+	if q.Workers != 2 || q.Timeout != 60*time.Second || q.Lease != 120*time.Second || q.Heartbeat != 40*time.Second {
+		t.Errorf("workers/timeout/lease = %d %v %v %v", q.Workers, q.Timeout, q.Lease, q.Heartbeat)
+	}
+	if q.MaxRows != 10_000 || q.MaxResultBytes != 256<<20 || q.MaxRowBytes != 1<<20 ||
+		q.MaxPageBytes != 4<<20 || q.MaxExportBytes != 64<<20 || q.MaxExportRows != 50_000 || q.QueueDepth != 100 {
+		t.Errorf("limits = %+v", q)
+	}
+}
+
+func TestQueryConfigRejectsValuesOutsideHardBounds(t *testing.T) {
+	cases := map[string]string{
+		"QUERY_WORKERS":            "0",
+		"QUERY_WORKERS ":           "17",
+		"QUERY_TIMEOUT":            "301s",
+		"QUERY_LEASE_DURATION":     "601s",
+		"MAX_RESULT_ROWS":          "100001",
+		"MAX_RESULT_BYTES":         "1073741825",
+		"MAX_ROW_BYTES":            "16777217",
+		"MAX_PAGE_BYTES":           "67108865",
+		"MAX_EXPORT_BYTES":         "536870913",
+		"QUERY_HEARTBEAT_INTERVAL": "100s", // 100s + 30s margin >= 120s lease
+		"QUEUE_DEPTH":              "0",
+	}
+	for k, v := range cases {
+		key := strings.TrimSpace(k)
+		t.Run(key+"="+v, func(t *testing.T) {
+			t.Setenv(key, v)
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s=%s accepted", key, v)
+			}
+		})
+	}
+}
+
+func TestQueryConfigRejectsGarbage(t *testing.T) {
+	t.Setenv("QUERY_WORKERS", "many")
+	if _, err := Load(); err == nil {
+		t.Fatal("non-numeric QUERY_WORKERS accepted")
+	}
+}
