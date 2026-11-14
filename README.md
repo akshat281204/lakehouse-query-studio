@@ -21,7 +21,7 @@ storage, not a distributed database.
 | `web/` | React + TypeScript + Vite dashboard with a typed API client |
 | `docker-compose.yml` | Local Postgres, MinIO, API, worker, and web |
 | `Makefile` | `up`, `down`, `run`, `web`, `test`, `verify` targets |
-| `docs/` | Design contract (phase 0), catalog (phase 2), ingestion (phase 3), queries (phase 4), dashboard (phase 5), security and operations (phase 6) |
+| `docs/` | Design contract (phase 0), catalog (phase 2), ingestion (phase 3), queries (phase 4), dashboard (phase 5), security and operations (phase 6), evaluation (phase 7) |
 
 ## Prerequisites
 
@@ -157,6 +157,28 @@ The dataset endpoints return `503 unavailable` when PostgreSQL or MinIO is not
 configured. All non-2xx responses use a single error envelope
 (`{ "error": { "code", "message", "details" } }`); see `docs/design.md` §11 and
 `docs/catalog.md`.
+
+## Measured performance
+
+Measured on one machine (Apple M4, 16 GiB, DuckDB v1.4.1, in-memory object store, not
+isolated) with a seeded TPC-H-*like* workload (not TPC-H). Full method, raw results and
+limitations: [`docs/evaluation.md`](docs/evaluation.md). Reproduce with `make bench`
+(`make bench-sf1` for the larger run).
+
+| Workload | Query p50 (single client, end to end) | Notes |
+|---|---|---|
+| ~600k lineitem rows (50 MiB) | 12-32 ms across the query set | Concurrency 1 to 2 workers: ~39 to ~70 queries/s |
+| ~6M lineitem rows (504 MiB) | 28-1000 ms; selective scans ~700 ms | Staging is most of the time; ~1.2 queries/s at every concurrency level |
+
+* Every query downloads (stages) all files of the datasets it names before DuckDB runs, and that
+  copy dominates latency at the larger scale. There is no cache.
+* **No benefit from partitioning was measured**: the same bytes are staged and DuckDB execute time
+  was equal or worse with the hive-partitioned layout.
+* CSV to Parquet ingestion ran at roughly 40-50 MiB/s (about 760k-875k rows/s) in this setup.
+
+Failure recovery (object store down, corrupt input, worker restarts, API restart, timeout,
+cancel, oversized results, export expiry) is covered by `test/faults`, which asserts persisted
+job and catalog state and object-store contents; it runs in `make verify`.
 
 ## CI
 
