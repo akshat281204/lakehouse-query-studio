@@ -13,6 +13,7 @@ import (
 	"github.com/akshat281204/lakehouse-query-studio/internal/api"
 	"github.com/akshat281204/lakehouse-query-studio/internal/catalog"
 	"github.com/akshat281204/lakehouse-query-studio/internal/config"
+	"github.com/akshat281204/lakehouse-query-studio/internal/guard"
 	"github.com/akshat281204/lakehouse-query-studio/internal/health"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
 	"github.com/akshat281204/lakehouse-query-studio/internal/query"
@@ -59,7 +60,7 @@ func New(cfg *config.Config, log *slog.Logger, deps Deps) *Server {
 	s := &Server{cfg: cfg, log: log, deps: deps}
 	s.srv = &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           s.routes(),
+		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return s
@@ -67,7 +68,12 @@ func New(cfg *config.Config, log *slog.Logger, deps Deps) *Server {
 
 // Handler exposes the HTTP handler for tests.
 func (s *Server) Handler() http.Handler {
-	return s.routes()
+	return guard.Middleware(guard.Config{
+		AllowedHosts:   s.cfg.AllowedHosts,
+		AllowedOrigins: s.cfg.AllowedOrigins,
+		Token:          s.cfg.APIToken,
+		TokenExempt:    []string{"/healthz"},
+	}, s.routes())
 }
 
 func (s *Server) routes() http.Handler {

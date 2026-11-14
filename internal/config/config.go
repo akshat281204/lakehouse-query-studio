@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"github.com/akshat281204/lakehouse-query-studio/internal/guard"
 	"net"
 	"net/url"
 	"os"
@@ -45,6 +46,17 @@ type Config struct {
 
 	// Query holds the query engine, worker and result limits.
 	Query QueryConfig
+
+	// AllowedHosts and AllowedOrigins are the closed lists of exact Host
+	// header values and Origin values the API accepts (design §15.2).
+	AllowedHosts   []string
+	AllowedOrigins []string
+
+	// Retention and cleanup (design §9, §10). Zero disables a sweeper.
+	Retention RetentionConfig
+
+	// MetricsAddr is where the worker serves /metrics. Empty disables it.
+	MetricsAddr string
 }
 
 // Load reads configuration from the environment, applies defaults, and
@@ -72,6 +84,16 @@ func Load() (*Config, error) {
 	if cfg.Query, err = loadQuery(); err != nil {
 		return nil, err
 	}
+	if cfg.Retention, err = loadRetention(); err != nil {
+		return nil, err
+	}
+	cfg.MetricsAddr = getenv("METRICS_ADDR", "127.0.0.1:9100")
+	port := "8080"
+	if _, p, perr := net.SplitHostPort(cfg.HTTPAddr); perr == nil && p != "" {
+		port = p
+	}
+	cfg.AllowedHosts = splitList(getenv("ALLOWED_HOSTS", ""), guard.DefaultHosts(port))
+	cfg.AllowedOrigins = splitList(getenv("ALLOWED_ORIGINS", ""), guard.DefaultOrigins(port))
 	if err = cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -104,6 +126,9 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.MinIOBucket) == "" {
 		return errors.New("MINIO_BUCKET must not be empty")
+	}
+	if c.APIToken != "" && len(c.APIToken) < 16 {
+		return errors.New("API_TOKEN must be at least 16 characters when set")
 	}
 	return nil
 }
@@ -166,4 +191,17 @@ func getenvDuration(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid duration %q: %w", v, err)
 	}
 	return d, nil
+}
+
+func splitList(raw string, def []string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return def
+	}
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

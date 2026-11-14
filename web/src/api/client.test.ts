@@ -95,7 +95,10 @@ describe('api client', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/datasets', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Lakehouse-CSRF': '1',
+      },
       body: JSON.stringify({ name: 'sales', prefix: 'data/sales' }),
     })
   })
@@ -198,5 +201,30 @@ describe('api client', () => {
       undefined,
     )
     expect(api.queryExportUrl('q1')).toBe('/api/v1/queries/q1/export')
+  })
+
+  it('sends the CSRF proof header on every mutation and never on reads', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({}),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    await api.cancelQuery('q1')
+    await api.submitQuery('SELECT 1')
+    await api.retryIngestion('j1')
+    await api.registerDataset({ name: 'a', prefix: 'p' })
+    for (const call of fetchMock.mock.calls) {
+      expect((call[1] as RequestInit).headers).toMatchObject({
+        'X-Lakehouse-CSRF': '1',
+      })
+    }
+    expect((fetchMock.mock.calls[1][1] as RequestInit).headers).toMatchObject({
+      'Content-Type': 'application/json',
+    })
+    fetchMock.mockClear()
+    await api.listQueries()
+    expect(fetchMock.mock.calls[0][1]).toBeUndefined()
   })
 })
