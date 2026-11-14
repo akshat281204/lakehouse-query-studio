@@ -28,3 +28,17 @@ func TestMigrationNames(t *testing.T) {
 		t.Errorf("last migration = %q, want 0005_ingestion_jobs.sql", names[4])
 	}
 }
+
+func TestSplitStatementsIgnoresSemicolonsInCommentsAndQuotes(t *testing.T) {
+	body := "-- a note; with a semicolon\nCREATE TABLE a (x text DEFAULT 'a;b'); -- trailing; comment\nINSERT INTO a VALUES ('it''s');\n"
+	got := splitStatements(body)
+	if len(got) != 2 {
+		t.Fatalf("splitStatements() = %d statements, want 2: %#v", len(got), got)
+	}
+	if got[0] != "CREATE TABLE a (x text DEFAULT 'a;b')" {
+		t.Errorf("first statement = %q", got[0])
+	}
+	if got[1] != "INSERT INTO a VALUES ('it''s')" {
+		t.Errorf("second statement = %q", got[1])
+	}
+}
