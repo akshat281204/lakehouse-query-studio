@@ -15,6 +15,148 @@ body {
   min-height: 100vh;
 }
 
+.page {
+  max-width: 56rem;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 4rem;
+}
+
+.page-header {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+.page-header h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.75rem;
+}
+
+.page-header p {
+  margin: 0;
+  color: #57606a;
+}
+
+.back-button {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: #0969da;
+  cursor: pointer;
+  font-size: 1rem;
+}
+
+.register-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 1rem 0;
+}
+
+.register-form input {
+  flex: 1 1 12rem;
+  padding: 0.5rem;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+}
+
+.register-form button {
+  padding: 0.5rem 1rem;
+  border: 1px solid #0969da;
+  border-radius: 6px;
+  background-color: #0969da;
+  color: #fff;
+  cursor: pointer;
+}
+
+.register-form button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.search-input {
+  width: 100%;
+  padding: 0.5rem;
+  margin-bottom: 1rem;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+}
+
+.dataset-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.dataset-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  width: 100%;
+  padding: 0.75rem 1rem;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  text-align: left;
+}
+
+.dataset-item:hover {
+  border-color: #0969da;
+}
+
+.dataset-name {
+  font-weight: 600;
+}
+
+.dataset-meta {
+  color: #57606a;
+  font-size: 0.85rem;
+}
+
+.dataset-info dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 1rem;
+  margin: 1rem 0;
+}
+
+.dataset-info dt {
+  color: #57606a;
+}
+
+.dataset-info dd {
+  margin: 0;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.data-table th,
+.data-table td {
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid #d0d7de;
+}
+
+.data-table th {
+  background: #f6f8fa;
+}
+
+.error {
+  color: #cf222e;
+}
+
+.note {
+  color: #57606a;
+}
+
 .empty-state {
   display: flex;
   flex-direction: column;
