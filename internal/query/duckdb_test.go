@@ -247,3 +247,36 @@ func TestExecuteRunawayAggregateIsContained(t *testing.T) {
 	}
 	t.Logf("contained in %s: %v", time.Since(start), err)
 }
+
+// Integer SUMs are HUGEINT in DuckDB. They must come back numeric when they
+// fit, and exact (text) when they do not, never rounded.
+func TestWideIntegersAndDecimalsKeepUsableTypes(t *testing.T) {
+	run := func(stmt string) *Result {
+		t.Helper()
+		req, _ := fixtureRequest(t, stmt)
+		res, err := NewDuckDB().Execute(context.Background(), req)
+		if err != nil {
+			t.Fatalf("%q: %v", stmt, err)
+		}
+		return res
+	}
+	if r := run("SELECT sum(id) AS s FROM sales"); r.Columns[0].Type != parquet.TypeInt64 || r.Rows[0][0] != int64(6) {
+		t.Errorf("sum(bigint): %+v %v", r.Columns, r.Rows)
+	}
+	if r := run("SELECT 170141183460469231731687303715884105727::HUGEINT AS h"); r.Columns[0].Type != parquet.TypeString ||
+		r.Rows[0][0] != "170141183460469231731687303715884105727" {
+		t.Errorf("huge hugeint must stay exact text: %+v %v", r.Columns, r.Rows)
+	}
+	if r := run("SELECT 18446744073709551615::UBIGINT AS u"); r.Columns[0].Type != parquet.TypeString || r.Rows[0][0] != "18446744073709551615" {
+		t.Errorf("ubigint max: %+v %v", r.Columns, r.Rows)
+	}
+	if r := run("SELECT 42::UBIGINT AS u, NULL::HUGEINT AS n"); r.Columns[0].Type != parquet.TypeInt64 || r.Rows[0][0] != int64(42) || r.Rows[0][1] != nil {
+		t.Errorf("small ubigint / null hugeint: %+v %v", r.Columns, r.Rows)
+	}
+	if r := run("SELECT sum(1.25::DECIMAL(10,2)) AS d FROM sales"); r.Columns[0].Type != parquet.TypeDouble || r.Rows[0][0] != 3.75 {
+		t.Errorf("small decimal: %+v %v", r.Columns, r.Rows)
+	}
+	if r := run("SELECT 1234567890123456789012345.12345::DECIMAL(30,5) AS d"); r.Columns[0].Type != parquet.TypeString {
+		t.Errorf("wide decimal must stay text: %+v %v", r.Columns, r.Rows)
+	}
+}
