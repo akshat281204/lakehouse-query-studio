@@ -95,3 +95,47 @@ export interface PreviewResponse {
   truncated: boolean
   note?: string
 }
+
+export type IngestionStatus =
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'CANCELLED'
+
+export interface IngestionJob {
+  id: string
+  datasetId: string
+  datasetName: string
+  versionId: string
+  version: number
+  kind: string
+  status: IngestionStatus
+  inputFormat: string
+  partitionColumns: string[]
+  failureReason?: string
+  errorSummary?: string
+  retryable: boolean
+  retryOf?: string
+  attempt: number
+  createdAt: string
+  startedAt?: string
+  finishedAt?: string
+}
+
+export interface IngestionListResponse {
+  jobs: IngestionJob[]
+}
+
+export interface InspectColumn {
+  name: string
+  type: string
+  nullable: boolean
+}
+
+export interface InspectResponse {
+  format: string
+  columns: InspectColumn[]
+  rowCount: number
+  sample: Record<string, unknown>[]
+}
