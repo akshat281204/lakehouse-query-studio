@@ -77,6 +77,10 @@ services:
     environment:
       DUCKDB_MEMORY: ${DUCKDB_MEMORY:-2GiB}
       QUERY_WORKERS: ${QUERY_WORKERS:-2}
+      # Worker /metrics: reachable on the Compose network only (not published).
+      METRICS_ADDR: ":9100"
+      EXPORT_TTL: ${EXPORT_TTL:-24h}
+      HISTORY_RETENTION: ${HISTORY_RETENTION:-720h}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       LOG_FORMAT: json
       POSTGRES_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lakehouse}?sslmode=disable
@@ -100,6 +104,36 @@ services:
     depends_on:
       api:
         condition: service_started
+
+  # --- Service operations (opt-in): docker compose --profile ops up -d ---------
+  # Separate from the user-facing SQL dashboard. Both bind to loopback only.
+  prometheus:
+    profiles: ["ops"]
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - api
+      - worker
+
+  grafana:
+    profiles: ["ops"]
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
 
 volumes:
   pgdata:
