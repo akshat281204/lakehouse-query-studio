@@ -70,7 +70,13 @@ services:
       context: .
       dockerfile: Dockerfile
     command: ["/app/worker"]
+    # DuckDB's memory_limit does not bound every allocation (a single huge
+    # string value is outside it), so the container limit is the real memory
+    # backstop for query execution. Keep DUCKDB_MEMORY * QUERY_WORKERS below it.
+    mem_limit: ${WORKER_MEM_LIMIT:-6g}
     environment:
+      DUCKDB_MEMORY: ${DUCKDB_MEMORY:-2GiB}
+      QUERY_WORKERS: ${QUERY_WORKERS:-2}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       LOG_FORMAT: json
       POSTGRES_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lakehouse}?sslmode=disable
