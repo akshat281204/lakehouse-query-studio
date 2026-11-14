@@ -62,6 +62,10 @@ func (f *fakeStore) GetLatestVersion(context.Context, string) (DatasetVersion, e
 	return DatasetVersion{}, ErrNotFound
 }
 
+func (f *fakeStore) GetLatestReadyVersion(context.Context, string) (DatasetVersion, error) {
+	return DatasetVersion{}, ErrNotFound
+}
+
 func (f *fakeStore) GetSchema(context.Context, string) ([]SchemaColumn, error) {
 	return nil, nil
 }

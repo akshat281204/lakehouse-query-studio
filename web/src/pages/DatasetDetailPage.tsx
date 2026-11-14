@@ -67,6 +67,12 @@ export function DatasetDetailPage({ id, onBack }: DatasetDetailPageProps) {
               <dd>
                 v{detail.version.version} ({detail.version.status})
               </dd>
+              {detail.version.errorSummary ? (
+                <>
+                  <dt>Error</dt>
+                  <dd className="error">{detail.version.errorSummary}</dd>
+                </>
+              ) : null}
               {detail.version.rowCount !== undefined ? (
                 <>
                   <dt>Rows</dt>

@@ -38,6 +38,9 @@ type Store interface {
 	Get(ctx context.Context, id string) (Dataset, error)
 	// GetLatestVersion returns the highest-numbered version of a dataset.
 	GetLatestVersion(ctx context.Context, datasetID string) (DatasetVersion, error)
+	// GetLatestReadyVersion returns the highest-numbered READY version, the only
+	// state exposed to schema and preview.
+	GetLatestReadyVersion(ctx context.Context, datasetID string) (DatasetVersion, error)
 	// GetSchema returns the schema columns of a version ordered by position.
 	GetSchema(ctx context.Context, versionID string) ([]SchemaColumn, error)
 }

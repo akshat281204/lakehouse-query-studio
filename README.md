@@ -16,12 +16,12 @@ storage, not a distributed database.
 | Path | Purpose |
 |---|---|
 | `cmd/api` | Go control-plane process (health, readiness, config) |
-| `cmd/worker` | Query/ingestion worker placeholder (phase 1) |
+| `cmd/worker` | Ingestion worker: claims upload jobs and writes versioned Parquet (phase 3) |
 | `internal/` | Shared Go packages: config, logging, health, server |
 | `web/` | React + TypeScript + Vite dashboard with a typed API client |
 | `docker-compose.yml` | Local Postgres, MinIO, API, worker, and web |
 | `Makefile` | `up`, `down`, `run`, `web`, `test`, `verify` targets |
-| `docs/` | Design contract and architecture (phase 0) |
+| `docs/` | Design contract (phase 0), catalog (phase 2), ingestion (phase 3) |
 
 ## Prerequisites
 
@@ -110,6 +110,15 @@ and `make web` (Vite dev server with hot reload).
 - `GET /api/v1/datasets/{id}` — dataset detail with latest version and schema
 - `GET /api/v1/datasets/{id}/schema` — schema columns
 - `GET /api/v1/datasets/{id}/preview` — bounded sample rows
+- `POST /api/v1/ingestions/inspect` — infer the schema of a CSV/JSON/JSONL body
+  without storing it
+- `POST /api/v1/ingestions?name=&filename=&partitionColumns=` — upload a file
+  (raw body, up to 64 MiB) and queue a conversion job (`202`)
+- `GET /api/v1/ingestions`, `GET /api/v1/ingestions/{id}` — list/poll jobs
+- `POST /api/v1/ingestions/{id}/retry` — retry a failed, retryable job
+
+See `docs/ingestion.md` for limits, partitioning, recovery, and known
+deviations from the phase-0 contract.
 
 The dataset endpoints return `503 unavailable` when PostgreSQL or MinIO is not
 configured. All non-2xx responses use a single error envelope

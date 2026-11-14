@@ -18,14 +18,14 @@ func TestMigrationNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrationNames() error = %v", err)
 	}
-	if len(names) != 5 {
-		t.Fatalf("migrationNames() = %d names, want 5: %v", len(names), names)
+	if len(names) != 6 {
+		t.Fatalf("migrationNames() = %d names, want 6: %v", len(names), names)
 	}
 	if names[0] != "0001_namespaces.sql" {
 		t.Errorf("first migration = %q, want 0001_namespaces.sql", names[0])
 	}
-	if names[4] != "0005_ingestion_jobs.sql" {
-		t.Errorf("last migration = %q, want 0005_ingestion_jobs.sql", names[4])
+	if names[5] != "0006_ingestion_inputs.sql" {
+		t.Errorf("last migration = %q, want 0006_ingestion_inputs.sql", names[5])
 	}
 }
 
