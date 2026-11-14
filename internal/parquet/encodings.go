@@ -93,7 +93,7 @@ func (d *rleDecoder) decodeValues(bitWidth int, count int) ([]uint32, error) {
 		if err != nil {
 			return nil, err
 		}
-		isRLE := header&1 == 1
+		isRLE := header&1 == 0
 		runLen := int(header >> 1)
 		if isRLE {
 			val, err := d.readRLEValue(bitWidth)

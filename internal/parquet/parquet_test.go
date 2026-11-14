@@ -14,6 +14,7 @@ import (
 type cw struct {
 	buf    []byte
 	lastID int16
+	stack  []int16
 }
 
 func (w *cw) varint(v uint64) {
@@ -46,7 +47,11 @@ func (w *cw) field(id int16, typ byte) {
 	w.lastID = id
 }
 
-func (w *cw) stop() { w.b(tStop) }
+func (w *cw) stop() {
+	w.b(tStop)
+	w.lastID = w.stack[len(w.stack)-1]
+	w.stack = w.stack[:len(w.stack)-1]
+}
 
 func (w *cw) listHeader(size int, elem byte) {
 	if size < 15 {
@@ -57,7 +62,10 @@ func (w *cw) listHeader(size int, elem byte) {
 	}
 }
 
-func (w *cw) begin() { w.lastID = 0 }
+func (w *cw) begin() {
+	w.stack = append(w.stack, w.lastID)
+	w.lastID = 0
+}
 
 func encodeSchemaElement(w *cw, e schemaElement) {
 	w.begin()
@@ -174,7 +182,7 @@ func rleEncodeRuns(bitWidth int, values []uint32) []byte {
 		if runLen == 0 {
 			return
 		}
-		out = appendVarint(out, uint64(runLen)<<1|1)
+		out = appendVarint(out, uint64(runLen)<<1)
 		nBytes := (bitWidth + 7) / 8
 		for i := 0; i < nBytes; i++ {
 			out = append(out, byte(runValue>>uint(8*i)))
@@ -369,8 +377,8 @@ func TestParseFileMetaDataMatchesSpec(t *testing.T) {
 }
 
 func TestDecodeRLE(t *testing.T) {
-	// RLE runs: [1,1,1,0,0] with bit width 1.
-	got, err := decodeRLE([]byte{0x07, 0x01, 0x05, 0x00}, 1, 5)
+	// RLE runs (header = length<<1): [1,1,1,0,0] with bit width 1.
+	got, err := decodeRLE([]byte{0x06, 0x01, 0x04, 0x00}, 1, 5)
 	if err != nil {
 		t.Fatalf("decodeRLE() error = %v", err)
 	}
@@ -386,8 +394,8 @@ func TestDecodeRLE(t *testing.T) {
 }
 
 func TestDecodeRLEBitPacked(t *testing.T) {
-	// One bit-packed group of 8 values of bit width 2.
-	got, err := decodeRLE([]byte{0x02, 0xE4, 0xE4}, 2, 8)
+	// One bit-packed group of 8 values of bit width 2 (header = groups<<1|1).
+	got, err := decodeRLE([]byte{0x03, 0xE4, 0xE4}, 2, 8)
 	if err != nil {
 		t.Fatalf("decodeRLE() error = %v", err)
 	}
