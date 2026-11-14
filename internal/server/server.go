@@ -82,7 +82,7 @@ func (s *Server) Handler() http.Handler {
 		// Outermost, so refused requests are counted too (route "unmatched").
 		h = s.deps.Metrics.Instrument(h)
 	}
-	return h
+	return accessLog(s.log, h)
 }
 
 func (s *Server) routes() http.Handler {

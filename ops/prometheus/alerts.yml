@@ -1,0 +1,28 @@
+groups:
+  - name: lakehouse
+    rules:
+      - alert: WorkerDown
+        expr: absent(lqs_worker_up == 1)
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "No query/ingestion worker is reporting up" }
+      - alert: DependencyDown
+        expr: lqs_dependency_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "A dependency readiness probe is failing (see the dependency label)" }
+      - alert: QueryQueueBacklog
+        expr: lqs_queue_depth{kind="query",state="queued"} > 20
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Queries are waiting for a worker slot" }
+      - alert: QueryFailureRateHigh
+        expr: sum(rate(lqs_query_jobs_total{outcome="failed"}[10m])) / clamp_min(sum(rate(lqs_query_jobs_total[10m])), 0.001) > 0.5
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "More than half of recent queries are failing" }
+      - alert: ApiServerErrors
+        expr: sum(rate(lqs_http_requests_total{class="5xx"}[5m])) > 0.1
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "The API is returning 5xx responses" }

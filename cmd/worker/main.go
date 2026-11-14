@@ -94,7 +94,16 @@ func run() error {
 		return fmt.Errorf("sql validator: %w", err)
 	}
 	defer func() { _ = validator.Close() }()
-	queryRunner, err := query.NewRunner(catalog.NewPostgresQueryStore(db), objects, query.NewDuckDB(), validator, owner,
+	// Query reads and result spooling can use a credential that cannot write
+	// lake/ or staging/ (see docs/security.md); ingestion keeps its own.
+	queryObjects := objects
+	if cfg.QueryMinIOAccessKey != "" {
+		queryObjects = objectstore.New(objectstore.Config{
+			Endpoint: cfg.MinIOEndpoint, AccessKey: cfg.QueryMinIOAccessKey, SecretKey: cfg.QueryMinIOSecretKey,
+			Bucket: cfg.MinIOBucket, Region: "us-east-1", UseSSL: cfg.MinIOUseSSL,
+		})
+	}
+	queryRunner, err := query.NewRunner(catalog.NewPostgresQueryStore(db), queryObjects, query.NewDuckDB(), validator, owner,
 		query.RunnerConfig{
 			Workers: q.Workers, Lease: q.Lease, Heartbeat: q.Heartbeat, TmpDir: q.TmpDir,
 			Limits: query.Limits{

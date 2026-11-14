@@ -40,6 +40,12 @@ type Config struct {
 	MinIOBucket    string
 	MinIOUseSSL    bool
 
+	// QueryMinIOAccessKey/SecretKey optionally give the worker's query runner
+	// its own object-store credential, separate from the ingestion credential
+	// (design §8). When empty the query runner uses the main credential.
+	QueryMinIOAccessKey string
+	QueryMinIOSecretKey string
+
 	// APIToken is an optional single deployment token. Empty disables token
 	// authentication.
 	APIToken string
@@ -72,6 +78,9 @@ func Load() (*Config, error) {
 		MinIOSecretKey: getenv("MINIO_SECRET_KEY", ""),
 		MinIOBucket:    getenv("MINIO_BUCKET", "lakehouse"),
 		APIToken:       getenv("API_TOKEN", ""),
+
+		QueryMinIOAccessKey: getenv("QUERY_MINIO_ACCESS_KEY", ""),
+		QueryMinIOSecretKey: getenv("QUERY_MINIO_SECRET_KEY", ""),
 	}
 
 	var err error
@@ -126,6 +135,9 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.MinIOBucket) == "" {
 		return errors.New("MINIO_BUCKET must not be empty")
+	}
+	if (c.QueryMinIOAccessKey == "") != (c.QueryMinIOSecretKey == "") {
+		return errors.New("QUERY_MINIO_ACCESS_KEY and QUERY_MINIO_SECRET_KEY must be set together")
 	}
 	if c.APIToken != "" && len(c.APIToken) < 16 {
 		return errors.New("API_TOKEN must be at least 16 characters when set")
