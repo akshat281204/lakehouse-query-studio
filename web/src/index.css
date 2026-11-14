@@ -246,3 +246,145 @@ body {
   background: #dbeafe;
   color: #1e3a8a;
 }
+
+.workbench {
+  display: grid;
+  grid-template-columns: 14rem 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+.workbench-main {
+  min-width: 0;
+}
+@media (max-width: 800px) {
+  .workbench {
+    grid-template-columns: 1fr;
+  }
+}
+.schema-browser ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 0;
+}
+.schema-columns {
+  padding-left: 1rem !important;
+}
+.link-button {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+}
+.muted {
+  opacity: 0.65;
+  font-size: 0.85rem;
+}
+.sql-editor {
+  position: relative;
+  height: 12rem;
+  border: 1px solid #9ca3af;
+  border-radius: 4px;
+  font:
+    0.9rem/1.4 ui-monospace,
+    monospace;
+}
+.sql-mirror,
+.sql-input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 0.5rem;
+  font: inherit;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow: auto;
+  border: 0;
+  box-sizing: border-box;
+}
+.sql-mirror {
+  pointer-events: none;
+}
+.sql-input {
+  background: transparent;
+  color: transparent;
+  caret-color: currentColor;
+  resize: none;
+  width: 100%;
+  height: 100%;
+}
+.tok-keyword {
+  color: #1d4ed8;
+  font-weight: 600;
+}
+.tok-string {
+  color: #15803d;
+}
+.tok-number {
+  color: #b45309;
+}
+.tok-comment {
+  color: #6b7280;
+  font-style: italic;
+}
+.toolbar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  margin: 0.75rem 0;
+  flex-wrap: wrap;
+}
+.tabs {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 1rem 0 0.5rem;
+}
+.tabs [aria-selected='true'] {
+  font-weight: 700;
+  border-bottom: 2px solid currentColor;
+}
+.tabs .button-link {
+  margin-left: auto;
+}
+.table-scroll {
+  overflow: auto;
+  max-height: 24rem;
+}
+.pager {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+.plan {
+  white-space: pre-wrap;
+  max-height: 16rem;
+  overflow: auto;
+}
+.statement {
+  font-size: 0.85rem;
+}
+.chart svg {
+  width: 100%;
+  max-width: 640px;
+  height: auto;
+}
+.chart-controls {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+.stat-grid {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  margin: 1rem 0;
+}
+.stat-grid strong {
+  font-size: 1.6rem;
+  display: block;
+}
