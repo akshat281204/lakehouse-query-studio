@@ -16,6 +16,7 @@ import (
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
 	"github.com/akshat281204/lakehouse-query-studio/internal/parquet"
 	"github.com/akshat281204/lakehouse-query-studio/internal/query"
+	"github.com/akshat281204/lakehouse-query-studio/internal/telemetry"
 )
 
 // QueryLimits are the API-side bounds of design §9 and §12.
@@ -39,6 +40,8 @@ type QueryDeps struct {
 	Validator *query.Validator
 	Objects   objectstore.Store
 	Limits    QueryLimits
+	// Metrics is optional.
+	Metrics *telemetry.Metrics
 }
 
 // WithQueries enables the query endpoints.
@@ -195,6 +198,9 @@ func (h *Handler) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeQueryError(w, err)
 		return
+	}
+	if h.queries.Metrics != nil {
+		h.queries.Metrics.QueryCancels.Inc()
 	}
 	writeJSON(w, http.StatusAccepted, job)
 }

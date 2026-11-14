@@ -17,6 +17,7 @@ import (
 	"github.com/akshat281204/lakehouse-query-studio/internal/health"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
 	"github.com/akshat281204/lakehouse-query-studio/internal/query"
+	"github.com/akshat281204/lakehouse-query-studio/internal/telemetry"
 )
 
 // Version is the reported service version. It may be overridden at build time
@@ -45,6 +46,9 @@ type Deps struct {
 	Queries     catalog.QueryStore
 	Validator   *query.Validator
 	QueryLimits api.QueryLimits
+
+	// Metrics, when set, enables /metrics and request instrumentation.
+	Metrics *telemetry.Metrics
 }
 
 // Server owns the HTTP server and its routes.
@@ -68,12 +72,17 @@ func New(cfg *config.Config, log *slog.Logger, deps Deps) *Server {
 
 // Handler exposes the HTTP handler for tests.
 func (s *Server) Handler() http.Handler {
-	return guard.Middleware(guard.Config{
+	var h http.Handler = guard.Middleware(guard.Config{
 		AllowedHosts:   s.cfg.AllowedHosts,
 		AllowedOrigins: s.cfg.AllowedOrigins,
 		Token:          s.cfg.APIToken,
 		TokenExempt:    []string{"/healthz"},
 	}, s.routes())
+	if s.deps.Metrics != nil {
+		// Outermost, so refused requests are counted too (route "unmatched").
+		h = s.deps.Metrics.Instrument(h)
+	}
+	return h
 }
 
 func (s *Server) routes() http.Handler {
@@ -83,10 +92,14 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
+	if s.deps.Metrics != nil {
+		mux.Handle("GET /metrics", s.deps.Metrics.Handler(s.refreshMetrics))
+	}
+
 	datasets := api.New(s.deps.Catalog, s.deps.Objects,
 		api.WithIngest(api.IngestDeps{Jobs: s.deps.Ingest, Objects: s.deps.Writer}),
 		api.WithQueries(api.QueryDeps{Store: s.deps.Queries, Validator: s.deps.Validator,
-			Objects: s.deps.Objects, Limits: s.deps.QueryLimits}))
+			Objects: s.deps.Objects, Limits: s.deps.QueryLimits, Metrics: s.deps.Metrics}))
 	mux.Handle("/api/v1/datasets", datasets)
 	mux.Handle("/api/v1/datasets/", datasets)
 	mux.Handle("/api/v1/ingestions", datasets)
@@ -94,6 +107,33 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("/api/v1/queries", datasets)
 	mux.Handle("/api/v1/queries/", datasets)
 	return mux
+}
+
+// refreshMetrics updates scrape-time gauges: dependency health from the same
+// probes /readyz uses, and queue depths from the catalog. Failures leave the
+// previous value and mark the dependency down; nothing is invented.
+func (s *Server) refreshMetrics() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	m := s.deps.Metrics
+	if s.deps.Ready != nil {
+		results := s.deps.Ready(ctx)
+		for _, dep := range telemetry.Dependencies {
+			up := 0.0
+			if r, ok := results[dep]; ok && r.OK {
+				up = 1
+			}
+			m.DependencyUp.Set(up, dep)
+		}
+	}
+	if s.deps.Queries != nil {
+		if st, err := s.deps.Queries.Stats(ctx); err == nil {
+			m.QueueDepth.Set(float64(st.QueryQueued), "query", "queued")
+			m.QueueDepth.Set(float64(st.QueryRunning), "query", "running")
+			m.QueueDepth.Set(float64(st.IngestQueued), "ingest", "queued")
+			m.QueueDepth.Set(float64(st.IngestRunning), "ingest", "running")
+		}
+	}
 }
 
 // ServiceInfo is the metadata payload shared by the service root and the
