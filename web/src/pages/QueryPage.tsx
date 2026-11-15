@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from '../api/client'
-import type { QueryJob } from '../api/types'
+import type { QueryJob, SavedQuery } from '../api/types'
 import { ResultsPanel } from '../components/ResultsPanel'
+import { SavedQueries } from '../components/SavedQueries'
+import { SaveQueryForm } from '../components/SaveQueryForm'
 import { SchemaBrowser } from '../components/SchemaBrowser'
 import { SqlEditor } from '../components/SqlEditor'
 import { formatDuration, isTerminal } from '../lib/format'
@@ -25,6 +27,12 @@ export function QueryPage({
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [elapsed, setElapsed] = useState(0)
+  const [saved, setSaved] = useState<SavedQuery[] | null>(null)
+  const [savedError, setSavedError] = useState<string | null>(null)
+  const [activeSaved, setActiveSaved] = useState<SavedQuery | undefined>()
+  const [showSave, setShowSave] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
   const runId = useRef(0)
   const alive = useRef(true)
 
@@ -81,6 +89,43 @@ export function QueryPage({
     [pollMs],
   )
 
+  const refreshSaved = useCallback(async () => {
+    try {
+      setSaved((await api.listSavedQueries()).savedQueries)
+      setSavedError(null)
+    } catch (e) {
+      setSavedError(e instanceof ApiError ? e.message : String(e))
+    }
+  }, [])
+  useEffect(() => {
+    void refreshSaved()
+  }, [refreshSaved])
+
+  const save = async (name: string, description: string, asNew: boolean) => {
+    setSaving(true)
+    setSaveError(null)
+    const input = { name, description, statement: sql }
+    try {
+      const q =
+        activeSaved && !asNew
+          ? await api.updateSavedQuery(activeSaved.id, input)
+          : await api.createSavedQuery(input)
+      setActiveSaved(q)
+      setShowSave(false)
+      await refreshSaved()
+    } catch (e) {
+      setSaveError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const removeSaved = async (q: SavedQuery) => {
+    await api.deleteSavedQuery(q.id)
+    if (activeSaved?.id === q.id) setActiveSaved(undefined)
+    await refreshSaved()
+  }
+
   const started = useRef(false)
   useEffect(() => {
     if (autoRun && initialStatement && !started.current) {
@@ -111,11 +156,24 @@ export function QueryPage({
         </div>
       </header>
       <div className="workbench">
-        <SchemaBrowser
-          onInsert={(t) =>
-            setSql((s) => `${s}${s && !/\s$/.test(s) ? ' ' : ''}${t}`)
-          }
-        />
+        <div className="workbench-side">
+          <SchemaBrowser
+            onInsert={(t) =>
+              setSql((s) => `${s}${s && !/\s$/.test(s) ? ' ' : ''}${t}`)
+            }
+          />
+          <SavedQueries
+            items={saved}
+            error={savedError}
+            activeId={activeSaved?.id}
+            onLoad={(q) => {
+              setSql(q.statement)
+              setActiveSaved(q)
+              setShowSave(false)
+            }}
+            onDelete={removeSaved}
+          />
+        </div>
         <div className="workbench-main">
           <SqlEditor
             value={sql}
@@ -153,11 +211,31 @@ export function QueryPage({
                 {formatDuration(job?.durationMs ?? elapsed)}
               </span>
             ) : null}
+            <button
+              type="button"
+              onClick={() => {
+                setSaveError(null)
+                setShowSave((v) => !v)
+              }}
+              disabled={!sql.trim()}
+            >
+              {activeSaved ? 'Update saved…' : 'Save…'}
+            </button>
             <span className="run-hint">
               <kbd>⌘</kbd>
               <kbd>↵</kbd> to run
             </span>
           </div>
+          {showSave ? (
+            <SaveQueryForm
+              key={activeSaved?.id ?? 'new'}
+              active={activeSaved}
+              busy={saving}
+              error={saveError}
+              onSave={(n, d, asNew) => void save(n, d, asNew)}
+              onCancel={() => setShowSave(false)}
+            />
+          ) : null}
           {active ? (
             <div
               className="progress"

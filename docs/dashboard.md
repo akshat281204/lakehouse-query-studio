@@ -77,3 +77,17 @@ and it carries no data.
 Press Cmd/Ctrl+K (or click the key hint in the top bar) to jump to a page, open a
 dataset, preview its first rows (runs `SELECT * ... LIMIT 100` through the normal
 validated query path) or switch theme. Arrow keys move, Enter opens, Esc closes.
+
+## Saved queries and the dataset profile (phase 10)
+
+* **Saved queries.** The SQL workbench has *Save…* (becomes *Update saved…* once a saved query is
+  open; the form can also *Save as new*), a *Saved queries* list under the datasets (click a name to load
+  it, a second click on the × then *Delete* to remove it), and the palette lists them too.
+* **Dataset profile.** The dataset page's schema table gains *Min*, *Max* and *Nulls* columns and a
+  "N rows in M files" line, all from Parquet footers (no data scanned). A dash means no range is known
+  for that column (see `docs/catalog.md`); datasets uploaded before statistics existed show dashes
+  until they are uploaded again.
+
+![Saved queries in the SQL workbench](images/workbench-saved-queries.png)
+
+![Dataset profile from Parquet footers](images/dataset-profile.png)

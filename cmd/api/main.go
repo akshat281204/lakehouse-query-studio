@@ -50,6 +50,7 @@ func run() error {
 	var catalogStore catalog.Store
 	var ingestStore catalog.IngestStore
 	var queryStore catalog.QueryStore
+	var savedStore catalog.SavedQueryStore
 	if cfg.PostgresURL != "" {
 		db, err = sql.Open("pgx", cfg.PostgresURL)
 		if err != nil {
@@ -64,6 +65,7 @@ func run() error {
 				catalogStore = catalog.NewPostgresStore(db)
 				ingestStore = catalog.NewPostgresIngestStore(db)
 				queryStore = catalog.NewPostgresQueryStore(db)
+				savedStore = catalog.NewPostgresSavedQueryStore(db)
 			}
 			cancel()
 		}
@@ -104,6 +106,7 @@ func run() error {
 		Writer:  objects,
 
 		Queries:   queryStore,
+		Saved:     savedStore,
 		Validator: validator,
 		QueryLimits: api.QueryLimits{
 			MaxPageBytes:   cfg.Query.MaxPageBytes,

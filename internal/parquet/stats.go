@@ -161,3 +161,58 @@ func decodeMinMax(typ string, st chunkStats) (lo, hi decoded, ok bool) {
 	}
 	return lo, hi, true
 }
+
+// MergeStats combines the statistics of several files of one dataset. A column
+// keeps min/max (null count) only if every file supplies it; a column missing
+// from any file, or typed differently across files, is reported without
+// min/max so a reader never mistakes partial knowledge for a range.
+func MergeStats(files []*FileStats) *FileStats {
+	out := &FileStats{Columns: map[string]ColumnStats{}}
+	n := 0
+	for _, f := range files {
+		if f == nil {
+			continue
+		}
+		n++
+		out.NumRows += f.NumRows
+	}
+	if n == 0 {
+		return out
+	}
+	seen := map[string]int{}
+	for _, f := range files {
+		if f == nil {
+			continue
+		}
+		for name, c := range f.Columns {
+			cur, ok := out.Columns[name]
+			seen[name]++
+			if !ok {
+				out.Columns[name] = c
+				continue
+			}
+			if cur.Type != c.Type {
+				cur.HasMinMax, cur.HasNullCount = false, false
+				out.Columns[name] = cur
+				continue
+			}
+			cur.HasMinMax = cur.HasMinMax && c.HasMinMax
+			cur.HasNullCount = cur.HasNullCount && c.HasNullCount
+			if cur.HasMinMax {
+				cur.MinInt, cur.MaxInt = min(cur.MinInt, c.MinInt), max(cur.MaxInt, c.MaxInt)
+				cur.MinFloat, cur.MaxFloat = min(cur.MinFloat, c.MinFloat), max(cur.MaxFloat, c.MaxFloat)
+				cur.MinStr, cur.MaxStr = min(cur.MinStr, c.MinStr), max(cur.MaxStr, c.MaxStr)
+				cur.MinBool, cur.MaxBool = cur.MinBool && c.MinBool, cur.MaxBool || c.MaxBool
+			}
+			cur.NullCount += c.NullCount
+			out.Columns[name] = cur
+		}
+	}
+	for name, c := range out.Columns {
+		if seen[name] != n { // absent from some file: nothing is known about the whole
+			c.HasMinMax, c.HasNullCount = false, false
+			out.Columns[name] = c
+		}
+	}
+	return out
+}

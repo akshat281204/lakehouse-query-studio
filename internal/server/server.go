@@ -47,6 +47,9 @@ type Deps struct {
 	Validator   *query.Validator
 	QueryLimits api.QueryLimits
 
+	// Saved enables the saved-query endpoints (it also needs Validator).
+	Saved catalog.SavedQueryStore
+
 	// Metrics, when set, enables /metrics and request instrumentation.
 	Metrics *telemetry.Metrics
 }
@@ -99,7 +102,8 @@ func (s *Server) routes() http.Handler {
 	datasets := api.New(s.deps.Catalog, s.deps.Objects,
 		api.WithIngest(api.IngestDeps{Jobs: s.deps.Ingest, Objects: s.deps.Writer}),
 		api.WithQueries(api.QueryDeps{Store: s.deps.Queries, Validator: s.deps.Validator,
-			Objects: s.deps.Objects, Limits: s.deps.QueryLimits, Metrics: s.deps.Metrics}))
+			Objects: s.deps.Objects, Limits: s.deps.QueryLimits, Metrics: s.deps.Metrics}),
+		api.WithSavedQueries(api.SavedDeps{Store: s.deps.Saved, Validator: s.deps.Validator}))
 	mux.Handle("/api/v1/datasets", datasets)
 	mux.Handle("/api/v1/datasets/", datasets)
 	mux.Handle("/api/v1/ingestions", datasets)
@@ -107,6 +111,8 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("/api/v1/queries", datasets)
 	mux.Handle("/api/v1/queries/", datasets)
 	mux.Handle("/api/v1/stats", datasets)
+	mux.Handle("/api/v1/saved-queries", datasets)
+	mux.Handle("/api/v1/saved-queries/", datasets)
 	return mux
 }
 

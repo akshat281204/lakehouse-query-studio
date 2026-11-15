@@ -4,7 +4,7 @@ import { THEMES } from '../lib/theme'
 
 interface Command {
   id: string
-  group: 'Go to' | 'Datasets' | 'Theme'
+  group: 'Go to' | 'Saved queries' | 'Datasets' | 'Theme'
   label: string
   hint?: string
   run: () => void
@@ -15,6 +15,7 @@ interface Props {
   onClose: () => void
   onNavigate: (hash: string) => void
   onPreview: (datasetName: string) => void
+  onOpenSaved: (statement: string) => void
   onTheme: (id: string) => void
 }
 
@@ -32,11 +33,15 @@ export function CommandPalette({
   onClose,
   onNavigate,
   onPreview,
+  onOpenSaved,
   onTheme,
 }: Props) {
   const [q, setQ] = useState('')
   const [active, setActive] = useState(0)
   const [datasets, setDatasets] = useState<{ id: string; name: string }[]>([])
+  const [saved, setSaved] = useState<
+    { id: string; name: string; statement: string; description: string }[]
+  >([])
   const input = useRef<HTMLInputElement>(null)
   const list = useRef<HTMLUListElement>(null)
 
@@ -50,6 +55,10 @@ export function CommandPalette({
       .listDatasets({ limit: 100 })
       .then((r) => alive && setDatasets(r.datasets))
       .catch(() => alive && setDatasets([]))
+    api
+      .listSavedQueries()
+      .then((r) => alive && setSaved(r.savedQueries))
+      .catch(() => alive && setSaved([]))
     return () => {
       alive = false
     }
@@ -67,6 +76,13 @@ export function CommandPalette({
         label: p.label,
         hint: p.hint,
         run: done(() => onNavigate(p.hash)),
+      })),
+      ...saved.map<Command>((q) => ({
+        id: `s-${q.id}`,
+        group: 'Saved queries',
+        label: q.name,
+        hint: q.description || 'open in the editor',
+        run: done(() => onOpenSaved(q.statement)),
       })),
       ...datasets.flatMap<Command>((d) => [
         {
@@ -92,7 +108,7 @@ export function CommandPalette({
         run: done(() => onTheme(t.id)),
       })),
     ]
-  }, [datasets, onClose, onNavigate, onPreview, onTheme])
+  }, [datasets, saved, onClose, onNavigate, onPreview, onOpenSaved, onTheme])
 
   const shown = useMemo(() => {
     const needle = q.trim().toLowerCase()

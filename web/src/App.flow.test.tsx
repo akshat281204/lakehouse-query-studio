@@ -116,6 +116,8 @@ function fakeApi(
       truncated: false,
     })
   }
+  if (path === '/api/v1/saved-queries' && method === 'GET')
+    return json({ savedQueries: [], total: 0, offset: 0, limit: 0 })
   if (path === '/api/v1/ingestions') return json({ jobs: [] })
   if (path === '/api/v1/queries' && method === 'POST') {
     const { statement } = JSON.parse(String(init?.body)) as {

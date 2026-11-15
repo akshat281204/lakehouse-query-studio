@@ -246,3 +246,45 @@ export interface Summary {
 }
 
 export type StatsWindow = '1h' | '6h' | '24h' | '7d'
+
+export interface SavedQuery {
+  id: string
+  name: string
+  description: string
+  statement: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface SavedQueryInput {
+  name: string
+  description?: string
+  statement: string
+}
+
+export interface SavedQueryListResponse {
+  savedQueries: SavedQuery[]
+  total: number
+  offset: number
+  limit: number
+}
+
+export interface ProfileColumn {
+  name: string
+  type: string
+  nullable: boolean
+  isPartition: boolean
+  /** true only when every file supplied min/max for this column */
+  hasRange: boolean
+  min?: string
+  max?: string
+  nullCount?: number
+  truncated?: boolean
+}
+
+export interface DatasetProfile {
+  rows: number
+  files: number
+  columns: ProfileColumn[]
+  note?: string
+}

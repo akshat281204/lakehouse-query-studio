@@ -4,6 +4,19 @@ import { CommandPalette } from './CommandPalette'
 
 vi.mock('../api/client', () => ({
   api: {
+    listSavedQueries: vi.fn().mockResolvedValue({
+      savedQueries: [
+        {
+          id: 's1',
+          name: 'Revenue by region',
+          description: 'weekly',
+          statement: 'SELECT 1',
+        },
+      ],
+      total: 1,
+      offset: 0,
+      limit: 1,
+    }),
     listDatasets: vi.fn().mockResolvedValue({
       datasets: [{ id: 'd1', name: 'sales' }],
       offset: 0,
@@ -18,6 +31,7 @@ const setup = (open = true) => {
     onClose: vi.fn(),
     onNavigate: vi.fn(),
     onPreview: vi.fn(),
+    onOpenSaved: vi.fn(),
     onTheme: vi.fn(),
   }
   render(<CommandPalette open={open} {...h} />)
@@ -75,6 +89,17 @@ describe('CommandPalette', () => {
     fireEvent.change(box, { target: { value: 'zzzz' } })
     expect(screen.getByText(/nothing matches/i)).toBeTruthy()
     fireEvent.keyDown(box, { key: 'Escape' })
+    expect(h.onClose).toHaveBeenCalled()
+  })
+
+  it('opens a saved query in the editor without running it', async () => {
+    const h = setup()
+    await waitFor(() =>
+      screen.getByRole('option', { name: /revenue by region/i }),
+    )
+    fireEvent.click(screen.getByRole('option', { name: /revenue by region/i }))
+    expect(h.onOpenSaved).toHaveBeenCalledWith('SELECT 1')
+    expect(h.onPreview).not.toHaveBeenCalled()
     expect(h.onClose).toHaveBeenCalled()
   })
 })

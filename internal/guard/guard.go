@@ -126,7 +126,7 @@ func Middleware(cfg Config, next http.Handler) http.Handler {
 				return
 			}
 			h := w.Header()
-			h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			h.Set("Access-Control-Allow-Headers", "Content-Type, "+CSRFHeader+", Authorization")
 			h.Set("Access-Control-Max-Age", "600")
 			w.WriteHeader(http.StatusNoContent)

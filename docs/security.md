@@ -66,6 +66,15 @@ rather than IAM policy JSON).
 Per-query STS credentials (design §7.4/§8) are not implemented; DuckDB itself
 never holds a credential (it reads staged local files).
 
+## Saved queries
+
+Saved statements are stored verbatim in PostgreSQL (`saved_queries`). They pass the SQL validator
+when saved and again whenever they are run, so a stored statement carries no more authority than a
+typed one; saving executes nothing, and statement text is not logged. The list is a single-operator
+library like the rest of the tool (no per-user ownership). Mutating routes need the CSRF header
+like every other POST, and the CORS preflight now also allows `PUT` and `DELETE` for the exact
+allowed origins.
+
 ## Metrics (`internal/telemetry`, `/metrics`)
 Hand-written Prometheus text exposition. **Every label value comes from a
 closed set declared with the metric; anything else is recorded as `other`.**

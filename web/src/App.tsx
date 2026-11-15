@@ -121,7 +121,11 @@ function SystemStatus() {
 export default function App() {
   const [route, setRoute] = useState<Route>(parseRoute)
   // A statement handed from History to the workbench (kept in memory only).
-  const [rerun, setRerun] = useState<{ sql: string; n: number } | null>(null)
+  const [rerun, setRerun] = useState<{
+    sql: string
+    n: number
+    run: boolean
+  } | null>(null)
   const [palette, setPalette] = useState(false)
 
   useEffect(() => {
@@ -161,7 +165,7 @@ export default function App() {
         <QueryPage
           key={rerun?.n ?? 0}
           initialStatement={rerun?.sql}
-          autoRun={rerun !== null}
+          autoRun={rerun?.run ?? false}
         />
       )
       break
@@ -169,7 +173,7 @@ export default function App() {
       page = (
         <HistoryPage
           onRerun={(sql) => {
-            setRerun((r) => ({ sql, n: (r?.n ?? 0) + 1 }))
+            setRerun((r) => ({ sql, n: (r?.n ?? 0) + 1, run: true }))
             go('#/query')
           }}
         />
@@ -190,7 +194,12 @@ export default function App() {
           setRerun((r) => ({
             sql: `SELECT * FROM "${name.replace(/"/g, '""')}" LIMIT 100`,
             n: (r?.n ?? 0) + 1,
+            run: true,
           }))
+          go('#/query')
+        }}
+        onOpenSaved={(sql) => {
+          setRerun((r) => ({ sql, n: (r?.n ?? 0) + 1, run: false }))
           go('#/query')
         }}
         onTheme={(id) => {

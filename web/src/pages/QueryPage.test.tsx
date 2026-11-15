@@ -15,6 +15,10 @@ vi.mock('../api/client', async (importOriginal) => {
       getQuery: vi.fn(),
       cancelQuery: vi.fn(),
       getQueryResults: vi.fn(),
+      listSavedQueries: vi.fn(),
+      createSavedQuery: vi.fn(),
+      updateSavedQuery: vi.fn(),
+      deleteSavedQuery: vi.fn(),
       queryExportUrl: (id: string) => `/api/v1/queries/${id}/export`,
     },
   }
@@ -57,6 +61,12 @@ beforeEach(() => {
     offset: 0,
     limit: 100,
     total: 0,
+  })
+  m.listSavedQueries.mockResolvedValue({
+    savedQueries: [],
+    total: 0,
+    offset: 0,
+    limit: 0,
   })
   m.queryExportUrl = ((id: string) =>
     `/api/v1/queries/${id}/export`) as typeof m.queryExportUrl
@@ -366,5 +376,109 @@ describe('QueryPage', () => {
     await waitFor(() =>
       expect(screen.getByRole('alert')).toHaveTextContent('catalog down'),
     )
+  })
+
+  describe('saved queries', () => {
+    const saved = (id: string, name: string, statement: string) => ({
+      id,
+      name,
+      description: '',
+      statement,
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z',
+    })
+    const list = (...items: ReturnType<typeof saved>[]) => ({
+      savedQueries: items,
+      total: items.length,
+      offset: 0,
+      limit: items.length,
+    })
+
+    it('saves the editor statement under a name and refreshes the list', async () => {
+      const created = saved('s1', 'Revenue', 'SELECT 7')
+      m.createSavedQuery.mockResolvedValue(created)
+      m.listSavedQueries
+        .mockResolvedValueOnce(list())
+        .mockResolvedValue(list(created))
+      render(<QueryPage pollMs={5} />)
+      fireEvent.change(screen.getByLabelText('SQL statement'), {
+        target: { value: 'SELECT 7' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Save…' }))
+      fireEvent.change(screen.getByLabelText(/^Name/), {
+        target: { value: 'Revenue' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+      await waitFor(() =>
+        expect(m.createSavedQuery).toHaveBeenCalledWith({
+          name: 'Revenue',
+          description: '',
+          statement: 'SELECT 7',
+        }),
+      )
+      expect(
+        await screen.findByRole('button', { name: 'Revenue' }),
+      ).toBeInTheDocument()
+      expect(
+        screen.getByRole('button', { name: 'Update saved…' }),
+      ).toBeInTheDocument()
+    })
+
+    it('loads a saved query into the editor and updates it in place', async () => {
+      const a = saved('s1', 'Revenue', 'SELECT 1')
+      m.listSavedQueries.mockResolvedValue(list(a))
+      m.updateSavedQuery.mockResolvedValue({ ...a, statement: 'SELECT 2' })
+      render(<QueryPage pollMs={5} />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Revenue' }))
+      expect(screen.getByLabelText('SQL statement')).toHaveValue('SELECT 1')
+      fireEvent.change(screen.getByLabelText('SQL statement'), {
+        target: { value: 'SELECT 2' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Update saved…' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Update' }))
+      await waitFor(() =>
+        expect(m.updateSavedQuery).toHaveBeenCalledWith('s1', {
+          name: 'Revenue',
+          description: '',
+          statement: 'SELECT 2',
+        }),
+      )
+      expect(m.createSavedQuery).not.toHaveBeenCalled()
+    })
+
+    it('shows the server message when the name is taken', async () => {
+      const { ApiError } = await import('../api/client')
+      m.createSavedQuery.mockRejectedValue(
+        new ApiError(
+          409,
+          'already_exists',
+          'a saved query with this name exists',
+        ),
+      )
+      render(<QueryPage pollMs={5} />)
+      fireEvent.click(screen.getByRole('button', { name: 'Save…' }))
+      fireEvent.change(screen.getByLabelText(/^Name/), {
+        target: { value: 'Dup' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+      expect(await screen.findByRole('alert')).toHaveTextContent('name exists')
+    })
+
+    it('deletes after confirmation and drops it from the list', async () => {
+      const a = saved('s1', 'Revenue', 'SELECT 1')
+      m.listSavedQueries
+        .mockResolvedValueOnce(list(a))
+        .mockResolvedValue(list())
+      m.deleteSavedQuery.mockResolvedValue(undefined)
+      render(<QueryPage pollMs={5} />)
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'Delete Revenue' }),
+      )
+      fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+      await waitFor(() => expect(m.deleteSavedQuery).toHaveBeenCalledWith('s1'))
+      await waitFor(() =>
+        expect(screen.queryByRole('button', { name: 'Revenue' })).toBeNull(),
+      )
+    })
   })
 })

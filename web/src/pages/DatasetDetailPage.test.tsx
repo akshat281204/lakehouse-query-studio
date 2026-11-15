@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { DatasetDetailPage } from './DatasetDetailPage'
 import { api, ApiError } from '../api/client'
@@ -10,6 +10,7 @@ vi.mock('../api/client', async (importOriginal) => {
     api: {
       getDataset: vi.fn(),
       getDatasetPreview: vi.fn(),
+      getDatasetProfile: vi.fn(),
     },
   }
 })
@@ -48,6 +49,15 @@ const detail = {
   ],
 }
 
+beforeEach(() => {
+  vi.resetAllMocks()
+  mockedApi.getDatasetProfile.mockResolvedValue({
+    rows: 0,
+    files: 0,
+    columns: [],
+  })
+})
+
 describe('DatasetDetailPage', () => {
   it('shows an error state when the detail request fails', async () => {
     mockedApi.getDataset.mockRejectedValue(
@@ -80,5 +90,79 @@ describe('DatasetDetailPage', () => {
     expect(screen.getAllByText('int64').length).toBeGreaterThan(0)
     // The column name appears in both the schema table and the preview header.
     expect(screen.getAllByText('id').length).toBeGreaterThan(0)
+  })
+
+  it('shows min, max and null counts from the profile, and a dash where there is no range', async () => {
+    mockedApi.getDataset.mockResolvedValue({
+      ...detail,
+      schema: [
+        ...detail.schema,
+        {
+          position: 1,
+          name: 'blob',
+          type: 'binary',
+          nullable: true,
+          isPartition: false,
+        },
+      ],
+    })
+    mockedApi.getDatasetPreview.mockResolvedValue({
+      columns: detail.schema,
+      rows: [{ id: 1 }],
+      truncated: false,
+    })
+    mockedApi.getDatasetProfile.mockResolvedValue({
+      rows: 2000,
+      files: 3,
+      note: '1 column(s) have no range: their type is not summarised',
+      columns: [
+        {
+          name: 'id',
+          type: 'int64',
+          nullable: false,
+          isPartition: false,
+          hasRange: true,
+          min: '-3',
+          max: '9007199254740993',
+          nullCount: 0,
+        },
+        {
+          name: 'blob',
+          type: 'binary',
+          nullable: true,
+          isPartition: false,
+          hasRange: false,
+        },
+      ],
+    })
+    render(<DatasetDetailPage id="d1" onBack={() => {}} />)
+    expect(await screen.findByTestId('profile-summary')).toHaveTextContent(
+      '2,000 rows in 3 files',
+    )
+    expect(screen.getByText('-3')).toBeInTheDocument()
+    // a 64-bit extreme is shown exactly, not rounded through a JS number
+    expect(screen.getByText('9007199254740993')).toBeInTheDocument()
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(3) // blob min, max, nulls
+    expect(screen.getByText(/have no range/)).toBeInTheDocument()
+  })
+
+  it('still shows the schema when the profile cannot be loaded', async () => {
+    mockedApi.getDataset.mockResolvedValue(detail)
+    mockedApi.getDatasetPreview.mockResolvedValue({
+      columns: detail.schema,
+      rows: [{ id: 1 }],
+      truncated: false,
+    })
+    mockedApi.getDatasetProfile.mockRejectedValue(
+      new ApiError(503, 'unavailable', 'object store down'),
+    )
+    render(<DatasetDetailPage id="d1" onBack={() => {}} />)
+    expect(
+      await screen.findByText(
+        /column statistics unavailable: object store down/i,
+      ),
+    ).toBeInTheDocument()
+    expect(screen.getAllByText('int64').length).toBeGreaterThan(0)
+    expect(screen.queryByText('Min')).toBeNull()
   })
 })

@@ -30,6 +30,19 @@ Errors use the §11 envelope. `query_denied` is `400`, `invalid_state` `409`,
 `result_expired` `410`, `resource_exhausted` `429`. Messages never echo the
 statement.
 
+## Saved queries (phase 10)
+
+A small library of named, reusable statements: `POST|GET /api/v1/saved-queries`,
+`GET|PUT|DELETE /api/v1/saved-queries/{id}`. A name is 1-120 characters and unique ignoring case
+(409 `already_exists`); a description is at most 500; at most 500 saved queries exist (the cap is
+enforced under an advisory lock, because a count check alone races under READ COMMITTED; a
+concurrency test covers it). The statement must pass **the same validator as a submitted
+query**, so the library can never hold SQL the engine would refuse (`query_denied`, nothing is
+stored); it is validated again, like every statement, when it is run. Saving never runs anything
+and statement text is never logged. In the dashboard: *Save…* / *Update saved…* in the run bar,
+the *Saved queries* list under the datasets (click to load, a second click to delete), and the
+command palette (Cmd/Ctrl+K) opens one in the editor without running it.
+
 ## Start-up latency
 
 An idle worker does not wait out its poll interval: submitting a query (and creating an ingestion job)

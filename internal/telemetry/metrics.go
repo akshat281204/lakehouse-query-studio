@@ -20,11 +20,13 @@ var (
 	HTTPRoutes     = []string{
 		"unmatched", "GET /{$}", "GET /api/v1/info", "GET /healthz", "GET /readyz", "GET /metrics",
 		"POST /api/v1/datasets", "GET /api/v1/datasets", "GET /api/v1/datasets/{id}",
-		"GET /api/v1/datasets/{id}/schema", "GET /api/v1/datasets/{id}/preview",
+		"GET /api/v1/datasets/{id}/schema", "GET /api/v1/datasets/{id}/preview", "GET /api/v1/datasets/{id}/profile",
 		"POST /api/v1/ingestions/inspect", "POST /api/v1/ingestions", "GET /api/v1/ingestions",
 		"GET /api/v1/ingestions/{id}", "POST /api/v1/ingestions/{id}/retry",
 		"POST /api/v1/queries", "GET /api/v1/queries", "GET /api/v1/queries/{id}",
-		"POST /api/v1/queries/{id}/cancel", "GET /api/v1/stats", "GET /api/v1/queries/{id}/results", "GET /api/v1/queries/{id}/export",
+		"POST /api/v1/queries/{id}/cancel", "GET /api/v1/stats",
+		"POST /api/v1/saved-queries", "GET /api/v1/saved-queries", "GET /api/v1/saved-queries/{id}",
+		"PUT /api/v1/saved-queries/{id}", "DELETE /api/v1/saved-queries/{id}", "GET /api/v1/queries/{id}/results", "GET /api/v1/queries/{id}/export",
 	}
 )
 

@@ -68,6 +68,7 @@ Each row says how to check it.
 | Browser protection: Host allowlist, Origin/`Sec-Fetch-Site`, CSRF header, exact-origin CORS, optional bearer token | `go test ./internal/guard ./internal/server` · [`docs/security.md`](docs/security.md) |
 | Bounded-cardinality metrics, structured logs, opt-in Prometheus + Grafana | `go test ./internal/telemetry` · `docker compose --profile ops up -d` |
 | Dashboard: overview (KPIs, activity, latency, outcomes, failures, health), datasets, upload, SQL workbench with charts, history | `make web-test` · [`docs/dashboard.md`](docs/dashboard.md) |
+| Saved queries (validated, unique names, capped) and a per-column dataset profile read from Parquet footers | `go test ./internal/api ./internal/catalog ./internal/parquet` |
 | Reproducible benchmarks and failure-recovery tests | `make bench` · [`docs/evaluation.md`](docs/evaluation.md) |
 | Real S3 client (SigV4) against a real S3-compatible server | see "Verification" below |
 
@@ -173,9 +174,10 @@ All routes are under the browser-request guard (mutations need
 (`{ "error": { "code", "message", "details" } }`).
 
 - `GET /healthz`, `GET /readyz` (per-dependency: `postgres`, `objectstore`), `GET /metrics`, `GET /api/v1/info`
-- `POST|GET /api/v1/datasets`, `GET /api/v1/datasets/{id}[/schema|/preview]`
+- `POST|GET /api/v1/datasets`, `GET /api/v1/datasets/{id}[/schema|/preview|/profile]`
 - `POST /api/v1/ingestions/inspect`, `POST|GET /api/v1/ingestions`, `GET /api/v1/ingestions/{id}`, `POST /api/v1/ingestions/{id}/retry`
 - `POST|GET /api/v1/queries`, `GET /api/v1/queries/{id}` (`?waitMs=N` long-polls up to 5 s), `POST /api/v1/queries/{id}/cancel`, `GET /api/v1/queries/{id}/results`, `GET /api/v1/queries/{id}/export`
+- `POST|GET /api/v1/saved-queries`, `GET|PUT|DELETE /api/v1/saved-queries/{id}` — named, validated, reusable statements
 - `GET /api/v1/stats?window=1h|6h|24h|7d` — aggregates for the Overview, from the durable job records
 
 ## Verification

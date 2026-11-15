@@ -15,6 +15,10 @@ import type {
   ReadyResponse,
   SchemaResponse,
   ServiceInfo,
+  SavedQuery,
+  SavedQueryInput,
+  SavedQueryListResponse,
+  DatasetProfile,
 } from './types'
 
 /** An error carrying the API's stable error code and HTTP status. */
@@ -65,6 +69,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(res.status, code, message)
   }
 
+  if (res.status === 204) return undefined as T
   return (await res.json()) as T
 }
 
@@ -211,6 +216,35 @@ export const api = {
   /** Relative URL of the CSV download; the browser follows it directly. */
   queryExportUrl: (id: string) =>
     `${BASE_URL}/api/v1/queries/${encodeURIComponent(id)}/export`,
+
+  listSavedQueries: (limit = 200, offset = 0) =>
+    request<SavedQueryListResponse>(
+      `/api/v1/saved-queries?limit=${limit}&offset=${offset}`,
+    ),
+
+  createSavedQuery: (input: SavedQueryInput) =>
+    request<SavedQuery>('/api/v1/saved-queries', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }),
+
+  updateSavedQuery: (id: string, input: SavedQueryInput) =>
+    request<SavedQuery>(`/api/v1/saved-queries/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }),
+
+  deleteSavedQuery: (id: string) =>
+    request<void>(`/api/v1/saved-queries/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  getDatasetProfile: (id: string) =>
+    request<DatasetProfile>(
+      `/api/v1/datasets/${encodeURIComponent(id)}/profile`,
+    ),
 
   getStats: (window: StatsWindow = '24h') =>
     request<Summary>(`/api/v1/stats?window=${window}`),
