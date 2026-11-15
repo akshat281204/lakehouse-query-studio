@@ -11,6 +11,7 @@ import App from './App'
 import './index.css'
 import './themes.css'
 import './premium.css'
+import './workbench.css'
 import { applyTheme, loadTheme } from './lib/theme'
 
 applyTheme(loadTheme())

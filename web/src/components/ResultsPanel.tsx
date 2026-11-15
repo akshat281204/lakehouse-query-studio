@@ -6,15 +6,39 @@ import { Chart } from './Chart'
 
 const PAGE = 100
 
-const decimalFormat = new Intl.NumberFormat(undefined, {
-  maximumFractionDigits: 4,
-})
+const MAX_DECIMALS = 4
+const formatters = new Map<number, Intl.NumberFormat>()
+function formatterFor(decimals: number): Intl.NumberFormat {
+  let f = formatters.get(decimals)
+  if (!f) {
+    f = new Intl.NumberFormat(undefined, {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    })
+    formatters.set(decimals, f)
+  }
+  return f
+}
+
+/** Decimals needed to show every value on this page of a double column
+ * (capped), so a column lines up: 200.93, 57.15, 1,902.90. */
+function columnDecimals(rows: CellValue[][], col: number): number {
+  let max = 0
+  for (const r of rows) {
+    const v = r[col]
+    if (typeof v !== 'number' || !Number.isFinite(v)) continue
+    const fixed = Number(v.toFixed(MAX_DECIMALS)).toString()
+    const dot = fixed.indexOf('.')
+    if (dot >= 0) max = Math.max(max, fixed.length - dot - 1)
+  }
+  return max
+}
 
 /** Display form of a cell. Doubles are tidied (no float noise); integers and
  * text are shown exactly. The CSV export and the stored result are unchanged. */
-function displayCell(v: CellValue, type: string): string {
+function displayCell(v: CellValue, type: string, decimals: number): string {
   if (typeof v === 'number' && type === 'double') {
-    return decimalFormat.format(v)
+    return formatterFor(decimals).format(v)
   }
   return String(v)
 }
@@ -49,6 +73,10 @@ export function ResultsPanel({ job }: ResultsPanelProps) {
     void load(0)
   }, [load])
 
+  const decimals = res
+    ? res.columns.map((_, i) => columnDecimals(res.rows, i))
+    : []
+
   return (
     <section className="results" aria-label="Results">
       <div className="tabs" role="tablist">
@@ -77,26 +105,49 @@ export function ResultsPanel({ job }: ResultsPanelProps) {
 
       {res && tab === 'table' ? (
         <>
-          <p data-testid="result-summary">
-            {res.totalRows.toLocaleString()} row{res.totalRows === 1 ? '' : 's'}{' '}
-            × {res.columns.length} column
-            {res.columns.length === 1 ? '' : 's'}
-            {res.truncated ? ' (result truncated at the server limit)' : ''}
-          </p>
+          <div className="result-bar">
+            <p data-testid="result-summary" className="result-summary">
+              {res.totalRows.toLocaleString()} row
+              {res.totalRows === 1 ? '' : 's'} × {res.columns.length} column
+              {res.columns.length === 1 ? '' : 's'}
+              {res.truncated ? ' (result truncated at the server limit)' : ''}
+            </p>
+            <ul className="result-meta" aria-label="Run details">
+              {job.durationMs !== undefined ? (
+                <li>
+                  <b>{formatDuration(job.durationMs)}</b> run time
+                </li>
+              ) : null}
+              {job.bytesStaged ? (
+                <li>
+                  <b>{formatBytes(job.bytesStaged)}</b> read
+                </li>
+              ) : null}
+              {job.resultBytes ? (
+                <li>
+                  <b>{formatBytes(job.resultBytes)}</b> result
+                </li>
+              ) : null}
+            </ul>
+          </div>
           {res.totalRows === 0 ? (
             <p>The query returned no rows.</p>
           ) : (
-            <div className="table-scroll">
+            <div className="table-scroll result-grid">
               <table className="data-table">
                 <thead>
                   <tr>
+                    <th className="rownum" aria-label="Row number">
+                      #
+                    </th>
                     {res.columns.map((c, i) => (
                       <th
                         key={i}
                         title={c.type}
                         className={isNumericType(c.type) ? 'num' : undefined}
                       >
-                        {c.name}
+                        <span className="col-name">{c.name}</span>
+                        <span className="col-type">{c.type}</span>
                       </th>
                     ))}
                   </tr>
@@ -104,6 +155,7 @@ export function ResultsPanel({ job }: ResultsPanelProps) {
                 <tbody>
                   {res.rows.map((r, ri) => (
                     <tr key={ri}>
+                      <td className="rownum">{offset + ri + 1}</td>
                       {r.map((v, ci) => (
                         <td
                           key={ci}
@@ -117,7 +169,7 @@ export function ResultsPanel({ job }: ResultsPanelProps) {
                           {v === null ? (
                             <span className="muted">null</span>
                           ) : (
-                            displayCell(v, res.columns[ci].type)
+                            displayCell(v, res.columns[ci].type, decimals[ci])
                           )}
                         </td>
                       ))}

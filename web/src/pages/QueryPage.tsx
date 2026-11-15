@@ -143,8 +143,18 @@ export function QueryPage({
                 {formatDuration(job?.durationMs ?? elapsed)}
               </span>
             ) : null}
-            <span className="muted">Ctrl/⌘+Enter runs</span>
+            <span className="run-hint">
+              <kbd>⌘</kbd>
+              <kbd>↵</kbd> to run
+            </span>
           </div>
+          {active ? (
+            <div
+              className="progress"
+              role="progressbar"
+              aria-label="Query in progress"
+            />
+          ) : null}
 
           {error ? (
             <p className="error" role="alert">
@@ -157,7 +167,11 @@ export function QueryPage({
                 ? 'The query exceeded the execution timeout.'
                 : 'The query failed'}
               {job.failureReason ? ` (${job.failureReason})` : ''}
-              {job.errorSummary ? `: ${job.errorSummary}` : ''}
+              {job.errorSummary ? (
+                <>
+                  : <span className="err-detail">{job.errorSummary}</span>
+                </>
+              ) : null}
             </p>
           ) : null}
           {job?.status === 'CANCELLED' ? (

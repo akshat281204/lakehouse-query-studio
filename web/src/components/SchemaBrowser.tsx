@@ -65,7 +65,7 @@ export function SchemaBrowser({ onInsert }: SchemaBrowserProps) {
             <li key={d.id}>
               <button
                 type="button"
-                className="link-button"
+                className="link-button ds-name"
                 aria-expanded={!!state}
                 onClick={() => void toggle(d)}
               >
