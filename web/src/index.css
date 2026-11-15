@@ -10,51 +10,51 @@
   --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
     'Liberation Mono', monospace;
 
-  --bg: #f4f6fa;
-  --surface: #ffffff;
-  --surface-2: #f8fafc;
-  --surface-hover: #f1f5f9;
-  --border: #e2e8f0;
-  --border-strong: #cbd5e1;
-  --text: #0f172a;
-  --text-2: #475569;
-  --text-3: #64748b;
+  --bg: #eaefee;
+  --surface: #fbfcfb;
+  --surface-2: #f2f6f5;
+  --surface-hover: #e9f0ef;
+  --border: #d5dedc;
+  --border-strong: #b6c4c1;
+  --text: #0f2229;
+  --text-2: #3f565c;
+  --text-3: #5d7378;
 
-  --accent: #4f46e5;
-  --accent-hover: #4338ca;
-  --accent-soft: #eef2ff;
+  --accent: #0b7285;
+  --accent-hover: #095c6b;
+  --accent-soft: #dff0f2;
   --accent-text: #ffffff;
 
-  --ok: #15803d;
-  --ok-soft: #dcfce7;
-  --err: #b91c1c;
-  --err-soft: #fee2e2;
-  --warn: #b45309;
-  --warn-soft: #fef3c7;
-  --info: #1d4ed8;
-  --info-soft: #dbeafe;
+  --ok: #2b7a4b;
+  --ok-soft: #dcefe3;
+  --err: #b0342b;
+  --err-soft: #f7e0dd;
+  --warn: #9a6200;
+  --warn-soft: #f8ebcb;
+  --info: #0b7285;
+  --info-soft: #dff0f2;
 
-  --sidebar-bg: #0b1220;
-  --sidebar-text: #94a3b8;
-  --sidebar-text-strong: #f1f5f9;
-  --sidebar-active: rgba(129, 140, 248, 0.16);
-  --sidebar-border: rgba(148, 163, 184, 0.14);
+  --sidebar-bg: #0c2630;
+  --sidebar-text: #8fb0b6;
+  --sidebar-text-strong: #eef7f6;
+  --sidebar-active: rgba(94, 205, 214, 0.15);
+  --sidebar-border: rgba(143, 176, 182, 0.18);
 
-  --code-bg: #0f172a;
+  --code-bg: #0c2630;
   --code-text: #e2e8f0;
   --tok-keyword: #93c5fd;
   --tok-string: #86efac;
   --tok-number: #fcd34d;
   --tok-comment: #64748b;
 
-  --chart-1: #6366f1;
-  --chart-grid: #e2e8f0;
+  --chart-1: #0b7285;
+  --chart-grid: #d5dedc;
 
-  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-sm: none;
   --shadow-md: 0 4px 16px rgba(15, 23, 42, 0.08);
-  --radius: 12px;
-  --radius-sm: 8px;
-  --ring: 0 0 0 3px rgba(99, 102, 241, 0.28);
+  --radius: 6px;
+  --radius-sm: 4px;
+  --ring: 0 0 0 3px rgba(11, 114, 133, 0.3);
 
   font-family: var(--font-sans);
   font-size: 15px;
@@ -66,35 +66,35 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0a0f1a;
-    --surface: #111827;
-    --surface-2: #0f1623;
-    --surface-hover: #1a2334;
-    --border: #1f2a3d;
-    --border-strong: #2f3d57;
-    --text: #e5e9f0;
-    --text-2: #a3aec2;
-    --text-3: #7c889e;
+    --bg: #091a21;
+    --surface: #0f2630;
+    --surface-2: #0c2029;
+    --surface-hover: #153440;
+    --border: #1d3a46;
+    --border-strong: #2d5260;
+    --text: #e3eeee;
+    --text-2: #a2bcc0;
+    --text-3: #7f9ca1;
 
-    --accent: #818cf8;
-    --accent-hover: #a5b4fc;
-    --accent-soft: rgba(129, 140, 248, 0.14);
-    --accent-text: #0b1020;
+    --accent: #4cc3d1;
+    --accent-hover: #7ad6e0;
+    --accent-soft: rgba(76, 195, 209, 0.14);
+    --accent-text: #06222a;
 
-    --ok: #4ade80;
+    --ok: #5fcf8c;
     --ok-soft: rgba(74, 222, 128, 0.14);
     --err: #f87171;
     --err-soft: rgba(248, 113, 113, 0.14);
-    --warn: #fbbf24;
+    --warn: #e8b14a;
     --warn-soft: rgba(251, 191, 36, 0.14);
-    --info: #60a5fa;
-    --info-soft: rgba(96, 165, 250, 0.14);
+    --info: #4cc3d1;
+    --info-soft: rgba(76, 195, 209, 0.14);
 
-    --sidebar-bg: #070b14;
-    --code-bg: #0a101c;
-    --chart-1: #818cf8;
-    --chart-grid: #1f2a3d;
-    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --sidebar-bg: #061419;
+    --code-bg: #061419;
+    --chart-1: #4cc3d1;
+    --chart-grid: #1d3a46;
+    --shadow-sm: none;
     --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.45);
     color-scheme: dark;
   }
@@ -165,7 +165,8 @@ pre {
   width: 2.1rem;
   height: 2.1rem;
   border-radius: 10px;
-  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  background: #0b7285;
+  border-radius: 6px;
   color: #fff;
   flex: none;
 }
@@ -219,7 +220,7 @@ pre {
 }
 
 .top-nav a[aria-current='page'] svg {
-  color: #a5b4fc;
+  color: #7ad6e0;
 }
 
 .top-nav svg {
@@ -1613,4 +1614,105 @@ rect.bar-warn {
 
 .upload-form.card {
   max-width: 52rem;
+}
+
+/* ==========================================================================
+   Chart-room finish: flat, hairline-ruled surfaces; teal "deep water" palette.
+   Overrides only; tokens above carry the colour.
+   ========================================================================== */
+
+.page-header {
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.page-header h1 {
+  font-size: 1.9rem;
+  font-weight: 650;
+  letter-spacing: -0.025em;
+}
+
+.brand-mark {
+  width: 2rem;
+  height: 2rem;
+}
+
+.top-nav a[aria-current='page'] {
+  box-shadow: inset 2px 0 0 #5ecdd6;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+/* KPIs become one instrument strip instead of four separate cards */
+.kpi-grid {
+  gap: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.kpi {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 1.1rem 1.3rem 1.2rem;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  margin: -1px -1px 0 0;
+}
+
+.kpi::before {
+  left: 1.3rem;
+  right: auto;
+  top: 0;
+  bottom: auto;
+  width: 1.6rem;
+  height: 3px;
+  opacity: 1;
+}
+
+.kpi-label {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.85rem;
+  font-weight: 500;
+  margin-top: 0.35rem;
+}
+
+.kpi strong {
+  font-size: 2.15rem;
+  font-weight: 600;
+  letter-spacing: -0.04em;
+}
+
+.panel h3 {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.panel,
+.card,
+.results,
+.schema-browser,
+.chart {
+  border-radius: var(--radius);
+}
+
+.panel-head {
+  padding-bottom: 0.65rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.9rem;
+}
+
+.data-table th {
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.btn-primary,
+.button-link {
+  border-radius: var(--radius-sm);
 }
