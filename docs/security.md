@@ -66,6 +66,16 @@ rather than IAM policy JSON).
 Per-query STS credentials (design §7.4/§8) are not implemented; DuckDB itself
 never holds a credential (it reads staged local files).
 
+## Uploaded Parquet files
+
+An imported or appended Parquet file is untrusted input handled like registered data: the API and worker
+read only its footer (bounded at 8 MiB) with the in-repo parser and never decompress or decode row data to
+accept it; the bytes are stored unchanged and read later by DuckDB inside the sealed, read-only engine (no
+extensions, no access outside the query's staged files). A hostile file could still exercise a Parquet bug
+in DuckDB itself, the same exposure as registering someone else's Parquet; the tool is single-operator and
+loopback-bound. Validation errors never echo file content, and appends are refused before anything is stored
+when the schema does not match.
+
 ## Saved queries
 
 Saved statements are stored verbatim in PostgreSQL (`saved_queries`). They pass the SQL validator

@@ -91,3 +91,14 @@ validated query path) or switch theme. Arrow keys move, Enter opens, Esc closes.
 ![Saved queries in the SQL workbench](images/workbench-saved-queries.png)
 
 ![Dataset profile from Parquet footers](images/dataset-profile.png)
+
+## Parquet import and appending (phase 11)
+
+The Upload page accepts `.parquet` (imported as it is; no partitioning choice, since the file keeps its own
+layout) and asks where the data should go: **New dataset** (an existing name replaces its data as a new
+version; the page says so) or **Add to an existing dataset**. Choosing a dataset re-checks the file against
+its schema before anything is uploaded and shows either "Compatible: adds N rows to ... (currently M rows).
+Earlier versions stay as they are." or a list of exactly why it cannot be added; the button is disabled until
+it is compatible.
+
+![Checking a file against a dataset before appending](images/upload-append-check.png)

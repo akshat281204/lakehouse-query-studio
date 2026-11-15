@@ -42,8 +42,8 @@ func hiveFor(prefix string, parts []string) bool {
 
 func scanRelation(row rowScanner) (Relation, error) {
 	var r Relation
-	var parts []byte
-	if err := row.Scan(&r.DatasetName, &r.Version, &r.VersionID, &r.ObjectPrefix, &r.Format, &parts); err != nil {
+	var parts, segments []byte
+	if err := row.Scan(&r.DatasetName, &r.Version, &r.VersionID, &r.ObjectPrefix, &r.Format, &parts, &segments); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Relation{}, fmt.Errorf("%w: relation", ErrNotFound)
 		}
@@ -52,12 +52,15 @@ func scanRelation(row rowScanner) (Relation, error) {
 	if err := json.Unmarshal(parts, &r.PartitionColumns); err != nil {
 		return Relation{}, fmt.Errorf("decode partition columns: %w", err)
 	}
+	if err := json.Unmarshal(segments, &r.BaseSegments); err != nil {
+		return Relation{}, fmt.Errorf("decode base segments: %w", err)
+	}
 	r.HivePartitioned = hiveFor(r.ObjectPrefix, r.PartitionColumns)
 	return r, nil
 }
 
 const relationSelect = `
-	SELECT d.name, v.version, v.id, v.object_prefix, v.format, v.partition_columns
+	SELECT d.name, v.version, v.id, v.object_prefix, v.format, v.partition_columns, v.base_segments
 	FROM dataset_versions v JOIN datasets d ON d.id = v.dataset_id`
 
 func (s *postgresQueryStore) ResolveRelation(ctx context.Context, name string) (Relation, error) {

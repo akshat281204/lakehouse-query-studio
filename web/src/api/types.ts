@@ -112,6 +112,8 @@ export interface IngestionJob {
   kind: string
   status: IngestionStatus
   inputFormat: string
+  /** 'append' adds to the dataset's latest version; 'replace' publishes only the upload */
+  mode?: 'replace' | 'append'
   partitionColumns: string[]
   failureReason?: string
   errorSummary?: string
@@ -133,11 +135,22 @@ export interface InspectColumn {
   nullable: boolean
 }
 
+export interface AppendCheck {
+  dataset: string
+  compatible: boolean
+  issues: string[]
+  datasetRows?: number
+  latestVersion?: number
+}
+
 export interface InspectResponse {
   format: string
   columns: InspectColumn[]
   rowCount: number
   sample: Record<string, unknown>[]
+  note?: string
+  /** present when the request named a target dataset to append to */
+  append?: AppendCheck
 }
 
 export type QueryStatus =

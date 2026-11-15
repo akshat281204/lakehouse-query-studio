@@ -269,7 +269,7 @@ func (h *Handler) handlePreview(w http.ResponseWriter, r *http.Request) {
 		limit = 100
 	}
 
-	objects, err := catalog.ListParquetObjects(r.Context(), h.objects, v.ObjectPrefix)
+	objects, err := listVersionObjects(r.Context(), h.objects, v)
 	if err != nil {
 		writeMappedError(w, err)
 		return

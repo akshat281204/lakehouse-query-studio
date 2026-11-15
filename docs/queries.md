@@ -131,7 +131,7 @@ Known limits of this boundary:
 
 ## Execution and results
 
-* The worker lists the version's `object_prefix`, downloads each `.parquet`
+* The worker lists each prefix of the version (its own `object_prefix` and any appended base segments; segments are kept in separate `s<n>/` directories so equal file names cannot collide), downloads each `.parquet`
   object (bounded per query by `MAX_SCAN_BYTES`, default 1 GiB, and 10,000
   files) into a private `0700` scratch directory preserving relative keys, so
   hive partition directories survive. Registered partitioned data is read with

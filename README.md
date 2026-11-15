@@ -1,7 +1,7 @@
 # Lakehouse Query Studio
 
 A local-first analytical query workbench over S3-compatible object storage.
-Upload CSV/JSON/JSONL or register existing Parquet, then run **bounded,
+Upload CSV/JSON/JSONL or Parquet (imported as it is), add more data to a dataset you already have, or register existing Parquet, then run **bounded,
 read-only SQL** against it from a web dashboard. Queries are durable
 background jobs executed by **single-node DuckDB**.
 
@@ -61,7 +61,7 @@ Each row says how to check it.
 | Capability | Check it with |
 |---|---|
 | Register an existing Parquet prefix; browse schema and preview rows | `go test ./internal/catalog ./internal/api` |
-| Upload CSV/JSON/JSONL: type inference, optional hive partitioning, versioned Parquet, leased/fenced ingestion jobs with retry | `go test ./internal/ingest` · [`docs/ingestion.md`](docs/ingestion.md) |
+| Upload CSV/JSON/JSONL (type inference, optional hive partitioning) or **import a Parquet file unchanged**; **append** to an existing dataset (no data copied, schema-checked, safe against concurrent writers); versioned, leased/fenced ingestion jobs with retry | `go test ./internal/ingest ./internal/catalog ./internal/query` · [`docs/ingestion.md`](docs/ingestion.md) |
 | One read-only SQL statement over registered datasets, parsed by DuckDB's own parser against closed allowlists, run on a sealed read-only engine; escapes, local files, extensions and arbitrary paths denied | `go test ./internal/query` · [`docs/queries.md`](docs/queries.md) |
 | Durable async query jobs: submit, poll, cancel, timeout, crash recovery, no false terminal states | `go test ./test/faults` |
 | Paged results, bounded CSV export, expiring result spools | `go test ./internal/api ./internal/sweeper` |
@@ -104,7 +104,8 @@ Reproduce with `make bench` (`make bench-sf1` for the larger run).
   least-privilege object-store policies in `ops/minio-policies/` are not
   enforced by default (see [`docs/security.md`](docs/security.md)).
 * File pruning is conservative: it skips files only for simple single-table `AND` filters on `int`/`double`/`string`/`boolean` columns. There is no result cache and no index; any other query stages every file.
-* The Parquet writer supports boolean, int64, double and string, uncompressed.
+* The Parquet writer (CSV/JSON conversion) supports boolean, int64, double and string, uncompressed. A Parquet file you import is stored as it is, whatever its types or compression.
+* Appending does not change a dataset's schema: the new data must have the dataset's exact column names and types (a nullable column may be omitted; adding or retyping columns is not supported yet).
 * No performance claim here goes beyond the measured numbers above.
 
 ## Repository layout
@@ -175,7 +176,7 @@ All routes are under the browser-request guard (mutations need
 
 - `GET /healthz`, `GET /readyz` (per-dependency: `postgres`, `objectstore`), `GET /metrics`, `GET /api/v1/info`
 - `POST|GET /api/v1/datasets`, `GET /api/v1/datasets/{id}[/schema|/preview|/profile]`
-- `POST /api/v1/ingestions/inspect`, `POST|GET /api/v1/ingestions`, `GET /api/v1/ingestions/{id}`, `POST /api/v1/ingestions/{id}/retry`
+- `POST /api/v1/ingestions/inspect` (`?target=<dataset>` also checks the file against that dataset), `POST|GET /api/v1/ingestions` (`?format=csv|jsonl|json|parquet&mode=replace|append`), `GET /api/v1/ingestions/{id}`, `POST /api/v1/ingestions/{id}/retry`
 - `POST|GET /api/v1/queries`, `GET /api/v1/queries/{id}` (`?waitMs=N` long-polls up to 5 s), `POST /api/v1/queries/{id}/cancel`, `GET /api/v1/queries/{id}/results`, `GET /api/v1/queries/{id}/export`
 - `POST|GET /api/v1/saved-queries`, `GET|PUT|DELETE /api/v1/saved-queries/{id}` — named, validated, reusable statements
 - `GET /api/v1/stats?window=1h|6h|24h|7d` — aggregates for the Overview, from the durable job records

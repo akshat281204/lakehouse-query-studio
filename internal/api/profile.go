@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"unicode/utf8"
 
@@ -14,6 +15,9 @@ import (
 
 // maxProfileFiles bounds the footers read for one profile request. A dataset
 // with more files is profiled from its schema only.
+// summarisedTypes are the column types whose min/max the profile reports.
+var summarisedTypes = map[string]bool{"int32": true, "int64": true, "double": true, "string": true, "boolean": true}
+
 const (
 	maxProfileFiles   = 200
 	profileParallel   = 8
@@ -70,7 +74,7 @@ func (h *Handler) handleProfile(w http.ResponseWriter, r *http.Request) {
 		writeMappedError(w, err)
 		return
 	}
-	objs, err := catalog.ListParquetObjects(r.Context(), h.objects, v.ObjectPrefix)
+	objs, err := listVersionObjects(r.Context(), h.objects, v)
 	if err != nil {
 		writeMappedError(w, err)
 		return
@@ -102,10 +106,15 @@ func (h *Handler) handleProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	merged := parquet.MergeStats(stats)
 	resp.Rows = merged.NumRows
-	missing := 0
+	var unsupported, noStats int
 	for i := range resp.Columns {
 		cs, ok := merged.Columns[resp.Columns[i].Name]
-		if !ok {
+		if !ok { // listed in the schema but in no file's footer: nothing is known
+			if !summarisedTypes[resp.Columns[i].Type] {
+				unsupported++
+			} else {
+				noStats++
+			}
 			continue
 		}
 		if cs.HasNullCount {
@@ -115,13 +124,20 @@ func (h *Handler) handleProfile(w http.ResponseWriter, r *http.Request) {
 		if cs.HasMinMax {
 			lo, hi, cut := renderRange(cs)
 			resp.Columns[i].HasRange, resp.Columns[i].Min, resp.Columns[i].Max, resp.Columns[i].Truncated = true, &lo, &hi, cut
+		} else if !summarisedTypes[cs.Type] {
+			unsupported++
 		} else {
-			missing++
+			noStats++
 		}
 	}
-	if missing > 0 {
-		resp.Note = strconv.Itoa(missing) + " column(s) have no range: their type is not summarised, or the files carry no statistics for them (files written before statistics were added have none; uploading the data again adds them)"
+	var notes []string
+	if unsupported > 0 {
+		notes = append(notes, strconv.Itoa(unsupported)+" column(s) have a type whose range is not summarised (only integers, doubles, strings and booleans are)")
 	}
+	if noStats > 0 {
+		notes = append(notes, strconv.Itoa(noStats)+" column(s) have no range because some files carry no statistics for them (files written before statistics were added have none; uploading the data again adds them)")
+	}
+	resp.Note = strings.Join(notes, "; ")
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -172,4 +188,17 @@ func clipText(s string) (string, bool) {
 	}
 	r := []rune(s)
 	return string(r[:maxProfileTextLen]), true
+}
+
+// listVersionObjects lists the Parquet files of every segment of a version.
+func listVersionObjects(ctx context.Context, store objectstore.Store, v catalog.DatasetVersion) ([]objectstore.Object, error) {
+	var all []objectstore.Object
+	for _, prefix := range v.Prefixes() {
+		objs, err := catalog.ListParquetObjects(ctx, store, prefix)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, objs...)
+	}
+	return all, nil
 }

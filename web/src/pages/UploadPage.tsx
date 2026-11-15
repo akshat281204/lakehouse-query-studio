@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
 import { api, ApiError } from '../api/client'
-import type { IngestionJob, InspectResponse } from '../api/types'
+import type {
+  DatasetListItem,
+  IngestionJob,
+  InspectResponse,
+} from '../api/types'
 
 interface UploadPageProps {
   onOpenDataset: (id: string) => void
@@ -37,6 +41,9 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
   const [job, setJob] = useState<IngestionJob | null>(null)
   const [pollError, setPollError] = useState<string | null>(null)
   const [retrying, setRetrying] = useState(false)
+  const [destination, setDestination] = useState<'new' | 'append'>('new')
+  const [target, setTarget] = useState('')
+  const [datasets, setDatasets] = useState<DatasetListItem[]>([])
   const jobId = job?.id
   const jobStatus = job?.status
   const timer = useRef<number | undefined>(undefined)
@@ -51,6 +58,16 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
     }
   }, [])
 
+  // Datasets a file can be added to (those with a READY version).
+  useEffect(() => {
+    api
+      .listDatasets({ limit: 100 })
+      .then((r) =>
+        setDatasets(r.datasets.filter((d) => d.versionStatus === 'READY')),
+      )
+      .catch(() => setDatasets([]))
+  }, [])
+
   // Poll until the job is terminal. A failed poll keeps retrying; it never
   // changes the displayed job state, so a network blip cannot fake a result.
   useEffect(() => {
@@ -58,6 +75,19 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
     timer.current = window.setTimeout(() => void poll(jobId), pollMs)
     return () => window.clearTimeout(timer.current)
   }, [jobId, jobStatus, job, poll, pollMs])
+
+  const runInspect = async (f: File, appendTo?: string) => {
+    setInspecting(true)
+    setInspectError(null)
+    try {
+      setInspect(await api.inspectUpload(f, appendTo))
+    } catch (err) {
+      setInspect(null)
+      setInspectError(errorText(err))
+    } finally {
+      setInspecting(false)
+    }
+  }
 
   const handleFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const picked = event.target.files?.[0] ?? null
@@ -69,14 +99,23 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
     setFormError(null)
     if (!picked) return
     setName(suggestName(picked.name))
-    setInspecting(true)
-    try {
-      setInspect(await api.inspectUpload(picked))
-    } catch (err) {
-      setInspectError(errorText(err))
-    } finally {
-      setInspecting(false)
-    }
+    await runInspect(
+      picked,
+      destination === 'append' && target ? target : undefined,
+    )
+  }
+
+  // Switching destination or target re-checks the same file against the dataset.
+  const chooseDestination = (next: 'new' | 'append') => {
+    setDestination(next)
+    setFormError(null)
+    if (file)
+      void runInspect(file, next === 'append' && target ? target : undefined)
+  }
+  const chooseTarget = (next: string) => {
+    setTarget(next)
+    setFormError(null)
+    if (file) void runInspect(file, next || undefined)
   }
 
   const togglePartition = (col: string) =>
@@ -92,9 +131,10 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
     try {
       setJob(
         await api.uploadDataset(file, {
-          name,
-          partitionColumns: partitions,
-          retainOriginal: retain,
+          name: appending ? target : name,
+          mode: appending ? 'append' : undefined,
+          partitionColumns: isParquet || appending ? undefined : partitions,
+          retainOriginal: appending ? undefined : retain,
         }),
       )
     } catch (err) {
@@ -118,6 +158,14 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
   }
 
   const busy = job !== null && !TERMINAL.has(job.status)
+  const isParquet =
+    inspect?.format === 'parquet' || /\.parquet$/i.test(file?.name ?? '')
+  const appending = destination === 'append'
+  const showPartitions = !isParquet && !appending
+  const verdict = appending ? inspect?.append : undefined
+  const canSubmit = appending
+    ? Boolean(target) && verdict?.compatible === true
+    : Boolean(name)
 
   return (
     <main className="page">
@@ -125,22 +173,91 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
         <div>
           <h1>Upload data</h1>
           <p>
-            Convert a CSV, JSON, or JSONL file into a versioned Parquet dataset.
+            Load a CSV, JSON, JSONL or Parquet file into a new dataset, or add
+            it to one you already have.
           </p>
         </div>
       </header>
 
       <form className="upload-form card" onSubmit={handleSubmit}>
         <label className="field">
-          <span>File (.csv, .json, .jsonl)</span>
+          <span>File (.csv, .json, .jsonl, .parquet)</span>
           <input
             type="file"
             aria-label="Data file"
-            accept=".csv,.json,.jsonl,.ndjson"
+            accept=".csv,.json,.jsonl,.ndjson,.parquet"
             onChange={(e) => void handleFile(e)}
             disabled={busy}
           />
         </label>
+
+        <fieldset className="destination" disabled={busy}>
+          <legend>Where should the data go?</legend>
+          <label className="inline-field">
+            <input
+              type="radio"
+              name="destination"
+              checked={!appending}
+              onChange={() => chooseDestination('new')}
+            />
+            New dataset
+          </label>
+          <label className="inline-field">
+            <input
+              type="radio"
+              name="destination"
+              checked={appending}
+              onChange={() => chooseDestination('append')}
+            />
+            Add to an existing dataset
+          </label>
+          {appending ? (
+            <select
+              aria-label="Existing dataset"
+              value={target}
+              onChange={(e) => chooseTarget(e.target.value)}
+            >
+              <option value="">Choose a dataset…</option>
+              {datasets.map((d) => (
+                <option key={d.id} value={d.name}>
+                  {d.name}
+                </option>
+              ))}
+            </select>
+          ) : null}
+        </fieldset>
+
+        {inspect && appending ? (
+          <>
+            {appending && target && verdict ? (
+              verdict.compatible ? (
+                <p className="verdict verdict-ok" role="status">
+                  Compatible: adds{' '}
+                  <strong>{inspect.rowCount.toLocaleString()}</strong> rows to{' '}
+                  <strong>{verdict.dataset}</strong>
+                  {verdict.datasetRows !== undefined
+                    ? ` (currently ${verdict.datasetRows.toLocaleString()} rows)`
+                    : ''}
+                  . Earlier versions stay as they are.
+                </p>
+              ) : (
+                <div className="verdict verdict-bad" role="alert">
+                  <strong>
+                    This file cannot be added to {verdict.dataset}:
+                  </strong>
+                  <ul>
+                    {verdict.issues.map((i) => (
+                      <li key={i}>{i}</li>
+                    ))}
+                  </ul>
+                </div>
+              )
+            ) : null}
+            {appending && !target ? (
+              <p className="note">Choose the dataset to add this file to.</p>
+            ) : null}
+          </>
+        ) : null}
 
         {inspecting ? <p className="note">Inspecting file…</p> : null}
         {inspectError ? (
@@ -154,16 +271,24 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
             <section aria-label="Inferred schema">
               <h2>Inferred schema</h2>
               <p className="note">
-                {inspect.rowCount} row{inspect.rowCount === 1 ? '' : 's'}, first{' '}
-                {inspect.sample.length} shown. Empty values become nulls.
+                {inspect.rowCount.toLocaleString()} row
+                {inspect.rowCount === 1 ? '' : 's'}
+                {inspect.sample.length > 0
+                  ? `, first ${inspect.sample.length} shown`
+                  : ''}
+                .{' '}
+                {isParquet
+                  ? 'A Parquet file is imported exactly as it is; it is not converted.'
+                  : 'Empty values become nulls.'}
               </p>
+              {inspect.note ? <p className="note">{inspect.note}</p> : null}
               <table className="data-table">
                 <thead>
                   <tr>
                     <th>Column</th>
                     <th>Type</th>
                     <th>Nullable</th>
-                    <th>Partition by</th>
+                    {showPartitions ? <th>Partition by</th> : null}
                   </tr>
                 </thead>
                 <tbody>
@@ -172,24 +297,28 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
                       <td>{c.name}</td>
                       <td>{c.type}</td>
                       <td>{c.nullable ? 'yes' : 'no'}</td>
-                      <td>
-                        <input
-                          type="checkbox"
-                          aria-label={`Partition by ${c.name}`}
-                          checked={partitions.includes(c.name)}
-                          disabled={c.type === 'double' || busy}
-                          onChange={() => togglePartition(c.name)}
-                        />
-                      </td>
+                      {showPartitions ? (
+                        <td>
+                          <input
+                            type="checkbox"
+                            aria-label={`Partition by ${c.name}`}
+                            checked={partitions.includes(c.name)}
+                            disabled={c.type === 'double' || busy}
+                            onChange={() => togglePartition(c.name)}
+                          />
+                        </td>
+                      ) : null}
                     </tr>
                   ))}
                 </tbody>
               </table>
-              <p className="note">
-                Partitioning is off by default. Choose only low-cardinality
-                columns: each distinct value becomes its own directory of small
-                files.
-              </p>
+              {showPartitions ? (
+                <p className="note">
+                  Partitioning is off by default. Choose only low-cardinality
+                  columns: each distinct value becomes its own directory of
+                  small files.
+                </p>
+              ) : null}
             </section>
 
             <section aria-label="Sample rows">
@@ -219,28 +348,40 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
             </section>
 
             <div className="register-form">
-              <input
-                aria-label="Dataset name"
-                placeholder="dataset name (lowercase a-z, 0-9, -)"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                disabled={busy}
-              />
-              <label className="inline-field">
+              {appending ? null : (
                 <input
-                  type="checkbox"
-                  checked={retain}
-                  onChange={(e) => setRetain(e.target.checked)}
+                  aria-label="Dataset name"
+                  placeholder="dataset name (lowercase a-z, 0-9, -)"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
                   disabled={busy}
                 />
-                Keep the original upload
-              </label>
-              <button type="submit" disabled={submitting || busy || !name}>
-                {submitting ? 'Uploading…' : 'Upload and convert'}
+              )}
+              {appending ? null : (
+                <label className="inline-field">
+                  <input
+                    type="checkbox"
+                    checked={retain}
+                    onChange={(e) => setRetain(e.target.checked)}
+                    disabled={busy}
+                  />
+                  Keep the original upload
+                </label>
+              )}
+              <button type="submit" disabled={submitting || busy || !canSubmit}>
+                {submitting
+                  ? 'Uploading…'
+                  : appending
+                    ? `Add to ${target || 'dataset'}`
+                    : isParquet
+                      ? 'Import Parquet'
+                      : 'Upload and convert'}
               </button>
             </div>
             <p className="note">
-              Uploading to an existing dataset name creates a new version.
+              {appending
+                ? 'The new rows are added as a new version of the dataset; nothing is copied or rewritten.'
+                : 'Using the name of an existing dataset replaces its data with this file as a new version. To keep the existing rows, choose "Add to an existing dataset".'}
             </p>
           </>
         ) : null}
@@ -259,6 +400,7 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
             <span className={`status status-${job.status.toLowerCase()}`}>
               {job.status}
             </span>{' '}
+            {job.mode === 'append' ? 'Appending to ' : ''}
             <strong>{job.datasetName}</strong> version {job.version}
             {job.attempt > 1 ? ` (attempt ${job.attempt})` : ''}
           </p>
@@ -266,7 +408,11 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
             <p className="note">Waiting for a worker…</p>
           ) : null}
           {job.status === 'RUNNING' ? (
-            <p className="note">Converting to Parquet…</p>
+            <p className="note">
+              {job.inputFormat === 'parquet'
+                ? 'Importing the Parquet file…'
+                : 'Converting to Parquet…'}
+            </p>
           ) : null}
           {job.status === 'SUCCEEDED' ? (
             <p>

@@ -56,10 +56,13 @@ type Dataset struct {
 
 // DatasetVersion is an immutable versioned snapshot of a dataset.
 type DatasetVersion struct {
-	ID               string    `json:"id"`
-	DatasetID        string    `json:"datasetId"`
-	Version          int       `json:"version"`
-	ObjectPrefix     string    `json:"objectPrefix"`
+	ID           string `json:"id"`
+	DatasetID    string `json:"datasetId"`
+	Version      int    `json:"version"`
+	ObjectPrefix string `json:"objectPrefix"`
+	// BaseSegments are the prefixes of earlier data this version includes (oldest
+	// first) in addition to ObjectPrefix; non-empty only for appended versions.
+	BaseSegments     []string  `json:"baseSegments,omitempty"`
 	Format           string    `json:"format"`
 	PartitionColumns []string  `json:"partitionColumns"`
 	Status           string    `json:"status"`
@@ -77,4 +80,12 @@ type SchemaColumn struct {
 	Type        string `json:"type"`
 	Nullable    bool   `json:"nullable"`
 	IsPartition bool   `json:"isPartition"`
+}
+
+// Prefixes returns every object prefix holding this version's files, oldest
+// segment first and the version's own prefix last.
+func (v DatasetVersion) Prefixes() []string {
+	out := make([]string, 0, len(v.BaseSegments)+1)
+	out = append(out, v.BaseSegments...)
+	return append(out, v.ObjectPrefix)
 }

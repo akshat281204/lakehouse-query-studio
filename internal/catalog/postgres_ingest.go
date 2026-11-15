@@ -17,7 +17,8 @@ const jobSelect = `
 	       COALESCE(j.input_ref, ''), COALESCE(j.input_format, ''), j.partition_columns,
 	       COALESCE(j.failure_reason, ''), COALESCE(j.error_summary, ''), j.retryable,
 	       COALESCE(j.retry_of::text, ''), j.attempt, COALESCE(j.fencing_token::text, ''),
-	       j.created_at, j.started_at, j.finished_at, d.retain_original
+	       j.created_at, j.started_at, j.finished_at, d.retain_original,
+	       j.mode, COALESCE(j.base_version_id::text, '')
 	FROM ingestion_jobs j
 	JOIN datasets d ON d.id = j.dataset_id
 	JOIN dataset_versions v ON v.id = j.target_version_id`
@@ -28,7 +29,8 @@ func scanJob(row rowScanner) (Job, error) {
 	var started, finished sql.NullTime
 	if err := row.Scan(&j.ID, &j.DatasetID, &j.DatasetName, &j.VersionID, &j.Version, &j.Kind, &j.Status,
 		&j.InputRef, &j.InputFormat, &parts, &j.FailureReason, &j.ErrorSummary, &j.Retryable,
-		&j.RetryOf, &j.Attempt, &j.FencingToken, &j.CreatedAt, &started, &finished, &j.RetainOriginal); err != nil {
+		&j.RetryOf, &j.Attempt, &j.FencingToken, &j.CreatedAt, &started, &finished, &j.RetainOriginal,
+		&j.Mode, &j.BaseVersionID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Job{}, fmt.Errorf("%w: job", ErrNotFound)
 		}
@@ -50,7 +52,7 @@ func scanJob(row rowScanner) (Job, error) {
 
 func (s *postgresStore) GetLatestReadyVersion(ctx context.Context, datasetID string) (DatasetVersion, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, dataset_id, version, object_prefix, format, partition_columns, status, error_summary, row_count, created_at
+		SELECT `+versionCols+`
 		FROM dataset_versions
 		WHERE dataset_id = $1 AND status = $2
 		ORDER BY version DESC
@@ -92,6 +94,23 @@ func lakeBasePrefix(namespace, dataset string, version int) string {
 // newVersionAndJob inserts the next PENDING version and a QUEUED job for an
 // already-locked dataset inside tx.
 func newVersionAndJob(ctx context.Context, tx *sql.Tx, ds Dataset, req CreateConvert) (string, error) {
+	var baseID any // NULL for a replacing upload
+	if req.Mode == ModeAppend {
+		base, err := scanVersion(tx.QueryRowContext(ctx, `
+			SELECT `+versionCols+` FROM dataset_versions
+			WHERE dataset_id = $1 AND status = $2 ORDER BY version DESC LIMIT 1`, ds.ID, VersionReady))
+		if errors.Is(err, ErrNotFound) {
+			return "", fmt.Errorf("%w: dataset %q has no READY version to append to", ErrInvalidArgument, ds.Name)
+		}
+		if err != nil {
+			return "", err
+		}
+		if err := CheckAppendable(ds.Name, base); err != nil {
+			return "", err
+		}
+		baseID = base.ID
+		req.PartitionColumns = base.PartitionColumns // an append keeps the dataset's layout
+	}
 	var next int
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COALESCE(MAX(version), 0) + 1 FROM dataset_versions WHERE dataset_id = $1`, ds.ID).Scan(&next); err != nil {
@@ -122,10 +141,14 @@ func newVersionAndJob(ctx context.Context, tx *sql.Tx, ds Dataset, req CreateCon
 	if req.RetryOf != "" {
 		retryOf = req.RetryOf
 	}
+	mode := req.Mode
+	if mode == "" {
+		mode = ModeReplace
+	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO ingestion_jobs (id, dataset_id, target_version_id, kind, status, input_ref, input_format, partition_columns, retry_of, attempt, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10)`,
-		req.JobID, ds.ID, versionID, KindConvert, JobQueued, req.InputRef, req.InputFormat, parts, retryOf, now); err != nil {
+		INSERT INTO ingestion_jobs (id, dataset_id, target_version_id, kind, status, input_ref, input_format, partition_columns, retry_of, attempt, created_at, mode, base_version_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11, $12)`,
+		req.JobID, ds.ID, versionID, KindConvert, JobQueued, req.InputRef, req.InputFormat, parts, retryOf, now, mode, baseID); err != nil {
 		return "", fmt.Errorf("insert job: %w", err)
 	}
 	if err := notify(ctx, tx, ChannelIngestJobs); err != nil {
@@ -185,6 +208,9 @@ func lockOrCreateDataset(ctx context.Context, tx *sql.Tx, ns Namespace, req Crea
 		if !errors.Is(err, sql.ErrNoRows) {
 			return Dataset{}, fmt.Errorf("lock dataset: %w", err)
 		}
+		if req.Mode == ModeAppend {
+			return Dataset{}, fmt.Errorf("%w: dataset %q does not exist; an append needs an existing dataset", ErrNotFound, req.Name)
+		}
 		id, err := newUUID()
 		if err != nil {
 			return Dataset{}, err
@@ -223,13 +249,13 @@ func (s *postgresStore) Retry(ctx context.Context, sourceJobID, newJobID string)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var datasetID, status, inputRef, inputFormat string
+	var datasetID, status, inputRef, inputFormat, mode string
 	var retryable bool
 	var parts []byte
 	err = tx.QueryRowContext(ctx, `
-		SELECT dataset_id, status, retryable, COALESCE(input_ref, ''), COALESCE(input_format, ''), partition_columns
+		SELECT dataset_id, status, retryable, COALESCE(input_ref, ''), COALESCE(input_format, ''), partition_columns, mode
 		FROM ingestion_jobs WHERE id = $1 AND kind = $2 FOR UPDATE`, sourceJobID, KindConvert).
-		Scan(&datasetID, &status, &retryable, &inputRef, &inputFormat, &parts)
+		Scan(&datasetID, &status, &retryable, &inputRef, &inputFormat, &parts, &mode)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, fmt.Errorf("%w: job", ErrNotFound)
 	}
@@ -264,7 +290,7 @@ func (s *postgresStore) Retry(ctx context.Context, sourceJobID, newJobID string)
 	}
 	if _, err := newVersionAndJob(ctx, tx, ds, CreateConvert{
 		JobID: newJobID, Name: ds.Name, InputRef: inputRef, InputFormat: inputFormat,
-		PartitionColumns: partition, RetryOf: sourceJobID,
+		PartitionColumns: partition, RetryOf: sourceJobID, Mode: mode,
 	}); err != nil {
 		return Job{}, err
 	}
@@ -362,25 +388,56 @@ func (s *postgresStore) Complete(ctx context.Context, jobID, token string, p Pub
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var versionID, datasetID string
+	var versionID, datasetID, mode, baseID string
 	err = tx.QueryRowContext(ctx, `
 		UPDATE ingestion_jobs SET status = $3, finished_at = now(), lease_owner = NULL, lease_expires_at = NULL,
 		       retryable = false, failure_reason = NULL, error_summary = NULL
 		WHERE id = $1 AND fencing_token = $2 AND status = $4
-		RETURNING target_version_id, dataset_id`, jobID, token, JobSucceeded, JobRunning).Scan(&versionID, &datasetID)
+		RETURNING target_version_id, dataset_id, mode, COALESCE(base_version_id::text, '')`,
+		jobID, token, JobSucceeded, JobRunning).Scan(&versionID, &datasetID, &mode, &baseID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrFenced
 	}
 	if err != nil {
 		return fmt.Errorf("complete job: %w", err)
 	}
+	// Publishers of one dataset are serialised on its row, so the "is my base
+	// still the latest version" check below cannot race another publish.
+	if _, err := tx.ExecContext(ctx, `SELECT 1 FROM datasets WHERE id = $1 FOR UPDATE`, datasetID); err != nil {
+		return fmt.Errorf("lock dataset: %w", err)
+	}
+
+	segments, rowCount := []string{}, any(p.RowCount)
+	if mode == ModeAppend {
+		var latest string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT id FROM dataset_versions WHERE dataset_id = $1 AND status = $2 ORDER BY version DESC LIMIT 1`,
+			datasetID, VersionReady).Scan(&latest); err != nil || latest != baseID {
+			return ErrBaseChanged // the deferred rollback also undoes the job update
+		}
+		base, err := scanVersion(tx.QueryRowContext(ctx, `SELECT `+versionCols+` FROM dataset_versions WHERE id = $1`, baseID))
+		if err != nil {
+			return fmt.Errorf("load append base: %w", err)
+		}
+		segments = append(append(segments, base.BaseSegments...), base.ObjectPrefix)
+		if base.RowCount == nil {
+			rowCount = nil // the base's size is unknown, so the total is too
+		} else {
+			rowCount = *base.RowCount + p.RowCount
+		}
+	}
+	segJSON, err := json.Marshal(segments)
+	if err != nil {
+		return err
+	}
 	parts, err := json.Marshal(orEmpty(p.PartitionColumns))
 	if err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE dataset_versions SET status = $2, object_prefix = $3, row_count = $4, partition_columns = $5, error_summary = NULL
-		WHERE id = $1`, versionID, VersionReady, p.ObjectPrefix, p.RowCount, parts); err != nil {
+		UPDATE dataset_versions SET status = $2, object_prefix = $3, row_count = $4, partition_columns = $5,
+		       error_summary = NULL, base_segments = $6
+		WHERE id = $1`, versionID, VersionReady, p.ObjectPrefix, rowCount, parts, segJSON); err != nil {
 		return fmt.Errorf("publish version: %w", err)
 	}
 	for i, c := range p.Columns {
@@ -400,6 +457,18 @@ func (s *postgresStore) Complete(ctx context.Context, jobID, token string, p Pub
 		return fmt.Errorf("commit complete: %w", err)
 	}
 	return nil
+}
+
+func (s *postgresStore) AppendBase(ctx context.Context, baseVersionID string) (DatasetVersion, []SchemaColumn, error) {
+	if !validUUID(baseVersionID) {
+		return DatasetVersion{}, nil, fmt.Errorf("%w: base version", ErrNotFound)
+	}
+	v, err := scanVersion(s.db.QueryRowContext(ctx, `SELECT `+versionCols+` FROM dataset_versions WHERE id = $1`, baseVersionID))
+	if err != nil {
+		return DatasetVersion{}, nil, err
+	}
+	cols, err := s.GetSchema(ctx, baseVersionID)
+	return v, cols, err
 }
 
 func (s *postgresStore) Fail(ctx context.Context, jobID, token, reason, summary string, retryable bool) error {
@@ -429,4 +498,26 @@ func (s *postgresStore) Fail(ctx context.Context, jobID, token, reason, summary 
 		return fmt.Errorf("commit fail: %w", err)
 	}
 	return nil
+}
+
+func (s *postgresStore) ReadySchema(ctx context.Context, name string) (DatasetVersion, []SchemaColumn, error) {
+	ns, err := s.defaultNamespace(ctx)
+	if err != nil {
+		return DatasetVersion{}, nil, err
+	}
+	var datasetID string
+	err = s.db.QueryRowContext(ctx, `SELECT id FROM datasets WHERE namespace_id = $1 AND name = $2 AND status = $3`,
+		ns.ID, name, DatasetActive).Scan(&datasetID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DatasetVersion{}, nil, fmt.Errorf("%w: dataset %q", ErrNotFound, name)
+	}
+	if err != nil {
+		return DatasetVersion{}, nil, fmt.Errorf("find dataset: %w", err)
+	}
+	v, err := s.GetLatestReadyVersion(ctx, datasetID)
+	if err != nil {
+		return DatasetVersion{}, nil, err
+	}
+	cols, err := s.GetSchema(ctx, v.ID)
+	return v, cols, err
 }

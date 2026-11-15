@@ -1,8 +1,9 @@
-# Upload, conversion, and Parquet ingestion (phase 3)
+# Upload, conversion, Parquet import and append (phases 3 and 11)
 
-Users upload a CSV, JSON (array of objects), or JSONL file. The API stores the
-upload, queues a durable `convert` job, and the worker converts it to
-partitioned Parquet and publishes a new dataset version. Normative contracts
+Users upload a CSV, JSON (array of objects), JSONL or **Parquet** file. The API stores the
+upload, queues a durable `convert` job, and the worker converts CSV/JSON to
+partitioned Parquet (or, for Parquet, imports the file as it is) and publishes a new dataset
+version, either replacing the dataset's data or **adding to it** (see below). Normative contracts
 (key layout, partition encoding, job state machine) remain in `docs/design.md`.
 
 ## Flow
@@ -26,6 +27,55 @@ partitioned Parquet and publishes a new dataset version. Normative contracts
 5. `GET /api/v1/ingestions/{id}` is polled by the dashboard;
    `POST /api/v1/ingestions/{id}/retry` retries a failed, retryable job;
    `GET /api/v1/ingestions` lists recent jobs.
+
+## Direct Parquet import (phase 11)
+
+`format=parquet` (or a `.parquet` filename) imports the uploaded file **byte for byte**: it is
+stored as one part under the new version's prefix and never re-encoded, so its types, compression
+and statistics are exactly what its producer wrote (a DuckDB-written, zstd-compressed file with a
+`date` column was imported and queried in the live check). The worker validates only that it is a
+Parquet file whose footer can be read and whose schema fits the same naming and size rules as
+converted data (1-256 columns, names 1-128 bytes with no control characters or surrounding space,
+unique ignoring case); the upload limit stays 64 MiB. `partitionColumns` does not apply (the file
+keeps its own layout). Types are recorded as the Parquet schema declares them (`int32`, `date`,
+`decimal`, ...); everything DuckDB can read is queryable, while the in-repo preview reader decodes
+only the encodings it supports, so a sample may be unavailable (the file still imports; the response
+says so). Errors never echo content from the file. For data that already sits in the bucket, registering
+it in place is still the right tool: it needs no upload and no copy.
+
+## Appending to a dataset (phase 11)
+
+`mode=append` (with the dataset's `name`) adds the uploaded data to an **existing** dataset instead
+of replacing it. The default, `mode=replace`, keeps its old meaning: a new version holding only the
+upload.
+
+* **Nothing is copied.** A version is the files under its own prefix plus those of its
+  `base_segments` (earlier prefixes, oldest first). An append publishes the new data as a new
+  segment and a new version whose segments are the base version's followed by the base's own prefix;
+  earlier versions are untouched and stay queryable (`"sales_v1"`). Queries stage every segment
+  (pruning and the stage cache work across them); at most 128 segments accumulate, after which the
+  data must be uploaded again as one dataset.
+* **Schema must match** (`catalog.CheckAppendSchema`): same column names (case-sensitive) and types;
+  a nullable dataset column may be absent (filled with NULL); an optional CSV column left entirely
+  empty in this batch fits any nullable column; CSV/JSON `int64` values may feed a `double` column
+  (widened). A Parquet file is stored as it is, so its types must match exactly. Extra columns,
+  retyping and missing required columns are refused with a message naming each column and type. Adding
+  columns (schema evolution) is not supported yet.
+* **Layout is inherited.** An append to a partitioned dataset uses the dataset's partition columns
+  (`partitionColumns` is rejected for an append); an imported Parquet file is added as it is.
+* **Registered datasets can be appended to without writing into your prefix.** The registered prefix
+  stays read-only; the appended data lands in a segment under `lake/`, beside it. A Hive-partitioned
+  registered dataset cannot be appended to (its partition values live in directory names).
+* **No lost updates.** An append records the version it was based on when the job is created. When it
+  publishes, the dataset row is locked and the job is refused (`ErrBaseChanged`, failure reason
+  `base_changed`, retryable, its objects removed) if a different version is now the latest, because
+  publishing would silently drop that change. A retry re-bases on the new latest version. A concurrency
+  test against PostgreSQL covers it.
+* **Feedback before uploading.** `POST /api/v1/ingestions/inspect?target=<dataset>` returns whether the
+  file can be appended (and why not), the dataset's current row count and version; the upload endpoint
+  runs the same check and answers `422 invalid_input` (or `404` for a dataset that does not exist; an
+  append never creates one) before anything is stored. The dashboard shows the verdict under the
+  destination chooser.
 
 ## Input rules and limits
 
@@ -94,7 +144,7 @@ a retryable failure can be retried.
 - **No lease renewal.** Conversion is bounded by the 64 MiB limit and runs under
   a timeout shorter than the lease, so heartbeats are not needed yet.
 - **Registered Parquet is still referenced in place** (`object_prefix` equals
-  the source prefix); copying into `lake/…` is not done in this phase.
+  the source prefix); copying into `lake/…` is not done. Since phase 11 it can be appended to (see above).
 - Uploads are buffered in memory (bounded by the size limit); there is no
   multipart or streaming upload.
 

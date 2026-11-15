@@ -516,7 +516,7 @@ func (r *Runner) execute(ctx context.Context, job catalog.QueryJob) (*spooled, i
 				}
 			}
 		}
-		n, err := r.stage(ctx, rel.ObjectPrefix, dir, r.Cfg.Limits.MaxScanBytes-staged, prune, rel.HivePartitioned, &info)
+		n, err := r.stage(ctx, rel.Prefixes(), dir, r.Cfg.Limits.MaxScanBytes-staged, prune, rel.HivePartitioned, &info)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -547,39 +547,59 @@ type stageInfo struct {
 	pruneWork                         bool
 }
 
-// stage places the Parquet objects under prefix that a query can need into dir,
-// preserving the relative key so hive partition directories survive. When prune
-// is non-nil, objects whose directory names or footer statistics prove that no
-// row can satisfy the query's filters are skipped. DuckDB never sees
-// credentials or object URLs: it reads only these local files.
-func (r *Runner) stage(ctx context.Context, prefix, dir string, budget int64, prune *Pruning, hive bool, info *stageInfo) (int64, error) {
-	prefix = strings.TrimRight(prefix, "/") + "/"
-	var objs []objectstore.Object
-	token := ""
-	for {
-		page, err := r.Objects.List(ctx, objectstore.ListOptions{Prefix: prefix, MaxKeys: 1000, Token: token})
-		if err != nil {
-			if ctx.Err() != nil {
-				return 0, ctx.Err()
+// stagedObject is an object chosen for staging: rel is its key relative to the
+// segment prefix it was listed under (what a Hive directory name is read from),
+// local its path under the query's data directory.
+type stagedObject struct {
+	objectstore.Object
+	rel   string
+	local string
+}
+
+// stage places the Parquet objects of one relation that a query can need into
+// dir. A relation is one or more prefixes (an appended version has one per
+// segment); keys keep their path below their prefix so Hive partition
+// directories survive. When prune is non-nil, objects whose directory names or
+// footer statistics prove that no row can satisfy the query's filters are
+// skipped. DuckDB never sees credentials or object URLs: it reads only these
+// local files.
+func (r *Runner) stage(ctx context.Context, prefixes []string, dir string, budget int64, prune *Pruning, hive bool, info *stageInfo) (int64, error) {
+	var objs []stagedObject
+	for si, prefix := range prefixes {
+		prefix = strings.TrimRight(prefix, "/") + "/"
+		token := ""
+		for {
+			page, err := r.Objects.List(ctx, objectstore.ListOptions{Prefix: prefix, MaxKeys: 1000, Token: token})
+			if err != nil {
+				if ctx.Err() != nil {
+					return 0, ctx.Err()
+				}
+				return 0, fmt.Errorf("%w: list: %v", errStorage, err)
 			}
-			return 0, fmt.Errorf("%w: list: %v", errStorage, err)
+			for _, o := range page.Objects {
+				if !strings.HasSuffix(strings.ToLower(o.Key), ".parquet") || o.Size == 0 {
+					continue
+				}
+				rel := strings.TrimPrefix(o.Key, prefix)
+				// Segments are kept apart so equal relative names cannot collide.
+				localRel := rel
+				if len(prefixes) > 1 {
+					localRel = fmt.Sprintf("s%d/%s", si, rel)
+				}
+				local, ok := safeJoin(dir, localRel)
+				if !ok {
+					return 0, fmt.Errorf("%w: dataset contains an unsupported object key", ErrEngine)
+				}
+				if len(objs) >= maxStagedFiles {
+					return 0, fmt.Errorf("%w: dataset has too many files to query", ErrLimit)
+				}
+				objs = append(objs, stagedObject{Object: o, rel: rel, local: local})
+			}
+			if !page.Truncated || page.NextToken == "" {
+				break
+			}
+			token = page.NextToken
 		}
-		for _, o := range page.Objects {
-			if !strings.HasSuffix(strings.ToLower(o.Key), ".parquet") || o.Size == 0 {
-				continue
-			}
-			if _, ok := safeJoin(dir, strings.TrimPrefix(o.Key, prefix)); !ok {
-				return 0, fmt.Errorf("%w: dataset contains an unsupported object key", ErrEngine)
-			}
-			if len(objs) >= maxStagedFiles {
-				return 0, fmt.Errorf("%w: dataset has too many files to query", ErrLimit)
-			}
-			objs = append(objs, o)
-		}
-		if !page.Truncated || page.NextToken == "" {
-			break
-		}
-		token = page.NextToken
 	}
 	if len(objs) == 0 {
 		return 0, fmt.Errorf("%w: dataset has no Parquet files", ErrEngine)
@@ -588,8 +608,7 @@ func (r *Runner) stage(ctx context.Context, prefix, dir string, budget int64, pr
 
 	keep := objs
 	if prune != nil {
-		keep = r.pruneObjects(ctx, objs, prefix, prune.Constraints, hive)
-		info.pruneWork = info.pruneWork || len(objs) > 1
+		keep = r.pruneObjects(ctx, objs, prune.Constraints, hive)
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
@@ -602,7 +621,7 @@ func (r *Runner) stage(ctx context.Context, prefix, dir string, budget int64, pr
 					smallest = o
 				}
 			}
-			keep = []objectstore.Object{smallest}
+			keep = []stagedObject{smallest}
 		}
 		for _, o := range objs {
 			info.bytesPruned += o.Size
@@ -611,6 +630,7 @@ func (r *Runner) stage(ctx context.Context, prefix, dir string, budget int64, pr
 			info.bytesPruned -= o.Size
 		}
 		info.pruned += len(objs) - len(keep)
+		info.pruneWork = info.pruneWork || len(objs) > 1
 	}
 
 	var total int64
@@ -621,8 +641,7 @@ func (r *Runner) stage(ctx context.Context, prefix, dir string, budget int64, pr
 		}
 	}
 	for _, o := range keep {
-		local, _ := safeJoin(dir, strings.TrimPrefix(o.Key, prefix))
-		hit, err := r.fetch(ctx, o, local)
+		hit, err := r.fetch(ctx, o.Object, o.local)
 		if err != nil {
 			return 0, err
 		}
@@ -660,12 +679,12 @@ func (r *Runner) fetch(ctx context.Context, o objectstore.Object, local string) 
 }
 
 // pruneObjects returns the objects that may contain a row matching cons.
-func (r *Runner) pruneObjects(ctx context.Context, objs []objectstore.Object, prefix string, cons []Constraint, hive bool) []objectstore.Object {
+func (r *Runner) pruneObjects(ctx context.Context, objs []stagedObject, cons []Constraint, hive bool) []stagedObject {
 	cand := objs
 	if hive {
-		cand = make([]objectstore.Object, 0, len(objs))
+		cand = make([]stagedObject, 0, len(objs))
 		for _, o := range objs {
-			if MayMatchPartition(cons, strings.TrimPrefix(o.Key, prefix)) {
+			if MayMatchPartition(cons, o.rel) {
 				cand = append(cand, o)
 			}
 		}
@@ -679,14 +698,14 @@ func (r *Runner) pruneObjects(ctx context.Context, objs []objectstore.Object, pr
 	for i, o := range cand {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(i int, o objectstore.Object) {
+		go func(i int, o stagedObject) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			verdict[i] = MayMatchFile(cons, r.fileStats(ctx, o))
+			verdict[i] = MayMatchFile(cons, r.fileStats(ctx, o.Object))
 		}(i, o)
 	}
 	wg.Wait()
-	keep := make([]objectstore.Object, 0, len(cand))
+	keep := make([]stagedObject, 0, len(cand))
 	for i, o := range cand {
 		if verdict[i] {
 			keep = append(keep, o)

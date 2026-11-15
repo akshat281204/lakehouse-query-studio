@@ -3,6 +3,8 @@ package catalog
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -16,12 +18,27 @@ const (
 	InputFormatCSV   = "csv"
 	InputFormatJSONL = "jsonl"
 	InputFormatJSON  = "json"
+	// InputFormatParquet imports an uploaded Parquet file as it is, with no
+	// conversion.
+	InputFormatParquet = "parquet"
+
+	// ModeReplace publishes only the uploaded data as the next version.
+	ModeReplace = "replace"
+	// ModeAppend publishes the latest READY version's data plus the uploaded
+	// data as the next version.
+	ModeAppend = "append"
 )
 
 // ErrFenced is returned when a worker tries to transition a job it no longer
 // holds (its lease expired and the job was reclaimed, or it is already
 // terminal). The stale worker must discard its work.
 var ErrFenced = errors.New("catalog: job fenced")
+
+// ErrBaseChanged is returned by Complete for an append whose base version is no
+// longer the dataset's latest READY version: another change was published while
+// it ran, and publishing would silently drop it. The job fails (retryable) and a
+// retry appends to the new latest version.
+var ErrBaseChanged = errors.New("catalog: dataset changed while the append was running")
 
 // Job is a durable ingestion job.
 type Job struct {
@@ -36,6 +53,8 @@ type Job struct {
 	InputFormat      string     `json:"inputFormat"`
 	RetainOriginal   bool       `json:"-"`
 	PartitionColumns []string   `json:"partitionColumns"`
+	Mode             string     `json:"mode"`
+	BaseVersionID    string     `json:"-"`
 	FailureReason    string     `json:"failureReason,omitempty"`
 	ErrorSummary     string     `json:"errorSummary,omitempty"`
 	Retryable        bool       `json:"retryable"`
@@ -57,6 +76,10 @@ type CreateConvert struct {
 	PartitionColumns []string
 	RetainOriginal   bool
 	RetryOf          string
+	// Mode is ModeReplace (default) or ModeAppend. An append targets an existing
+	// ACTIVE dataset (it never creates one), takes the latest READY version as
+	// its base and inherits that version's partition columns.
+	Mode string
 }
 
 // Publish is the atomic result of a successful conversion.
@@ -85,6 +108,35 @@ type IngestStore interface {
 	// Complete publishes the version READY and the job SUCCEEDED in one fenced
 	// transaction. It returns ErrFenced if the token is stale.
 	Complete(ctx context.Context, jobID, fencingToken string, p Publish) error
+	// ReadySchema returns an ACTIVE dataset's latest READY version and its schema,
+	// by name (ErrNotFound if the dataset or a READY version does not exist). The
+	// upload API uses it to tell the caller up front whether data can be appended.
+	ReadySchema(ctx context.Context, name string) (DatasetVersion, []SchemaColumn, error)
+	// AppendBase returns the base version of an append job and its schema, as
+	// recorded when the job was created.
+	AppendBase(ctx context.Context, baseVersionID string) (DatasetVersion, []SchemaColumn, error)
 	// Fail marks the job and its version FAILED in one fenced transaction.
 	Fail(ctx context.Context, jobID, fencingToken, reason, summary string, retryable bool) error
+}
+
+// MaxAppendSegments bounds how many appends one dataset accumulates. Every query
+// lists each segment's prefix, so an unbounded chain would slow every read; at
+// the limit the data must be re-uploaded as one dataset.
+const MaxAppendSegments = 128
+
+// CheckAppendable decides whether a READY version can take an append. Data this
+// tool wrote (under lake/) always can; a registered prefix is referenced in
+// place and never written to, so appending to it adds a new segment next to it,
+// which is only supported when that prefix is not Hive-partitioned (its
+// partition values live in directory names, and the appended files are not
+// laid out that way).
+func CheckAppendable(name string, base DatasetVersion) error {
+	if len(base.BaseSegments)+1 >= MaxAppendSegments {
+		return fmt.Errorf("%w: dataset %q already has %d appended segments (the limit is %d); upload the data again as one dataset",
+			ErrInvalidArgument, name, len(base.BaseSegments)+1, MaxAppendSegments)
+	}
+	if len(base.PartitionColumns) > 0 && !strings.HasPrefix(base.ObjectPrefix, "lake/") {
+		return fmt.Errorf("%w: dataset %q is a Hive-partitioned registered dataset; appending to it is not supported", ErrInvalidArgument, name)
+	}
+	return nil
 }

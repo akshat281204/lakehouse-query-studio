@@ -493,3 +493,47 @@ path.chart-line {
     max-height: none;
   }
 }
+
+/* ---- Upload: destination and append verdict ---- */
+.destination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 1.4rem;
+  margin: 0 0 1rem;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+.destination legend {
+  padding: 0 0.4rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--text-3);
+}
+.destination select {
+  min-width: 14rem;
+}
+.verdict {
+  margin: 0.6rem 0 1rem;
+  padding: 0.75rem 1rem;
+  border-radius: 12px;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  border: 1px solid var(--border);
+}
+.verdict ul {
+  margin: 0.4rem 0 0;
+  padding-left: 1.1rem;
+}
+.verdict-ok {
+  background: var(--ok-soft);
+  border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+  border-left: 3px solid var(--ok);
+}
+.verdict-bad {
+  background: var(--err-soft);
+  border-color: color-mix(in srgb, var(--err) 35%, transparent);
+  border-left: 3px solid var(--err);
+}

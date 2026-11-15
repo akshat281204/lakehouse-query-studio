@@ -139,3 +139,24 @@ func TestProfileOfAnEmptyPrefix(t *testing.T) {
 		t.Fatalf("%d %+v", code, p)
 	}
 }
+
+func TestProfileNoteSaysWhyAColumnHasNoRange(t *testing.T) {
+	// a type the profile does not summarise (date) vs a file with no statistics
+	_, mem := profileEnv(t, [][]any{{int64(1), 1.0, "a", true}})
+	st := &fakeStore{
+		datasets: []catalog.Dataset{{ID: "d1", Name: "sales"}},
+		versions: map[string]catalog.DatasetVersion{"d1": {ID: "v1", DatasetID: "d1", Version: 1, Status: catalog.VersionReady, ObjectPrefix: "lake/default/sales/v1/"}},
+		schema: map[string][]catalog.SchemaColumn{"v1": {
+			{Position: 0, Name: "id", Type: "int64"}, {Position: 1, Name: "price", Type: "double", Nullable: true},
+			{Position: 2, Name: "region", Type: "string"}, {Position: 3, Name: "ok", Type: "boolean"},
+			{Position: 4, Name: "day", Type: "date"},
+		}},
+	}
+	rec := httptest.NewRecorder()
+	New(st, mem).ServeHTTP(rec, httptest.NewRequest("GET", "/api/v1/datasets/d1/profile", nil))
+	var p profileResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &p)
+	if !strings.Contains(p.Note, "1 column(s) have a type whose range is not summarised") || strings.Contains(p.Note, "written before statistics") {
+		t.Fatalf("note: %q", p.Note)
+	}
+}

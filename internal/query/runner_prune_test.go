@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -199,12 +200,11 @@ func BenchmarkPruneObjectsMemoised(b *testing.B) {
 	addFiles(b, h, 199)
 	cons := []Constraint{{Column: "id", Op: "=", Values: []literal{{kind: litInt, i: 0}}}}
 	objs := listObjects(b, h)
-	prefix := h.rel.ObjectPrefix
-	h.runner.pruneObjects(context.Background(), objs, prefix, cons, false) // populate the memo
+	h.runner.pruneObjects(context.Background(), objs, cons, false) // populate the memo
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		h.runner.pruneObjects(context.Background(), objs, prefix, cons, false)
+		h.runner.pruneObjects(context.Background(), objs, cons, false)
 	}
 }
 
@@ -214,22 +214,25 @@ func BenchmarkPruneObjectsColdFooters(b *testing.B) {
 	addFiles(b, h, 199)
 	cons := []Constraint{{Column: "id", Op: "=", Values: []literal{{kind: litInt, i: 0}}}}
 	objs := listObjects(b, h)
-	prefix := h.rel.ObjectPrefix
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		h.runner.stats = statsMemo{}
-		h.runner.pruneObjects(context.Background(), objs, prefix, cons, false)
+		h.runner.pruneObjects(context.Background(), objs, cons, false)
 	}
 }
 
-func listObjects(tb testing.TB, h *harness) []objectstore.Object {
+func listObjects(tb testing.TB, h *harness) []stagedObject {
 	tb.Helper()
 	page, err := h.objects.List(context.Background(), objectstore.ListOptions{Prefix: h.rel.ObjectPrefix, MaxKeys: 1000})
 	if err != nil {
 		tb.Fatal(err)
 	}
-	return page.Objects
+	out := make([]stagedObject, len(page.Objects))
+	for i, o := range page.Objects {
+		out[i] = stagedObject{Object: o, rel: strings.TrimPrefix(o.Key, h.rel.ObjectPrefix)}
+	}
+	return out
 }
 
 // BenchmarkTrivialQuery measures a SELECT 1 through the whole runner (claim,

@@ -88,14 +88,19 @@ export interface RegisterDatasetInput {
 
 export interface UploadOptions {
   name?: string
+  mode?: 'replace' | 'append'
   partitionColumns?: string[]
   retainOriginal?: boolean
+  /** inspect only: check the file against this dataset's schema */
+  target?: string
 }
 
 function uploadQuery(file: File, opts: UploadOptions): string {
   const params = new URLSearchParams()
   params.set('filename', file.name)
   if (opts.name) params.set('name', opts.name)
+  if (opts.mode) params.set('mode', opts.mode)
+  if (opts.target) params.set('target', opts.target)
   if (opts.partitionColumns?.length) {
     params.set('partitionColumns', opts.partitionColumns.join(','))
   }
@@ -161,9 +166,9 @@ export const api = {
     )
   },
 
-  inspectUpload: (file: File) =>
+  inspectUpload: (file: File, target?: string) =>
     request<InspectResponse>(
-      `/api/v1/ingestions/inspect${uploadQuery(file, {})}`,
+      `/api/v1/ingestions/inspect${uploadQuery(file, { target })}`,
       { method: 'POST', body: file },
     ),
 

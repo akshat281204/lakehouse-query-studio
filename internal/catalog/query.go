@@ -98,16 +98,27 @@ type QueryResult struct {
 
 // Relation is a READY dataset version a query may read.
 type Relation struct {
-	DatasetName      string
-	Version          int
-	VersionID        string
-	ObjectPrefix     string
+	DatasetName  string
+	Version      int
+	VersionID    string
+	ObjectPrefix string
+	// BaseSegments are earlier prefixes whose files are part of this version
+	// (appended data), oldest first.
+	BaseSegments     []string
 	Format           string
 	PartitionColumns []string
 	// HivePartitioned is true for registered data whose partition values live
 	// only in directory names. Converted data keeps partition columns in the
 	// files, so it must not be hive-decoded a second time.
 	HivePartitioned bool
+}
+
+// Prefixes returns every object prefix holding the relation's files: the base
+// segments (oldest first), then ObjectPrefix.
+func (r Relation) Prefixes() []string {
+	out := make([]string, 0, len(r.BaseSegments)+1)
+	out = append(out, r.BaseSegments...)
+	return append(out, r.ObjectPrefix)
 }
 
 // QueueStats counts jobs by kind and state, for queue-depth metrics.

@@ -43,6 +43,7 @@ type uploadParams struct {
 	filename   string
 	partitions []string
 	retain     bool
+	mode       string
 }
 
 type inspectResponse struct {
@@ -50,6 +51,20 @@ type inspectResponse struct {
 	Columns  []inspectColumn  `json:"columns"`
 	RowCount int              `json:"rowCount"`
 	Sample   []map[string]any `json:"sample"`
+	// Note explains a limit on what is shown (for example no sample for a file
+	// the reader cannot decode).
+	Note string `json:"note,omitempty"`
+	// Append is present when the request named a target dataset (?target=).
+	Append *appendCheck `json:"append,omitempty"`
+}
+
+// appendCheck is the verdict of checking the file against a dataset's schema.
+type appendCheck struct {
+	Dataset       string   `json:"dataset"`
+	Compatible    bool     `json:"compatible"`
+	Issues        []string `json:"issues"`
+	DatasetRows   *int64   `json:"datasetRows,omitempty"`
+	LatestVersion int      `json:"latestVersion,omitempty"`
 }
 
 type inspectColumn struct {
@@ -90,13 +105,15 @@ func formatFromParams(format, filename string) (string, error) {
 			f = catalog.InputFormatJSONL
 		case ".json":
 			f = catalog.InputFormatJSON
+		case ".parquet":
+			f = catalog.InputFormatParquet
 		}
 	}
 	switch f {
-	case catalog.InputFormatCSV, catalog.InputFormatJSONL, catalog.InputFormatJSON:
+	case catalog.InputFormatCSV, catalog.InputFormatJSONL, catalog.InputFormatJSON, catalog.InputFormatParquet:
 		return f, nil
 	case "":
-		return "", fmt.Errorf("%w: specify format=csv|jsonl|json or a filename with a known extension", catalog.ErrInvalidArgument)
+		return "", fmt.Errorf("%w: specify format=csv|jsonl|json|parquet or a filename with a known extension", catalog.ErrInvalidArgument)
 	default:
 		return "", fmt.Errorf("%w: unsupported format %q", catalog.ErrInvalidArgument, f)
 	}
@@ -113,7 +130,21 @@ func parseUploadParams(r *http.Request, needName bool) (uploadParams, error) {
 		if p.name, err = catalog.ValidateDatasetName(q.Get("name")); err != nil {
 			return p, fmt.Errorf("%w: %v", catalog.ErrInvalidArgument, err)
 		}
+		switch m := strings.ToLower(strings.TrimSpace(q.Get("mode"))); m {
+		case "", catalog.ModeReplace:
+			p.mode = catalog.ModeReplace
+		case catalog.ModeAppend:
+			p.mode = catalog.ModeAppend
+		default:
+			return p, fmt.Errorf("%w: mode must be replace or append", catalog.ErrInvalidArgument)
+		}
 		if v := q.Get("partitionColumns"); v != "" {
+			if p.format == catalog.InputFormatParquet {
+				return p, fmt.Errorf("%w: partitionColumns does not apply to a Parquet import; the file keeps its own layout", catalog.ErrInvalidArgument)
+			}
+			if p.mode == catalog.ModeAppend {
+				return p, fmt.Errorf("%w: partitionColumns cannot be set for an append; it keeps the dataset's partitioning", catalog.ErrInvalidArgument)
+			}
 			for _, c := range strings.Split(v, ",") {
 				if verr := ingest.ValidateColumnName(c); verr != nil {
 					return p, fmt.Errorf("%w: invalid partition column name", catalog.ErrInvalidArgument)
@@ -155,6 +186,69 @@ func writeIngestError(w http.ResponseWriter, err error) {
 	writeMappedError(w, err)
 }
 
+// incomingOf parses an upload just far enough to know its columns, so it can be
+// reported or checked against a dataset. For Parquet that is its footer; for
+// CSV/JSON the file is parsed and types are inferred.
+type incomingFile struct {
+	columns []catalog.IncomingColumn
+	table   *ingest.Table // CSV/JSON only
+	rows    int
+	sample  []map[string]any
+	note    string
+}
+
+func (h *Handler) parseIncoming(format string, data []byte, withSample bool) (*incomingFile, error) {
+	f := &incomingFile{}
+	if format == catalog.InputFormatParquet {
+		info, err := ingest.ParseParquet(data, h.ingest.Limits)
+		if err != nil {
+			return nil, err
+		}
+		f.columns, f.rows = info.Columns, int(info.Rows)
+		if withSample {
+			f.sample, f.note = ingest.ParquetSample(data, inspectSampleRows)
+		}
+		return f, nil
+	}
+	table, err := ingest.Parse(format, data, h.ingest.Limits)
+	if err != nil {
+		return nil, err
+	}
+	f.table, f.columns, f.rows = table, ingest.IncomingColumns(table), len(table.Rows)
+	if withSample {
+		for i := 0; i < len(table.Rows) && i < inspectSampleRows; i++ {
+			row := make(map[string]any, len(table.Columns))
+			for j, c := range table.Columns {
+				row[c.Name] = table.Rows[i][j]
+			}
+			f.sample = append(f.sample, row)
+		}
+	}
+	return f, nil
+}
+
+// checkAppend compares incoming columns with a dataset's latest READY schema.
+// missing is true when the dataset does not exist (or has no READY version).
+func (h *Handler) checkAppend(ctx context.Context, name string, incoming []catalog.IncomingColumn, widen bool) (check *appendCheck, missing bool, err error) {
+	if _, verr := catalog.ValidateDatasetName(name); verr != nil {
+		return nil, false, fmt.Errorf("%w: %v", catalog.ErrInvalidArgument, verr)
+	}
+	v, cols, err := h.ingest.Jobs.ReadySchema(ctx, name)
+	if errors.Is(err, catalog.ErrNotFound) {
+		return &appendCheck{Dataset: name, Issues: []string{"the dataset does not exist or has no ready version"}}, true, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	check = &appendCheck{Dataset: name, DatasetRows: v.RowCount, LatestVersion: v.Version, Issues: []string{}}
+	if aerr := catalog.CheckAppendable(name, v); aerr != nil {
+		check.Issues = append(check.Issues, strings.TrimPrefix(aerr.Error(), catalog.ErrInvalidArgument.Error()+": "))
+	}
+	check.Issues = append(check.Issues, catalog.CheckAppendSchema(cols, incoming, widen)...)
+	check.Compatible = len(check.Issues) == 0
+	return check, false, nil
+}
+
 func (h *Handler) handleInspect(w http.ResponseWriter, r *http.Request) {
 	if !h.requireIngest(w) {
 		return
@@ -168,21 +262,22 @@ func (h *Handler) handleInspect(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	table, err := ingest.Parse(p.format, data, h.ingest.Limits)
+	f, err := h.parseIncoming(p.format, data, true)
 	if err != nil {
 		writeIngestError(w, err)
 		return
 	}
-	resp := inspectResponse{Format: p.format, RowCount: len(table.Rows), Columns: make([]inspectColumn, len(table.Columns))}
-	for i, c := range table.Columns {
+	resp := inspectResponse{Format: p.format, RowCount: f.rows, Columns: make([]inspectColumn, len(f.columns)), Sample: f.sample, Note: f.note}
+	for i, c := range f.columns {
 		resp.Columns[i] = inspectColumn{Name: c.Name, Type: c.Type, Nullable: c.Nullable}
 	}
-	for i := 0; i < len(table.Rows) && i < inspectSampleRows; i++ {
-		row := make(map[string]any, len(table.Columns))
-		for j, c := range table.Columns {
-			row[c.Name] = table.Rows[i][j]
+	if target := r.URL.Query().Get("target"); target != "" {
+		check, _, err := h.checkAppend(r.Context(), target, f.columns, p.format != catalog.InputFormatParquet)
+		if err != nil {
+			writeMappedError(w, err)
+			return
 		}
-		resp.Sample = append(resp.Sample, row)
+		resp.Append = check
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -223,14 +318,29 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	// Fail fast on structurally invalid input so the caller gets an immediate,
 	// actionable error rather than a queued job that is certain to fail.
-	table, err := ingest.Parse(p.format, data, h.ingest.Limits)
+	f, err := h.parseIncoming(p.format, data, false)
 	if err != nil {
 		writeIngestError(w, err)
 		return
 	}
-	if err := ingest.ValidatePartitionColumns(table.Columns, p.partitions); err != nil {
-		writeIngestError(w, err)
-		return
+	if p.mode == catalog.ModeAppend {
+		check, missing, err := h.checkAppend(r.Context(), p.name, f.columns, p.format != catalog.InputFormatParquet)
+		switch {
+		case err != nil:
+			writeMappedError(w, err)
+			return
+		case missing:
+			writeError(w, http.StatusNotFound, "not_found", fmt.Sprintf("dataset %q does not exist; an append needs an existing dataset", p.name))
+			return
+		case !check.Compatible:
+			writeError(w, http.StatusUnprocessableEntity, "invalid_input", "cannot append: "+strings.Join(check.Issues, "; "))
+			return
+		}
+	} else if f.table != nil {
+		if err := ingest.ValidatePartitionColumns(f.table.Columns, p.partitions); err != nil {
+			writeIngestError(w, err)
+			return
+		}
 	}
 
 	jobID, err := catalog.NewUUID()
@@ -245,7 +355,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	job, _, err := h.ingest.Jobs.CreateConvert(r.Context(), catalog.CreateConvert{
 		JobID: jobID, Name: p.name, InputRef: key, InputFormat: p.format,
-		PartitionColumns: p.partitions, RetainOriginal: p.retain,
+		PartitionColumns: p.partitions, RetainOriginal: p.retain, Mode: p.mode,
 	})
 	if err != nil {
 		// The job was never created: release the orphaned upload.

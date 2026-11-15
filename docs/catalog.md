@@ -43,6 +43,14 @@ PostgreSQL. In this phase registration is a **reference** to existing data
 (`object_prefix == source_prefix`); copying source objects into the canonical
 `lake/…` layout arrives with ingestion (phase 3).
 
+## Versions, segments and ingestion modes (phase 11)
+
+`dataset_versions.base_segments` (JSON, default `[]`) lists the earlier prefixes whose files are part
+of the version, oldest first; the version's files are those under each base segment and under its own
+`object_prefix`. `DatasetVersion.Prefixes()` / `Relation.Prefixes()` return that list and every reader
+(query staging, preview, profile) iterates it. `ingestion_jobs.mode` is `replace` (default) or `append`;
+an append job also records `base_version_id`, the latest READY version when the job was created.
+
 ## APIs
 
 - `POST /api/v1/datasets` — register a Parquet prefix.
