@@ -30,7 +30,9 @@ type Runner struct {
 	Lease   time.Duration
 	Limits  Limits
 	Poll    time.Duration
-	Log     *slog.Logger
+	// Wake, if set, ends the idle wait early; polling remains the fallback.
+	Wake <-chan struct{}
+	Log  *slog.Logger
 	// Metrics is optional; labels come from closed sets only.
 	Metrics *telemetry.Metrics
 }
@@ -53,10 +55,13 @@ func (r *Runner) Run(ctx context.Context) {
 		if worked && err == nil {
 			continue
 		}
+		t := time.NewTimer(r.Poll)
 		select {
 		case <-ctx.Done():
-		case <-time.After(r.Poll):
+		case <-r.Wake:
+		case <-t.C:
 		}
+		t.Stop()
 	}
 }
 

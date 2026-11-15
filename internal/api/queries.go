@@ -62,6 +62,10 @@ const (
 	defaultHistory   = 25
 	maxHistory       = 100
 	maxResultRowsAPI = 100_000
+
+	// Long-poll bounds for GET /api/v1/queries/{id}?waitMs=N.
+	maxQueryWaitMs = 5000
+	queryWaitStep  = 10 * time.Millisecond
 )
 
 func (h *Handler) registerQueries(mux *http.ServeMux) {
@@ -184,10 +188,31 @@ func (h *Handler) handleGetQuery(w http.ResponseWriter, r *http.Request) {
 	if !h.requireQueries(w) {
 		return
 	}
-	job, err := h.queries.Store.GetQuery(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	job, err := h.queries.Store.GetQuery(r.Context(), id)
 	if err != nil {
 		writeQueryError(w, err)
 		return
+	}
+	// Optional long-poll: ?waitMs=N holds the request until the query reaches a
+	// final state or N milliseconds pass (capped), so a client learns the moment
+	// a fast query finishes instead of at its next poll tick. Without the
+	// parameter the response is immediate, as before.
+	if ms, _ := strconv.Atoi(r.URL.Query().Get("waitMs")); ms > 0 && !catalog.IsTerminalQuery(job.Status) {
+		deadline := time.Now().Add(time.Duration(min(ms, maxQueryWaitMs)) * time.Millisecond)
+		tick := time.NewTicker(queryWaitStep)
+		defer tick.Stop()
+		for !catalog.IsTerminalQuery(job.Status) && time.Now().Before(deadline) {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-tick.C:
+			}
+			if job, err = h.queries.Store.GetQuery(r.Context(), id); err != nil {
+				writeQueryError(w, err)
+				return
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, job)
 }

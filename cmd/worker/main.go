@@ -61,7 +61,7 @@ func run() error {
 		return fmt.Errorf("open postgres: %w", err)
 	}
 	defer func() { _ = db.Close() }()
-	db.SetMaxOpenConns(4)
+	db.SetMaxOpenConns(8) // two connections are held by the job-notification listeners
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	// Wait for the schema: the API owns migration, but whichever process starts
@@ -115,6 +115,11 @@ func run() error {
 	}
 
 	defer func() { _ = queryRunner.Close() }()
+
+	// Wake idle runners the moment a job is committed instead of at the next
+	// poll. Each runner gets its own listener (a signal wakes one reader).
+	queryRunner.Wake = catalog.Listen(ctx, db, log, catalog.ChannelQueryJobs)
+	runner.Wake = catalog.Listen(ctx, db, log, catalog.ChannelIngestJobs)
 
 	metrics := telemetry.New("worker")
 	metrics.WorkerUp.Set(1)

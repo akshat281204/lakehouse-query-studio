@@ -76,6 +76,7 @@ go run ./cmd/demo
 | `401 unauthorized` | `API_TOKEN` is set; send `Authorization: Bearer <token>` (the browser dashboard cannot hold the token, so token mode is for CLI use) |
 | Overview or sidebar shows **a dependency is down** | Open Overview > System health for the failing dependency and message. Object store: check `docker compose logs s3` and that `.s3-config.json` is a file, not a directory (delete it and run `make up` again) |
 | `demo` waits then fails with "objectstore is not ready (…)" | The S3 service is up but rejecting the signed probe: credentials in `.env` and `.s3-config.json` differ. Run `make up` to regenerate both consistently |
+| Queries take about a second to start | The worker's job-notification listener is down (see the worker log: "job notification listener lost"); it falls back to polling once a second and reconnects by itself. Check that the worker can reach PostgreSQL and that it is not behind a connection pooler in transaction mode (LISTEN needs a session connection) |
 | Queries stay QUEUED | The worker is not running or cannot reach PostgreSQL: `docker compose logs worker`, and check the "In flight" KPI |
 | `query_denied` on submit | The statement is not a single read-only `SELECT` over a READY dataset, or it names an unknown dataset. Quote names containing `-` (`"demo-sales"`) |
 | `result_expired` (410) | The result spool is older than `EXPORT_TTL` (24 h) and was swept; rerun the query |

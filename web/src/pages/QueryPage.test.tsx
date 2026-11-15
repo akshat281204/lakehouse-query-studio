@@ -65,6 +65,29 @@ beforeEach(() => {
 const run = () => fireEvent.click(screen.getByRole('button', { name: 'Run' }))
 
 describe('QueryPage', () => {
+  it('asks the server to hold status requests (long poll) instead of ticking on a timer', async () => {
+    m.submitQuery.mockResolvedValue(job())
+    // The first answer is non-terminal but slow (as a held request would be),
+    // so no client-side sleep is needed before asking again.
+    m.getQuery
+      .mockImplementationOnce(async () => {
+        await new Promise((r) => setTimeout(r, 300))
+        return job({ status: 'RUNNING' })
+      })
+      .mockResolvedValue(
+        job({ status: 'SUCCEEDED', rowsReturned: 2, attempt: 1 }),
+      )
+    m.getQueryResults.mockResolvedValue(results())
+    render(<QueryPage pollMs={5000} />)
+    const started = Date.now()
+    run()
+    await screen.findByTestId('result-summary')
+    expect(m.getQuery).toHaveBeenCalledWith('q1', 2000)
+    expect(m.getQuery).toHaveBeenCalledTimes(2)
+    // pollMs is 5 s: had the page slept between requests this would take seconds.
+    expect(Date.now() - started).toBeLessThan(2000)
+  })
+
   it('runs a query, polls to success, and shows counts, export link and details', async () => {
     m.submitQuery.mockResolvedValue(job())
     m.getQuery

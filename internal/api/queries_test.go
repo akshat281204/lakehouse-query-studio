@@ -477,3 +477,69 @@ func TestStatsEndpointReflectsRealQueryActivity(t *testing.T) {
 		}
 	}
 }
+
+func TestQueryStatusLongPollReturnsAsSoonAsTheQueryFinishes(t *testing.T) {
+	e := newQueryEnv(t, nil, nil)
+	job, _ := e.submit("SELECT id FROM sales ORDER BY id")
+
+	type out struct {
+		job     catalog.QueryJob
+		elapsed time.Duration
+	}
+	done := make(chan out, 1)
+	go func() {
+		start := time.Now()
+		rec := e.do("GET", "/api/v1/queries/"+job.ID+"?waitMs=4000", "")
+		var j catalog.QueryJob
+		_ = json.Unmarshal(rec.Body.Bytes(), &j)
+		done <- out{j, time.Since(start)}
+	}()
+	time.Sleep(120 * time.Millisecond) // the request is now parked on a QUEUED job
+	select {
+	case <-done:
+		t.Fatal("long poll returned while the query was still queued")
+	default:
+	}
+	e.runAll()
+	select {
+	case o := <-done:
+		if o.job.Status != catalog.QuerySucceeded {
+			t.Fatalf("status = %s", o.job.Status)
+		}
+		if o.elapsed > 2*time.Second {
+			t.Fatalf("returned %s after the query finished", o.elapsed-120*time.Millisecond)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("long poll did not return after the query finished")
+	}
+}
+
+func TestQueryStatusLongPollTimesOutWithTheCurrentState(t *testing.T) {
+	e := newQueryEnv(t, nil, nil)
+	job, _ := e.submit("SELECT id FROM sales")
+	start := time.Now()
+	rec := e.do("GET", "/api/v1/queries/"+job.ID+"?waitMs=80", "")
+	var j catalog.QueryJob
+	_ = json.Unmarshal(rec.Body.Bytes(), &j)
+	if rec.Code != 200 || j.Status != catalog.QueryQueued {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	if d := time.Since(start); d < 60*time.Millisecond || d > time.Second {
+		t.Fatalf("waited %s, want about 80ms", d)
+	}
+}
+
+func TestQueryStatusIsImmediateWithoutWaitMsAndIgnoresBadValues(t *testing.T) {
+	e := newQueryEnv(t, nil, nil)
+	job, _ := e.submit("SELECT id FROM sales")
+	for _, q := range []string{"", "?waitMs=0", "?waitMs=-5", "?waitMs=abc"} {
+		start := time.Now()
+		rec := e.do("GET", "/api/v1/queries/"+job.ID+q, "")
+		if rec.Code != 200 || time.Since(start) > 200*time.Millisecond {
+			t.Fatalf("%q: %d after %s", q, rec.Code, time.Since(start))
+		}
+	}
+	if rec := e.do("GET", "/api/v1/queries/00000000-0000-4000-8000-000000000000?waitMs=50", ""); rec.Code != 404 {
+		t.Fatalf("unknown id with waitMs: %d", rec.Code)
+	}
+}

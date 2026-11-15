@@ -30,6 +30,16 @@ Errors use the §11 envelope. `query_denied` is `400`, `invalid_state` `409`,
 `result_expired` `410`, `resource_exhausted` `429`. Messages never echo the
 statement.
 
+## Start-up latency
+
+An idle worker does not wait out its poll interval: submitting a query (and creating an ingestion job)
+sends a PostgreSQL `NOTIFY` in the same transaction, and the worker holds a dedicated `LISTEN` connection per
+runner, so a committed job is claimed in a few milliseconds. A notification that never arrives (a dropped
+listener connection, which reconnects with backoff) only costs latency: the one-second poll
+is kept as the fallback and still finds the job. `GET /api/v1/queries/{id}?waitMs=N` holds the request until the
+query reaches a final state or `N` ms (at most 5000) pass; without it the response is immediate. See
+[`evaluation.md`](evaluation.md) for the measurement.
+
 ## Job state machine
 
 `QUEUED → RUNNING → SUCCEEDED | FAILED | CANCELLED | TIMED_OUT`, backed by the

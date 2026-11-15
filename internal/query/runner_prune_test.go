@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/akshat281204/lakehouse-query-studio/internal/catalog"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
@@ -229,4 +230,32 @@ func listObjects(tb testing.TB, h *harness) []objectstore.Object {
 		tb.Fatal(err)
 	}
 	return page.Objects
+}
+
+// BenchmarkTrivialQuery measures a SELECT 1 through the whole runner (claim,
+// validate, scratch dir, stage, DuckDB, spool, finish) against in-memory stores,
+// and reports where the time goes. It is the floor for any query's latency.
+func BenchmarkTrivialQuery(b *testing.B) {
+	h := newHarness(b, nil, nil)
+	var stage, exec, spool time.Duration
+	var n int
+	h.runner.OnTimings = func(t Timings) { stage += t.Stage; exec += t.Execute; spool += t.Spool; n++ }
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id, _ := catalog.NewUUID()
+		if _, err := h.store.Submit(context.Background(), catalog.SubmitQuery{
+			ID: id, Statement: "SELECT 1 AS one", StatementHash: StatementHash("SELECT 1 AS one"), Bindings: map[string]string{},
+		}); err != nil {
+			b.Fatal(err)
+		}
+		if ran, err := h.runner.RunOnce(context.Background()); err != nil || !ran {
+			b.Fatalf("ran=%v err=%v", ran, err)
+		}
+	}
+	b.StopTimer()
+	if n > 0 {
+		b.ReportMetric(float64(stage.Microseconds())/float64(n), "stage-us")
+		b.ReportMetric(float64(exec.Microseconds())/float64(n), "execute-us")
+		b.ReportMetric(float64(spool.Microseconds())/float64(n), "spool-us")
+	}
 }

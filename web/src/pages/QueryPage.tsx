@@ -7,6 +7,7 @@ import { SqlEditor } from '../components/SqlEditor'
 import { formatDuration, isTerminal } from '../lib/format'
 
 const DEFAULT_SQL = 'SELECT 1 AS one'
+const LONG_POLL_MS = 2000
 
 interface QueryPageProps {
   initialStatement?: string
@@ -52,13 +53,22 @@ export function QueryPage({
         let current = await api.submitQuery(statement)
         if (mine !== runId.current) return
         setJob(current)
+        // Ask the server to hold each status request until the query ends, so
+        // a fast query is seen the moment it finishes. A server that answers at
+        // once (an older one) falls back to polling: quickly at first, backing
+        // off to pollMs, so a long query stays cheap.
+        let wait = Math.min(pollMs, 25)
         while (!isTerminal(current.status)) {
-          await new Promise((r) => setTimeout(r, pollMs))
+          const asked = Date.now()
+          current = await api.getQuery(current.id, LONG_POLL_MS)
           if (mine !== runId.current) return
           setElapsed(Date.now() - started)
-          current = await api.getQuery(current.id)
-          if (mine !== runId.current) return
           setJob(current)
+          if (!isTerminal(current.status) && Date.now() - asked < 250) {
+            await new Promise((r) => setTimeout(r, wait))
+            if (mine !== runId.current) return
+            wait = Math.min(pollMs, Math.ceil(wait * 1.6))
+          }
         }
         setElapsed(Date.now() - started)
       } catch (e) {

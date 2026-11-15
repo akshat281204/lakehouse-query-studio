@@ -67,6 +67,9 @@ type Runner struct {
 	// OnTimings, if set, is called after each executed query with where its
 	// time went. Used by the benchmark; carries no statement text.
 	OnTimings func(Timings)
+	// Wake, if set, ends the idle wait early (the worker connects it to
+	// PostgreSQL LISTEN/NOTIFY). Polling every Cfg.Poll remains the fallback.
+	Wake <-chan struct{}
 
 	cache *StageCache
 	stats statsMemo
@@ -200,10 +203,13 @@ func (r *Runner) Run(ctx context.Context) {
 			if err != nil && ctx.Err() == nil {
 				r.Log.Error("query claim failed", "error", err.Error())
 			}
+			t := time.NewTimer(r.Cfg.Poll)
 			select {
 			case <-ctx.Done():
-			case <-time.After(r.Cfg.Poll):
+			case <-r.Wake:
+			case <-t.C:
 			}
+			t.Stop()
 			continue
 		}
 		wg.Add(1)

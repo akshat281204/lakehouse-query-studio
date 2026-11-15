@@ -10,7 +10,7 @@ GO_SOURCES := $(shell find cmd internal test -type f -name '*.go')
 
 .DEFAULT_GOAL := verify
 
-.PHONY: up down run web genenv test test-integration verify bench bench-sf1 demo \
+.PHONY: up down run web genenv test test-integration verify bench bench-sf1 latency demo \
         fmt vet lint go-test web-test go-build web-build typecheck build
 
 # --- Local stack -----------------------------------------------------------
@@ -62,11 +62,14 @@ lint: # Run the Go linter (golangci-lint when available) and web ESLint
 
 test: go-test web-test # Run Go and web unit tests
 
-test-integration: # Run Postgres-backed integration tests (needs TEST_POSTGRES_URL)
-	$(GO) test -tags integration -count=1 $(GO_PACKAGES)
+test-integration: # Run Postgres-backed integration tests (needs TEST_POSTGRES_URL); serial: the packages share one database
+	$(GO) test -tags integration -count=1 -p 1 $(GO_PACKAGES)
 
 bench: # Benchmark at the default scale (~600k lineitem rows); writes docs/results/
 	$(GO) run ./cmd/bench -scale 0.1 -iterations 15 -out docs/results/bench-sf0.1.json -md docs/results/bench-sf0.1.md
+
+latency: # Queue wait / worker time / total for a statement on the running stack (make latency SQL='SELECT 1')
+	$(GO) run ./cmd/latency -n 20 $(if $(SQL),-sql "$(SQL)")
 
 bench-sf1: # Opt-in larger run (~6M lineitem rows, needs ~2 GiB free RAM and several minutes)
 	$(GO) run ./cmd/bench -scale 1 -iterations 15 -concurrency-queries 16 -out docs/results/bench-sf1.json -md docs/results/bench-sf1.md

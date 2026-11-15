@@ -129,6 +129,7 @@ Reproduce with `make bench` (`make bench-sf1` for the larger run).
 | `make up` / `make down` | Start / stop the stack (data is kept) |
 | `make verify` | Format, vet, lint, Go and web tests, typecheck, builds, bundle-secret check |
 | `make test-integration` | Adds PostgreSQL-backed tests (needs `TEST_POSTGRES_URL`) |
+| `make latency` | Measure queue wait, worker time and client total of a statement on the running stack |
 | `make bench` / `make bench-sf1` | Benchmarks at ~600k / ~6M lineitem rows |
 | `make run` / `make web` | API / Vite dev server on the host |
 
@@ -174,7 +175,7 @@ All routes are under the browser-request guard (mutations need
 - `GET /healthz`, `GET /readyz` (per-dependency: `postgres`, `objectstore`), `GET /metrics`, `GET /api/v1/info`
 - `POST|GET /api/v1/datasets`, `GET /api/v1/datasets/{id}[/schema|/preview]`
 - `POST /api/v1/ingestions/inspect`, `POST|GET /api/v1/ingestions`, `GET /api/v1/ingestions/{id}`, `POST /api/v1/ingestions/{id}/retry`
-- `POST|GET /api/v1/queries`, `GET /api/v1/queries/{id}`, `POST /api/v1/queries/{id}/cancel`, `GET /api/v1/queries/{id}/results`, `GET /api/v1/queries/{id}/export`
+- `POST|GET /api/v1/queries`, `GET /api/v1/queries/{id}` (`?waitMs=N` long-polls up to 5 s), `POST /api/v1/queries/{id}/cancel`, `GET /api/v1/queries/{id}/results`, `GET /api/v1/queries/{id}/export`
 - `GET /api/v1/stats?window=1h|6h|24h|7d` — aggregates for the Overview, from the durable job records
 
 ## Verification

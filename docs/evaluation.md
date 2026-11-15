@@ -285,3 +285,33 @@ simple single-table `AND` shape; any gain on a remote store with real latency (o
 anything about hardware other than this machine; and the figures in the sf1 and in-memory tables beyond their
 direction, because of their variance. The unprunable controls show the in-memory runs' noise floor: o4 and o5 at
 sf0.1 execute identical work in both variants yet their medians differ by up to 19% (90 vs 107 ms for o5).
+
+### Phase 9 follow-up: time to start a query
+
+A report that `SELECT 1 AS one` felt slow (113 ms in the dashboard) led to measuring where a *trivial* query
+spends its time on the live stack (`go run ./cmd/latency`, public API only, PostgreSQL + SeaweedFS + worker on
+one machine). The worker found a new job only when its once-a-second poll fired, so every query waited about a
+second to be claimed no matter how cheap it was:
+
+| Statement | | queue wait p50 | worker p50 | client total p50 (POST -> SUCCEEDED) |
+|---|---|---:|---:|---:|
+| `SELECT 1 AS one` | before (poll only), n = 12 | 971.9 ms | 30.0 ms | 1,007.4 ms |
+| | after (LISTEN/NOTIFY), n = 30 | 3.7 ms | 12.1 ms | 24.9 ms |
+| aggregate over `demo-sales` | before, n = 12 | 964.4 ms | 36.7 ms | 1,007.9 ms |
+| | after, n = 30 | 3.8 ms | 17.2 ms | 25.4 ms |
+
+* The change: submitting a job sends a PostgreSQL `NOTIFY` inside the same transaction, the worker keeps a
+  `LISTEN` connection and wakes immediately; the 1 s poll remains as the fallback. The status endpoint also
+  accepts `?waitMs=N` (a long poll, capped at 5 s) so the dashboard learns the moment a query ends instead of at
+  its next timer tick.
+* Not attributable to the change: the *worker* column improved too, but the "before" runs were spaced a second
+  apart (an idle machine between queries) and the "after" runs were back to back, so that gap mixes in CPU and
+  cache state. Only the queue-wait and client-total columns are claimed.
+* Where the remaining ~12 ms of worker time goes (measured in-process with a throwaway timing test, in-memory
+  stores): building the per-query DuckDB database file 3.3 ms, reopening it read-only 2.6 ms, sealing 0.55 ms,
+  running the statement 0.13 ms. The read-only reopen is part of the safety boundary and was kept. A 300-byte S3 PUT
+  measured 0.8 ms and a PostgreSQL round trip 0.2 ms on this machine, so neither is a meaningful share.
+* In the dashboard, click to rendered result was 47-108 ms with a 500 ms client timer and 56-70 ms with the long
+  poll (10 samples each, headless Chrome through the Vite dev proxy); the status call (1 ms) and the first page
+  of results (3-4 ms) are fast, so the remainder is the browser and the dev proxy.
+* Only loopback was measured. Run `make latency` against your own stack.

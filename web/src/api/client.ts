@@ -186,8 +186,12 @@ export const api = {
       body: JSON.stringify({ statement }),
     }),
 
-  getQuery: (id: string) =>
-    request<QueryJob>(`/api/v1/queries/${encodeURIComponent(id)}`),
+  /** waitMs asks the server to hold the request until the query reaches a final
+   * state (or the wait elapses), so a fast query is seen the moment it ends. */
+  getQuery: (id: string, waitMs?: number) =>
+    request<QueryJob>(
+      `/api/v1/queries/${encodeURIComponent(id)}${waitMs ? `?waitMs=${waitMs}` : ''}`,
+    ),
 
   listQueries: (limit = 25, offset = 0) =>
     request<QueryListResponse>(

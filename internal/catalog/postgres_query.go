@@ -179,6 +179,9 @@ func (s *postgresQueryStore) Submit(ctx context.Context, req SubmitQuery) (Query
 		req.ID, req.Statement, req.StatementHash, bindings, idsJSON); err != nil {
 		return QueryJob{}, fmt.Errorf("insert query: %w", err)
 	}
+	if err := notify(ctx, tx, ChannelQueryJobs); err != nil {
+		return QueryJob{}, fmt.Errorf("notify workers: %w", err)
+	}
 	q, err := scanQuery(tx.QueryRowContext(ctx, `SELECT `+queryCols+` FROM query_jobs WHERE id = $1`, req.ID))
 	if err != nil {
 		return QueryJob{}, err
