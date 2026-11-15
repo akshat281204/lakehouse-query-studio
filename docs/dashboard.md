@@ -61,3 +61,12 @@ parameter selects a theme for that view, which is how the screenshots in
 Each theme in `web/src/themes.css` defines the full set of design tokens
 (colours, code-editor colours, radius, focus ring), and components only read
 tokens, so a new theme is one CSS block plus one entry in `web/src/lib/theme.ts`.
+
+## Background terrain
+
+The page background is a generated topographic map (contour lines, thicker index
+lines and depth labels), drawn as an SVG mask filled with the theme accent. Near the
+pointer a brighter copy of the lines shows through, and the map drifts slowly as the
+page scrolls. It is decorative only: hidden from assistive technology, switched off
+for reduced-motion preferences and touch screens, and it carries no data. The asset
+is `web/src/assets/contours.svg`.

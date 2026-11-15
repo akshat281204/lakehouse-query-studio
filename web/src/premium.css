@@ -14,38 +14,88 @@ body {
   position: relative;
 }
 
-/* Topographic contours: the lake seen from above. Pure decoration, fades out. */
-body::before {
-  content: '';
+/* Topographic terrain: the lake seen from above. Lines are a mask filled with the
+   accent. A glow copy shows only near the pointer; scroll shifts it slowly. */
+.terrain {
   position: fixed;
-  inset: 0 0 auto 0;
-  height: 78vh;
+  inset: 0;
   z-index: 0;
+  overflow: hidden;
   pointer-events: none;
+  animation: terrain-in 2.2s ease-out both;
+}
+.terrain i {
+  position: absolute;
+  inset: -30px 0 -150px 0;
   background: var(--accent);
-  opacity: var(--contour-alpha, 0.1);
-  -webkit-mask-image: url('./assets/contours.svg'),
-    linear-gradient(#000 20%, transparent 95%);
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
   -webkit-mask-size:
+    cover,
+    100% 100%;
+  mask-size:
     cover,
     100% 100%;
   -webkit-mask-position:
     center top,
     0 0;
-  -webkit-mask-repeat: no-repeat, no-repeat;
-  -webkit-mask-composite: source-in;
-  mask-image: url('./assets/contours.svg'),
-    linear-gradient(#000 20%, transparent 95%);
-  mask-size:
-    cover,
-    100% 100%;
   mask-position:
     center top,
     0 0;
-  mask-repeat: no-repeat, no-repeat;
+  -webkit-mask-composite: source-in;
   mask-composite: intersect;
+  will-change: transform;
 }
-#root {
+.t-base {
+  opacity: calc(var(--contour-alpha, 0.1) * 1.5);
+  -webkit-mask-image: url('./assets/contours.svg'),
+    linear-gradient(#000 0%, rgba(0, 0, 0, 0.6) 55%, rgba(0, 0, 0, 0.35) 100%);
+  mask-image: url('./assets/contours.svg'),
+    linear-gradient(#000 0%, rgba(0, 0, 0, 0.6) 55%, rgba(0, 0, 0, 0.35) 100%);
+}
+.t-glow {
+  opacity: calc(var(--contour-alpha, 0.1) * 8);
+  -webkit-mask-image: url('./assets/contours.svg'),
+    radial-gradient(
+      280px circle at var(--mx, -999px) var(--my, -999px),
+      #000 0%,
+      rgba(0, 0, 0, 0.5) 45%,
+      transparent 100%
+    );
+  mask-image: url('./assets/contours.svg'),
+    radial-gradient(
+      280px circle at var(--mx, -999px) var(--my, -999px),
+      #000 0%,
+      rgba(0, 0, 0, 0.5) 45%,
+      transparent 100%
+    );
+}
+@keyframes terrain-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@supports (animation-timeline: scroll()) {
+  .terrain i {
+    animation: terrain-shift linear both;
+    animation-timeline: scroll(root);
+  }
+  @keyframes terrain-shift {
+    to {
+      transform: translateY(-140px);
+    }
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .terrain,
+  .terrain i {
+    animation: none;
+  }
+}
+.shell {
   position: relative;
   z-index: 1;
 }
