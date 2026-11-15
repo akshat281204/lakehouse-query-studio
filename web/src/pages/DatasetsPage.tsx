@@ -121,7 +121,10 @@ export function DatasetsPage({ onOpen }: DatasetsPageProps) {
                     {d.versionStatus ?? 'READY'}
                   </span>
                 </span>
-                <span className="dataset-meta">
+                <span
+                  className="dataset-meta"
+                  title={`${d.sourcePrefix} · ${d.format}`}
+                >
                   {d.sourcePrefix} · {d.format}
                   {d.version !== undefined ? ` · v${d.version}` : ''}
                 </span>

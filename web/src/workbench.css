@@ -537,3 +537,42 @@ path.chart-line {
   border-color: color-mix(in srgb, var(--err) 35%, transparent);
   border-left: 3px solid var(--err);
 }
+
+/* ---- Dataset cards: one constant size, however long the name or path ---- */
+.dataset-list {
+  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+  grid-auto-rows: 7.25rem;
+}
+.dataset-list > li {
+  min-width: 0;
+  height: 100%;
+}
+.dataset-item {
+  height: 100%;
+  overflow: hidden;
+  justify-content: flex-start;
+}
+.dataset-top {
+  width: 100%;
+  min-width: 0;
+}
+.dataset-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dataset-top .status {
+  flex: none;
+}
+.dataset-meta {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  width: 100%;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  line-height: 1.45;
+}
