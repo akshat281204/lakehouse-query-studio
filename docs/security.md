@@ -83,6 +83,7 @@ statement text, object keys, ids and raw paths never appear.
 | `lqs_queue_depth` | `kind`, `state` |
 | `lqs_dependency_up` | `dependency` (`postgres`, `objectstore`) |
 | `lqs_worker_up`, `lqs_worker_inflight_queries`, `lqs_worker_query_slots` | — |
+| `lqs_stage_files_total`, `lqs_stage_files_pruned_total`, `lqs_stage_bytes_pruned_total`, `lqs_stage_cache_hits_total` | — |
 | `lqs_sweeper_deleted_total` | `kind` |
 | `lqs_build_info` | `version` |
 

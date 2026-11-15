@@ -28,6 +28,8 @@ type Harness struct {
 
 	val     *query.Validator
 	tmp     string
+	workers int
+	runners []*query.Runner
 	tmu     sync.Mutex // guards timings: the hook runs on worker goroutines
 	timings []query.Timings
 }
@@ -36,6 +38,12 @@ type Harness struct {
 type Config struct {
 	Limits  query.Limits
 	Workers int
+	// EnablePruning and StageCacheBytes select the runner's production
+	// optimisations for the main measurements. The default (both off) is the
+	// baseline every earlier result was produced with; the optimisation
+	// experiment (MeasureOptimizations) compares configurations explicitly.
+	EnablePruning   bool
+	StageCacheBytes int64
 	// Objects, when set, is used instead of an in-memory store (for a real
 	// S3/MinIO run). The dataset is then loaded into it.
 	Objects objectstore.ReadWriter
@@ -64,28 +72,44 @@ func NewHarness(ctx context.Context, scale float64, cfg Config) (*Harness, error
 	if h.tmp, err = os.MkdirTemp("", "lqs-bench-"); err != nil {
 		return nil, err
 	}
-	rc := query.DefaultRunnerConfig()
-	rc.TmpDir = h.tmp
-	rc.Limits = cfg.Limits
-	if cfg.Workers > 0 {
-		rc.Workers = cfg.Workers
-	}
-	rc.Poll = time.Millisecond
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h.Runner, err = query.NewRunner(h.Store, h.Objects, query.NewDuckDB(), h.val, "bench", rc, log)
-	if err != nil {
+	h.workers = cfg.Workers
+	if h.Runner, err = h.newRunner(!cfg.EnablePruning, cfg.StageCacheBytes); err != nil {
 		return nil, err
-	}
-	h.Runner.OnTimings = func(t query.Timings) {
-		h.tmu.Lock()
-		h.timings = append(h.timings, t)
-		h.tmu.Unlock()
 	}
 	return h, nil
 }
 
+// newRunner builds a query runner over the harness's store and objects with the
+// given optimisation settings, wired to record timings.
+func (h *Harness) newRunner(disablePruning bool, cacheBytes int64) (*query.Runner, error) {
+	rc := query.DefaultRunnerConfig()
+	rc.TmpDir = h.tmp
+	rc.Limits = h.Limits
+	if h.workers > 0 {
+		rc.Workers = h.workers
+	}
+	rc.Poll = time.Millisecond
+	rc.DisablePruning = disablePruning
+	rc.StageCacheBytes = cacheBytes
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r, err := query.NewRunner(h.Store, h.Objects, query.NewDuckDB(), h.val, "bench", rc, log)
+	if err != nil {
+		return nil, err
+	}
+	r.OnTimings = func(t query.Timings) {
+		h.tmu.Lock()
+		h.timings = append(h.timings, t)
+		h.tmu.Unlock()
+	}
+	h.runners = append(h.runners, r)
+	return r, nil
+}
+
 // Close releases temporary resources.
 func (h *Harness) Close() {
+	for _, r := range h.runners {
+		_ = r.Close()
+	}
 	_ = h.val.Close()
 	_ = os.RemoveAll(h.tmp)
 }
@@ -118,6 +142,10 @@ type Sample struct {
 	BytesStaged int64
 	ResultBytes int64
 	Truncated   bool
+
+	FilesListed, FilesStaged, FilesPruned, CacheHits int
+	BytesPruned                                      int64
+	PruneWork                                        bool
 }
 
 // Once runs a single query to completion and returns its measurements and
@@ -147,6 +175,8 @@ func (h *Harness) Once(ctx context.Context, stmt string) (Sample, []map[string]a
 	if len(h.timings) == 1 {
 		t := h.timings[0]
 		s.Stage, s.Execute, s.Spool = t.Stage, t.Execute, t.Spool
+		s.FilesListed, s.FilesStaged, s.FilesPruned = t.FilesListed, t.FilesStaged, t.FilesPruned
+		s.CacheHits, s.BytesPruned, s.PruneWork = t.CacheHits, t.BytesPruned, t.PruneWork
 	}
 	h.tmu.Unlock()
 	rr, err := parquet.ReadRows(ctx, h.Objects, job.ResultRef, *job.ResultBytes, 0, 100_000)

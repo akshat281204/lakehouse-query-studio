@@ -42,6 +42,11 @@ type Metrics struct {
 	QueryCancels      *Counter
 	QueryRowsReturned *Counter
 
+	StageFiles       *Counter
+	StageFilesPruned *Counter
+	StageBytesPruned *Counter
+	StageCacheHits   *Counter
+
 	IngestJobs     *Counter
 	IngestDuration *Histogram
 
@@ -73,6 +78,10 @@ func New(version string) *Metrics {
 		latency, nil, nil)
 	m.QueryCancels = r.NewCounter("lqs_query_cancel_requests_total", "Cancel requests accepted by the API.", nil, nil)
 	m.QueryRowsReturned = r.NewCounter("lqs_query_rows_returned_total", "Rows returned by succeeded queries.", nil, nil)
+	m.StageFiles = r.NewCounter("lqs_stage_files_total", "Dataset objects staged for queries.", nil, nil)
+	m.StageFilesPruned = r.NewCounter("lqs_stage_files_pruned_total", "Dataset objects skipped because their statistics or directory names ruled them out.", nil, nil)
+	m.StageBytesPruned = r.NewCounter("lqs_stage_bytes_pruned_total", "Bytes of dataset objects skipped by file pruning.", nil, nil)
+	m.StageCacheHits = r.NewCounter("lqs_stage_cache_hits_total", "Staged dataset objects served from the local stage cache.", nil, nil)
 	m.IngestJobs = r.NewCounter("lqs_ingest_jobs_total", "Finished ingestion jobs by outcome.",
 		[]string{"outcome"}, [][]string{IngestOutcomes})
 	m.IngestDuration = r.NewHistogram("lqs_ingest_duration_seconds", "Ingestion job duration.", latency, nil, nil)

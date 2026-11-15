@@ -37,7 +37,10 @@ func run() error {
 	threads := flag.Int("threads", 4, "DuckDB threads per query")
 	memory := flag.String("memory", "2GiB", "DuckDB memory limit per query")
 	scanGiB := flag.Float64("max-scan-gib", 4, "per-query staging limit in GiB (raise for larger scales)")
+	optimize := flag.Bool("optimizations", true, "also measure file pruning and the stage cache against the baseline")
+	cacheMiB := flag.Int("stage-cache-mib", 2048, "stage cache size for the optimisation experiment")
 	useS3 := flag.Bool("s3", false, "use the object store from MINIO_* env instead of memory (not covered by tests)")
+	keepS3 := flag.Bool("keep-s3-data", false, "with -s3: leave the generated bench/ objects in the bucket (default: delete them afterwards)")
 	flag.Parse()
 
 	var levels []int
@@ -59,11 +62,18 @@ func run() error {
 	cfg := bench.Config{Limits: lim}
 	store := "in-memory object store (no network latency; staging is a memory copy)"
 	if *useS3 {
-		cfg.Objects = objectstore.New(objectstore.Config{
+		c := objectstore.New(objectstore.Config{
 			Endpoint: os.Getenv("MINIO_ENDPOINT"), AccessKey: os.Getenv("MINIO_ACCESS_KEY"), SecretKey: os.Getenv("MINIO_SECRET_KEY"),
 			Bucket: os.Getenv("MINIO_BUCKET"), Region: "us-east-1", UseSSL: os.Getenv("MINIO_USE_SSL") == "true",
 		})
-		store = "S3-compatible object store from MINIO_* env"
+		if err := c.EnsureBucket(ctx); err != nil {
+			return fmt.Errorf("object store: %w", err)
+		}
+		cfg.Objects = c
+		store = "S3-compatible object store from MINIO_* env (real HTTP requests, local loopback)"
+		if !*keepS3 {
+			defer cleanupBenchObjects(c)
+		}
 	}
 
 	fmt.Fprintf(os.Stderr, "generating workload (scale %g)...\n", *scale)
@@ -86,7 +96,7 @@ func run() error {
 			"Workload is TPC-H-LIKE (seeded, same table shapes and cardinality ratios), not TPC-H: it was not produced by dbgen and must not be reported as TPC-H.",
 			"Single machine, single process; the API, worker and benchmark share one CPU and one memory pool.",
 			"The object store is in memory unless -s3 is used, so staging cost excludes network latency and S3 throughput.",
-			"Every query stages (downloads) all files of every dataset it references before DuckDB runs; there is no cache, so 'warm' means a warm OS page cache and warmed code paths, not a result or data cache.",
+			"The main latency, concurrency and layout sections use the baseline runner: every query stages (downloads) all files of every dataset it references, with no file pruning and no cache, so 'warm' means a warm OS page cache and warmed code paths, not a data cache. Pruning and the stage cache are measured only in the optimisation section, against that baseline.",
 			"The OS page cache was not dropped, so 'first' is first-after-generation, not a guaranteed cold read.",
 			"'Bytes scanned' is not available from the engine; 'bytes staged' is the bytes downloaded for the query and is an upper bound on what DuckDB read.",
 			"Percentiles come from few samples; p95/p99 are at or near the maximum. Median differences under 10% or 5 ms are not reported as differences.",
@@ -140,6 +150,16 @@ func run() error {
 		}
 		rep.Concurrency = append(rep.Concurrency, r)
 	}
+	if *optimize {
+		for _, oq := range bench.OptimizationQueries() {
+			fmt.Fprintf(os.Stderr, "optimisations: %s...\n", oq.ID)
+			r, err := h.MeasureOptimizations(ctx, oq, *iters, int64(*cacheMiB)<<20)
+			if err != nil {
+				return err
+			}
+			rep.Optimization = append(rep.Optimization, r)
+		}
+	}
 	for _, part := range []string{"", "l_returnflag"} {
 		fmt.Fprintf(os.Stderr, "ingesting %d rows (partition %q)...\n", *ingestRows, part)
 		r, err := bench.MeasureIngest(ctx, *ingestRows, part)
@@ -165,4 +185,31 @@ func run() error {
 		rep.Markdown(f)
 	}
 	return nil
+}
+
+// cleanupBenchObjects deletes the generated workload (everything under bench/)
+// so a run against a real store leaves nothing behind. It touches no other prefix.
+func cleanupBenchObjects(c *objectstore.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	token, n := "", 0
+	for {
+		page, err := c.List(ctx, objectstore.ListOptions{Prefix: "bench/", MaxKeys: 1000, Token: token})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "bench: cleanup list:", err)
+			return
+		}
+		for _, o := range page.Objects {
+			if err := c.Delete(ctx, o.Key); err != nil {
+				fmt.Fprintln(os.Stderr, "bench: cleanup delete:", err)
+				return
+			}
+			n++
+		}
+		if !page.Truncated || page.NextToken == "" {
+			break
+		}
+		token = page.NextToken
+	}
+	fmt.Fprintf(os.Stderr, "removed %d generated objects from the bucket\n", n)
 }

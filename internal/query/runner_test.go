@@ -26,7 +26,7 @@ type harness struct {
 
 func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-func newHarness(t *testing.T, engine Engine, mutate func(*RunnerConfig)) *harness {
+func newHarness(t testing.TB, engine Engine, mutate func(*RunnerConfig)) *harness {
 	t.Helper()
 	store := catalog.NewMemoryQueryStore()
 	objects := objectstore.NewMemory()

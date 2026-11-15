@@ -104,6 +104,7 @@ func run() error {
 	queryRunner, err := query.NewRunner(catalog.NewPostgresQueryStore(db), queryObjects, query.NewDuckDB(), validator, owner,
 		query.RunnerConfig{
 			Workers: q.Workers, Lease: q.Lease, Heartbeat: q.Heartbeat, TmpDir: q.TmpDir,
+			StageCacheBytes: q.StageCacheBytes, DisablePruning: q.DisablePruning,
 			Limits: query.Limits{
 				Timeout: q.Timeout, MaxRows: q.MaxRows, MaxResultBytes: q.MaxResultBytes,
 				MaxRowBytes: q.MaxRowBytes, MaxScanBytes: q.MaxScanBytes, Threads: q.Threads, MemoryLimit: q.Memory,
@@ -112,6 +113,8 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("query runner: %w", err)
 	}
+
+	defer func() { _ = queryRunner.Close() }()
 
 	metrics := telemetry.New("worker")
 	metrics.WorkerUp.Set(1)

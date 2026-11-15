@@ -139,6 +139,53 @@ Known limits of this boundary:
   catalog, conversion or parser message, which can mention a column name or a
   data value from the caller's own query; other errors are generic.
 
+## File pruning and the stage cache (phase 9)
+
+Staging is the dominant cost of a query (see [`evaluation.md`](evaluation.md)), so the
+worker avoids staging bytes a query cannot need.
+
+**File pruning.** For a statement of the shape `SELECT ... FROM <one dataset> WHERE c1 AND c2 ...`
+the validator also records the top-level `AND` conjuncts of the form `column <op> literal`
+(`= <> < <= > >=`, `IN (...)`, `BETWEEN`; the parser turns `NOT (a = b)` into `a <> b` and a
+reversed `5 < col` is flipped). A file is **skipped only when its statistics prove no row can
+satisfy one of them**:
+
+* *Footer statistics.* Each file's Parquet footer is read (two range reads, memoised by
+  object key + size + modified time) and its per-column min / max / null count compared with the
+  literal. Supported types: `int32`, `int64`, `double`, `string`, `boolean`. Doubles are compared
+  with the literal widened by a few ULPs, `<>` on doubles never prunes, and a column that is
+  entirely `NULL` cannot match any comparison.
+* *Hive directory names* (registered, hive-partitioned data only): `name=value` segments are
+  compared only when DuckDB's type auto-detection cannot change their meaning (canonical
+  integers against integer literals, purely alphabetic strings against string literals).
+* The in-repo writer now emits `min_value` / `max_value` / `null_count`, so ingested data is
+  prunable; files written by other tools are prunable when they carry statistics, and are simply
+  kept when they do not.
+
+Pruning is **off** (every file is staged) for anything it cannot reason about with certainty:
+no `WHERE`, `OR`, expressions or function calls on the column, a join, subquery, `WITH`, set
+operation, `USING SAMPLE`, `QUALIFY`, a literal whose kind does not match the column, an unknown
+column, missing or unreadable statistics. If every file is ruled out, the smallest is still staged
+so the engine can read the schema (it returns no rows). Skipped files do not count against
+`MAX_SCAN_BYTES`. Pruning never changes a result: `TestPruningNeverChangesResults` runs a
+filter set with pruning on and off and compares the rows, a randomised property test checks the
+skip decision against a brute-force oracle, and the benchmark verifies identical answers across
+configurations. Disable with `QUERY_PRUNING=off`.
+
+**Stage cache.** `STAGE_CACHE_BYTES` (default 512 MiB, `0` disables) keeps staged objects on local
+disk in a private `0700` directory under `QUERY_TMP_DIR`, evicted least-recently-used. A query
+"stages" a cached object by hard-linking it into its scratch directory (a copy only where links are
+unavailable), so a repeat read copies no bytes and eviction never disturbs a running query. An
+entry is keyed by object key, size and modified time; **dataset prefixes must be treated as
+immutable** (ingestion always writes new versioned prefixes), because an object rewritten in place
+with the same size inside the timestamp's resolution would be served stale. The cache directory is
+removed on a clean worker shutdown; directories left by a crashed worker are removed at the next
+start once a day old. Bytes in the cache are dataset bytes: it has the same trust boundary as the
+scratch directories (single operator, local disk).
+
+Counters `lqs_stage_files_total`, `lqs_stage_files_pruned_total`, `lqs_stage_bytes_pruned_total`
+and `lqs_stage_cache_hits_total` are exported by the worker.
+
 ## Deviations from the phase-0 design
 
 | Design | Implemented | Why |

@@ -264,3 +264,46 @@ func TestExecuteOnlyVerdict(t *testing.T) {
 		t.Error(v)
 	}
 }
+
+func TestOptimizationsPruneWhereTheyCanAndNeverChangeAnswers(t *testing.T) {
+	lim := query.DefaultLimits()
+	lim.Timeout = time.Minute
+	h, err := NewHarness(context.Background(), 0.05, Config{Limits: lim})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	byID := map[string]OptimizationResult{}
+	for _, q := range OptimizationQueries() {
+		r, err := h.MeasureOptimizations(context.Background(), q, 1, 256<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !r.AnswersMatch || len(r.Variants) != 3 {
+			t.Fatalf("%s: %+v", q.ID, r)
+		}
+		byID[q.ID] = r
+	}
+	base := func(id string) OptimizationVariant { return byID[id].Variants[0] }
+	prune := func(id string) OptimizationVariant { return byID[id].Variants[1] }
+	cache := func(id string) OptimizationVariant { return byID[id].Variants[2] }
+
+	if base("o1-partition-column").FilesPruned != 0 {
+		t.Fatal("baseline must not prune")
+	}
+	if p := prune("o1-partition-column"); p.FilesPruned == 0 || p.BytesStaged >= base("o1-partition-column").BytesStaged {
+		t.Fatalf("partition filter did not prune: %+v", p)
+	}
+	if p := prune("o2-clustered-range"); p.FilesPruned == 0 || p.BytesStaged >= base("o2-clustered-range").BytesStaged {
+		t.Fatalf("clustered range did not prune: %+v", p)
+	}
+	if p := prune("o3-spread-column"); p.FilesPruned != 0 {
+		t.Fatalf("a column present in every file must not prune any: %+v", p)
+	}
+	if c := cache("o5-full-scan"); c.CacheHits != c.FilesStaged || c.FilesStaged == 0 {
+		t.Fatalf("warm cache variant: %+v", c)
+	}
+	if !strings.Contains(byID["o3-spread-column"].PruningVerdict, "no files could be ruled out") {
+		t.Fatalf("verdict: %s", byID["o3-spread-column"].PruningVerdict)
+	}
+}

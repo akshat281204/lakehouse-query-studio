@@ -65,6 +65,7 @@ type Report struct {
 	Concurrency  []ConcurrencyResult   `json:"concurrency"`
 	Ingest       []IngestResult        `json:"ingestion"`
 	Partitioning []PartitionComparison `json:"partitioning"`
+	Optimization []OptimizationResult  `json:"optimizations"`
 	Limitations  []string              `json:"limitations"`
 }
 
@@ -222,6 +223,19 @@ func (r *Report) Markdown(w io.Writer) {
 	for _, p := range r.Partitioning {
 		wf(w, "| %s | %.0f | %.0f | %.0f | %.0f | %d / %d | %s | %s |\n", p.Pair, p.FlatP50Ms, p.PartitionedP50Ms,
 			p.FlatExecP50Ms, p.PartExecP50Ms, p.FlatBytesStaged, p.PartBytesStaged, p.Verdict, p.ExecVerdict)
+	}
+
+	if len(r.Optimization) > 0 {
+		wf(w, "\n### File pruning and stage cache\n\nSame dataset, same queries, three runner configurations measured interleaved. The answer of every variant was checked identical to the baseline's. 'First run' is the first execution of that variant (footers unread, cache empty: the one-time cost); p50/p95 are warm repeats, where 'cache' numbers are the repeated-identical-access best case (every file already cached).\n\n")
+		for _, o := range r.Optimization {
+			wf(w, "**%s** — %s\n\n`%s`\n\n", o.ID, o.Description, o.SQL)
+			wf(w, "| Variant | first run ms | p50 ms | p95 ms | stage p50 | execute p50 | files staged / listed | bytes staged | cache hits |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+			for _, v := range o.Variants {
+				wf(w, "| %s | %.0f | %.0f | %.0f | %.0f | %.0f | %d / %d | %.1f MiB | %d |\n", v.Name, v.FirstRunMs, v.Total.P50Ms, v.Total.P95Ms,
+					v.Stage.P50Ms, v.Execute.P50Ms, v.FilesStaged, v.FilesListed, float64(v.BytesStaged)/(1<<20), v.CacheHits)
+			}
+			wf(w, "\n- %s\n- %s\n\n", o.PruningVerdict, o.CacheVerdict)
+		}
 	}
 
 	wf(w, "\n### Ingestion throughput (CSV -> Parquet)\n\n| Rows | Input MiB | Output MiB | Files | Seconds | Rows/s | Input MiB/s | Partition |\n|---:|---:|---:|---:|---:|---:|---:|---|\n")

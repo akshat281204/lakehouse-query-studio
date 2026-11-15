@@ -83,10 +83,14 @@ Reproduce with `make bench` (`make bench-sf1` for the larger run).
 | ~600k lineitem rows (50 MiB) | 12-32 ms across the query set | Concurrency 1 to 2 workers: ~39 to ~70 queries/s |
 | ~6M lineitem rows (504 MiB) | 28-1000 ms; selective scans ~700 ms | Staging is most of the time; ~1.2 queries/s at every concurrency level |
 
-* Every query downloads (stages) all files of the datasets it names before
-  DuckDB runs, and that copy dominates latency at the larger scale. There is no cache.
-* **No benefit from partitioning was measured**: the same bytes are staged and
-  DuckDB execute time was equal or worse with the hive-partitioned layout.
+* The baseline downloads (stages) all files of the datasets a query names, and that copy dominates latency at
+  the larger scale.
+* **File pruning and a local stage cache** (phase 9) cut that cost. Measured over real HTTP requests at ~600k
+  rows, a filter on a partition column went from 266 to 47 ms (3 of 21 files staged) and a clustered key range
+  from 247 to 91 ms (1 of 3 files); at ~6M rows a clustered range staged 1 of 30 files (503.6 to 16.8 MiB).
+  A repeated read served from the cache took 13-20 ms, including queries that cannot prune. Pruning only helps
+  where files can be ruled out (a column present in every file saw no gain), and the first read of a dataset
+  is not faster. Method, controls and caveats: [`docs/evaluation.md`](docs/evaluation.md).
 * CSV to Parquet ingestion ran at roughly 40-50 MiB/s (about 760k-875k rows/s) in this setup.
 
 ## What this is not
@@ -98,9 +102,9 @@ Reproduce with `make bench` (`make bench-sf1` for the larger run).
 * No per-query scoped object-store credentials, no OpenTelemetry tracing, and the
   least-privilege object-store policies in `ops/minio-policies/` are not
   enforced by default (see [`docs/security.md`](docs/security.md)).
-* No partition pruning at the storage layer; no result or data cache.
+* File pruning is conservative: it skips files only for simple single-table `AND` filters on `int`/`double`/`string`/`boolean` columns. There is no result cache and no index; any other query stages every file.
 * The Parquet writer supports boolean, int64, double and string, uncompressed.
-* No performance claim here goes beyond the measured table above.
+* No performance claim here goes beyond the measured numbers above.
 
 ## Repository layout
 
@@ -150,7 +154,9 @@ historical: they configure **any S3-compatible store**.
 | `QUERY_LEASE_DURATION` | `120s` | Query lease (max 600s) |
 | `MAX_RESULT_ROWS` / `MAX_RESULT_BYTES` / `MAX_ROW_BYTES` | `10000` / `268435456` / `1048576` | Result bounds (byte values are integers; hard max 100000 / 1 GiB / 16 MiB) |
 | `MAX_PAGE_BYTES` / `MAX_EXPORT_BYTES` / `MAX_EXPORT_ROWS` | `4194304` / `67108864` / `50000` | Paging and CSV export bounds |
-| `MAX_SCAN_BYTES` | `1073741824` | Dataset bytes one query may stage |
+| `MAX_SCAN_BYTES` | `1073741824` | Dataset bytes one query may stage (files skipped by pruning do not count) |
+| `STAGE_CACHE_BYTES` | `536870912` | Local-disk cache of staged dataset objects; `0` disables |
+| `QUERY_PRUNING` | `on` | `off` stops skipping files whose statistics rule them out |
 | `QUEUE_DEPTH` | `100` | Combined queued query + ingestion jobs |
 | `DUCKDB_THREADS` / `DUCKDB_MEMORY` | `min(4, cpus)` / `2GiB` | Per-query DuckDB budgets |
 | `QUERY_TMP_DIR` | OS temp dir | Per-query scratch parent |

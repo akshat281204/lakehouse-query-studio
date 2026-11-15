@@ -49,8 +49,8 @@ dirty flag, limits). The workload is seeded, so two runs generate identical byte
   unfiltered projection truncated at the 10,000-row limit. All pass the production SQL validator.
 * **Samples:** 1 "first" run (first after generation or the previous query; the OS page cache
   is **not** dropped, so this is not a guaranteed cold read) and 15 warm runs. "Warm" means a warm
-  OS cache and warmed code paths; there is **no** result or data cache in the system, so every
-  query re-stages its datasets. With 15 samples p95 and p99 sit at or next to the maximum.
+  OS cache and warmed code paths. These sections use the **baseline runner** (no file pruning, no stage
+  cache), so every query re-stages its datasets; pruning and the cache are measured separately below. With 15 samples p95 and p99 sit at or next to the maximum.
 * **Throughput:** 24 (SF0.1) or 16 (SF1) queries from the mixed set are submitted at once and
   drained with 1, 2 and 4 concurrent query slots; latency includes queue wait.
 * **Partitioned vs unpartitioned:** the same rows are written flat (30 files at SF1) and
@@ -209,3 +209,79 @@ Findings from these tests that changed the product:
 * In-memory object store; no network or S3 behavior is represented.
 * Latencies are small-sample statistics; percentiles above p95 are effectively the maximum.
 * No comparison against other engines or other DuckDB configurations (threads and memory were fixed).
+
+## Phase 9: file pruning and the stage cache
+
+Phase 7 found that staging (copying every file of every referenced dataset) dominates latency and that
+partitioning gave no measurable benefit, because the same bytes were staged either way. Phase 9 changes
+what is staged. What was added is described in [`queries.md`](queries.md); this section only reports what was
+**measured**.
+
+**Method.** `make bench` now ends its query measurements with an experiment on one dataset and five
+statements, each run under three runner configurations **interleaved** (baseline, then file pruning, then
+file pruning + stage cache, repeated 15 times) so machine drift hits all three equally. The warm-up run of each
+configuration also verifies its answer is **identical** to the baseline's; a different answer aborts the run.
+Same reporting rule as before: a difference is stated only if it exceeds 10% **and** 5 ms, and a variant with
+p95 > 2x p50 is marked inconclusive. Files: `docs/results/bench-phase9-sf0.1.*` (in-memory store),
+`bench-phase9-sf0.1-s3.*` (a real S3-compatible server, SeaweedFS over loopback HTTP, objects deleted afterwards)
+and `bench-phase9-sf1.*` (in-memory, about 6M lineitem rows). The unsuffixed `bench-sf0.1.*` / `bench-sf1.*` are the
+unchanged phase-7 baseline runs the earlier sections of this document describe. Same machine and caveats as above (not isolated).
+
+The five statements (the third and fifth are controls that **cannot** be pruned):
+
+| ID | Statement shape | Can it prune? |
+|---|---|---|
+| o1 | `WHERE l_year = 1995` on the hive-partitioned layout | yes: directory names |
+| o2 | `WHERE l_orderkey BETWEEN 1 AND 20000` on flat files clustered by order key | yes: footer min/max |
+| o3 | `WHERE l_year = 1995` on the flat layout (every file holds every year) | no |
+| o4 | `WHERE o_orderkey = 17` on `orders` | only when `orders` has several files (sf1) |
+| o5 | unfiltered aggregate | no filter |
+
+**Results, real S3 requests (sf0.1, p50 end to end ms, baseline / pruning / pruning + cache):**
+
+| | baseline | file pruning | + stage cache | files staged / listed | bytes staged |
+|---|---:|---:|---:|---:|---|
+| o1 partition column | 266 | 47 | 16 | 3 / 21 | 45.8 -> 6.5 MiB |
+| o2 clustered range | 247 | 91 | 13 | 1 / 3 | 50.4 -> 16.8 MiB |
+| o3 spread column | 232 | 241 | 15 | 3 / 3 | 50.4 MiB (unchanged) |
+| o4 point lookup (1 file) | 45 | 46 | 13 | 1 / 1 | 7.2 MiB (unchanged) |
+| o5 full scan | 265 | 258 | 20 | 3 / 3 | 50.4 MiB (unchanged) |
+
+**Results at about 6M rows (sf1, in-memory store):**
+
+| | baseline p50 | file pruning p50 | files staged / listed | bytes staged |
+|---|---:|---:|---|---|
+| o1 partition column | 180 | 43 | 30 / 210 | 458.0 -> 65.4 MiB |
+| o2 clustered range | 759 | 17 | 1 / 30 | 503.6 -> 16.8 MiB |
+| o4 point lookup | 92 | 14 | 1 / 8 | 72.1 -> 9.6 MiB |
+
+What the numbers support:
+
+* **Pruning removes the bytes it can prove unnecessary, and the saving follows the bytes.** Staged bytes fell by
+  86% (o1) and 67% (o2) at sf0.1 and by 86%, 97% and 87% (o1, o2, o4) at sf1. End-to-end p50 fell from 266 to 47 ms
+  (o1, -82%) and 247 to 91 ms (o2, -63%) over real HTTP requests, where the run-to-run spread was small (p95 within
+  about 20% of p50). The sf1 and in-memory runs show the same direction with much larger spread (p95 up to 5x p50
+  on this non-isolated machine), so their millisecond figures are indicative only.
+* **This reverses the Phase 7 finding about partitioning.** `l_year = 1995` on the partitioned layout now stages
+  3 of 21 files (30 of 210 at sf1) instead of all of them; Phase 7 measured identical bytes.
+* **Pruning only helps where the data is laid out to allow it.** o3 filters on a column present in every file, so
+  no file can be ruled out: 3 of 3 files were staged and the p50 difference (232 vs 241 ms) is under the reporting
+  threshold. Flat files help when they are **clustered** by the filtered column (o2), not when the column is
+  spread across them (o3).
+* **The stage cache removes the copy.** With every file already cached (repeated identical access: the best
+  case) staging dropped to about 1 ms and end-to-end p50 to 13-20 ms in every row, including the unprunable
+  ones (o3, o5: 232 -> 15 ms and 265 -> 20 ms over real HTTP). It does not change what DuckDB does (execute
+  times are unchanged) and it only helps repeats; a first read pays the full cost, and the cache run's first
+  execution is not faster than the baseline's.
+* **Pruning overhead is small but not zero.** With statistics already memoised, evaluating 200 files costs
+  about 0.11 ms (`BenchmarkPruneObjectsMemoised`); reading and parsing 200 footers from an in-memory store costs
+  about 0.33 ms (`BenchmarkPruneObjectsColdFooters`). **Not measured:** the cost of the first query on a large
+  dataset against a remote store, where 200 files means 400 range requests (run 8 at a time). In the loopback
+  run, the first execution of o3 (three footers read, nothing pruned) took 303 ms against 230 ms for the
+  baseline's first run; with a single sample that cannot be separated from noise.
+
+What is **not** supported by these runs, and is not claimed: any gain from pruning for statements outside the
+simple single-table `AND` shape; any gain on a remote store with real latency (only loopback was measured);
+anything about hardware other than this machine; and the figures in the sf1 and in-memory tables beyond their
+direction, because of their variance. The unprunable controls show the in-memory runs' noise floor: o4 and o5 at
+sf0.1 execute identical work in both variants yet their medians differ by up to 19% (90 vs 107 ms for o5).
