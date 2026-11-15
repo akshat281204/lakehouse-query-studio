@@ -61,7 +61,7 @@ describe('CommandPalette', () => {
     const h = setup()
     await waitFor(() => screen.getByRole('option', { name: /^sales/ }))
     fireEvent.change(screen.getByRole('combobox'), {
-      target: { value: 'preview sales' },
+      target: { value: 'sales' },
     })
     fireEvent.click(
       screen.getByRole('option', { name: /preview rows from sales/i }),
