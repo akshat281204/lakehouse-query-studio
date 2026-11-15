@@ -11,8 +11,7 @@ background jobs executed by **single-node DuckDB**.
 > another engine later.
 
 <p align="center">
-  <img src="docs/images/overview-light.png" alt="Overview dashboard (light theme)" width="49%">
-  <img src="docs/images/overview-dark.png" alt="Overview dashboard (dark theme)" width="49%">
+  <img src="docs/images/overview-light.png" alt="Overview dashboard" width="98%">
 </p>
 <p align="center">
   <img src="docs/images/workbench-results.png" alt="SQL workbench with results" width="49%">
