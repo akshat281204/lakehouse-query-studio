@@ -13,6 +13,7 @@ import {
   LatencyHistogram,
   RangeBar,
 } from '../components/charts'
+import { OverviewSkeleton } from '../components/Skeleton'
 import { compact, formatBytesLong, ms, timeAgo } from '../lib/format'
 
 const WINDOWS: { key: StatsWindow; label: string }[] = [
@@ -126,7 +127,7 @@ export function OverviewPage() {
     return (
       <main className="page">
         {header}
-        <p>Loading overview…</p>
+        <OverviewSkeleton label="Loading overview…" />
       </main>
     )
   }

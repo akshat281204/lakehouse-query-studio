@@ -915,3 +915,201 @@ button,
 .button-link {
   border-color: var(--border-strong);
 }
+
+/* ---- Command palette ---- */
+.palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 14vh;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+  backdrop-filter: blur(6px) saturate(1.2);
+  animation: palette-fade 0.14s ease-out;
+}
+@keyframes palette-fade {
+  from {
+    opacity: 0;
+  }
+}
+.palette {
+  width: min(38rem, calc(100vw - 2rem));
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 18px;
+  box-shadow:
+    var(--shadow-md),
+    0 0 0 1px color-mix(in srgb, #000 4%, transparent);
+  animation: palette-in 0.16s cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+@keyframes palette-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.985);
+  }
+}
+.palette-input {
+  width: 100%;
+  padding: 1.05rem 1.25rem;
+  font-size: 1.02rem;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  color: var(--text);
+}
+.palette-input:focus {
+  box-shadow: none;
+  outline: none;
+  border-color: var(--border);
+}
+.palette-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.4rem;
+  max-height: 21rem;
+  overflow-y: auto;
+}
+.palette-group {
+  padding: 0.65rem 0.8rem 0.3rem;
+  font-size: 0.74rem;
+  font-weight: 500;
+  color: var(--text-3);
+}
+.palette-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.55rem 0.8rem;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 0.93rem;
+}
+.palette-item small {
+  color: var(--text-3);
+  font-size: 0.78rem;
+}
+.palette-item[aria-selected='true'] {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.palette-item[aria-selected='true'] small {
+  color: var(--text-2);
+}
+.palette-empty {
+  padding: 1.4rem;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 0.9rem;
+}
+.palette-foot {
+  display: flex;
+  gap: 1.2rem;
+  padding: 0.6rem 1rem;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 0.75rem;
+  color: var(--text-3);
+}
+kbd {
+  display: inline-block;
+  min-width: 1.35rem;
+  padding: 0.08rem 0.38rem;
+  margin-right: 0.25rem;
+  font-family: var(--font-sans);
+  font-size: 0.72rem;
+  text-align: center;
+  color: var(--text-2);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 6px;
+}
+.kbd-hint {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  cursor: pointer;
+}
+.kbd-hint kbd {
+  margin: 0;
+  padding: 0.28rem 0.55rem;
+  font-size: 0.76rem;
+}
+.kbd-hint:hover kbd {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* ---- Skeletons ---- */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+.skeleton-page {
+  padding-top: 0.5rem;
+}
+.sk {
+  border-radius: 12px;
+  background: linear-gradient(
+    100deg,
+    var(--surface-hover) 30%,
+    color-mix(in srgb, var(--surface-hover) 40%, var(--surface)) 50%,
+    var(--surface-hover) 70%
+  );
+  background-size: 220% 100%;
+  animation: sk-shimmer 1.5s ease-in-out infinite;
+}
+@keyframes sk-shimmer {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -120% 0;
+  }
+}
+.sk-hero {
+  height: 3.2rem;
+  width: min(46rem, 100%);
+  margin-bottom: 0.8rem;
+}
+.sk-hero.short {
+  width: min(30rem, 70%);
+}
+.sk-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 1.4rem;
+  margin: 2.6rem 0;
+}
+.sk-fig {
+  height: 4.2rem;
+}
+.sk-chart {
+  height: 17rem;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sk,
+  .palette,
+  .palette-backdrop {
+    animation: none;
+  }
+}
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-3);
+}
+.btn-ghost:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}

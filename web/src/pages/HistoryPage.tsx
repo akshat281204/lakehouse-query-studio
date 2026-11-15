@@ -1,3 +1,4 @@
+import { CopyButton } from '../components/CopyButton'
 import { useEffect, useState } from 'react'
 import { api, ApiError } from '../api/client'
 import type { QueryJob } from '../api/types'
@@ -127,7 +128,8 @@ export function HistoryPage({ onRerun }: HistoryPageProps) {
                     onClick={() => onRerun(j.statement)}
                   >
                     Rerun
-                  </button>
+                  </button>{' '}
+                  <CopyButton text={j.statement} />
                 </td>
               </tr>
             ))}

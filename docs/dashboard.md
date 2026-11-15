@@ -71,3 +71,9 @@ pixels against the pointer, it breathes very slowly, shifts a little as the page
 scrolls, and each click sends out one faint ripple. It is decorative only: hidden from
 assistive technology, switched off for reduced-motion preferences and touch screens,
 and it carries no data.
+
+## Command palette
+
+Press Cmd/Ctrl+K (or click the key hint in the top bar) to jump to a page, open a
+dataset, preview its first rows (runs `SELECT * ... LIMIT 100` through the normal
+validated query path) or switch theme. Arrow keys move, Enter opens, Esc closes.

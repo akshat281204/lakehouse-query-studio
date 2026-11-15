@@ -8,6 +8,8 @@ import { QueryPage } from './pages/QueryPage'
 import { HistoryPage } from './pages/HistoryPage'
 import { ThemePicker } from './components/ThemePicker'
 import { Terrain } from './components/Terrain'
+import { CommandPalette } from './components/CommandPalette'
+import { applyTheme, saveTheme } from './lib/theme'
 
 type Route =
   | { view: 'overview' }
@@ -120,11 +122,23 @@ export default function App() {
   const [route, setRoute] = useState<Route>(parseRoute)
   // A statement handed from History to the workbench (kept in memory only).
   const [rerun, setRerun] = useState<{ sql: string; n: number } | null>(null)
+  const [palette, setPalette] = useState(false)
 
   useEffect(() => {
     const onChange = () => setRoute(parseRoute())
     window.addEventListener('hashchange', onChange)
     return () => window.removeEventListener('hashchange', onChange)
+  }, [])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        setPalette((o) => !o)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
   }, [])
 
   const go = (hash: string) => {
@@ -168,6 +182,22 @@ export default function App() {
   return (
     <>
       <Terrain />
+      <CommandPalette
+        open={palette}
+        onClose={() => setPalette(false)}
+        onNavigate={go}
+        onPreview={(name) => {
+          setRerun((r) => ({
+            sql: `SELECT * FROM "${name.replace(/"/g, '""')}" LIMIT 100`,
+            n: (r?.n ?? 0) + 1,
+          }))
+          go('#/query')
+        }}
+        onTheme={(id) => {
+          applyTheme(id)
+          saveTheme(id)
+        }}
+      />
       <div className="shell">
         <aside className="sidebar">
           <div className="brand">
