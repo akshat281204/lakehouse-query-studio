@@ -1,0 +1,116 @@
+// Package logging constructs the structured logger used across the process and
+// enforces a redaction policy so secrets never reach log output.
+package logging
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"strings"
+)
+
+// New builds a structured slog.Logger writing to w with the given level and
+// format. Every record passes through a redacting handler.
+func New(w io.Writer, level, format string) (*slog.Logger, error) {
+	lvl, err := parseLevel(level)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := &slog.HandlerOptions{
+		Level:     lvl,
+		AddSource: lvl == slog.LevelDebug,
+	}
+
+	var base slog.Handler
+	switch strings.ToLower(format) {
+	case "json":
+		base = slog.NewJSONHandler(w, opts)
+	case "text":
+		base = slog.NewTextHandler(w, opts)
+	default:
+		return nil, fmt.Errorf("unknown log format %q", format)
+	}
+
+	return slog.New(&redactingHandler{next: base}), nil
+}
+
+func parseLevel(level string) (slog.Level, error) {
+	switch strings.ToLower(level) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("unknown log level %q", level)
+	}
+}
+
+// sensitive reports whether an attribute key names a value that must be
+// redacted from log output.
+func sensitive(key string) bool {
+	k := strings.ToLower(key)
+	for _, frag := range []string{
+		"password", "secret", "token", "credential", "authorization",
+		"api_key", "apikey", "access_key", "secret_key", "private_key",
+	} {
+		if strings.Contains(k, frag) {
+			return true
+		}
+	}
+	return false
+}
+
+// redactingHandler wraps a slog.Handler and masks the values of sensitive
+// attributes before they are written.
+type redactingHandler struct {
+	next slog.Handler
+}
+
+func (h *redactingHandler) Enabled(ctx context.Context, lvl slog.Level) bool {
+	return h.next.Enabled(ctx, lvl)
+}
+
+func (h *redactingHandler) Handle(ctx context.Context, r slog.Record) error {
+	record := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+	r.Attrs(func(a slog.Attr) bool {
+		record.AddAttrs(redactAttr(a))
+		return true
+	})
+	return h.next.Handle(ctx, record)
+}
+
+func (h *redactingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	out := make([]slog.Attr, 0, len(attrs))
+	for _, a := range attrs {
+		out = append(out, redactAttr(a))
+	}
+	return &redactingHandler{next: h.next.WithAttrs(out)}
+}
+
+func (h *redactingHandler) WithGroup(name string) slog.Handler {
+	return &redactingHandler{next: h.next.WithGroup(name)}
+}
+
+// redactAttr returns the attribute with its value masked when the key is
+// sensitive. Group values are redacted recursively.
+func redactAttr(a slog.Attr) slog.Attr {
+	if sensitive(a.Key) {
+		a.Value = slog.StringValue("[REDACTED]")
+		return a
+	}
+	if a.Value.Kind() == slog.KindGroup {
+		group := a.Value.Group()
+		out := make([]slog.Attr, 0, len(group))
+		for _, g := range group {
+			out = append(out, redactAttr(g))
+		}
+		a.Value = slog.GroupValue(out...)
+	}
+	return a
+}
