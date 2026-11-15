@@ -14,6 +14,9 @@ background jobs executed by **single-node DuckDB**.
   <img src="docs/images/overview-light.png" alt="Overview dashboard" width="98%">
 </p>
 <p align="center">
+  <img src="docs/images/themes.png" alt="The six built-in themes" width="98%">
+</p>
+<p align="center">
   <img src="docs/images/workbench-results.png" alt="SQL workbench with results" width="49%">
   <img src="docs/images/workbench-chart.png" alt="SQL workbench chart" width="49%">
 </p>

@@ -29,7 +29,7 @@ beyond React: the editor highlighting and charts are small in-repo components.
 ## Safety
 * Cell values and errors are rendered as React text; there is no
   `dangerouslySetInnerHTML`. A test renders `<img onerror>` as literal text.
-* The app uses no `localStorage`, `sessionStorage` or IndexedDB.
+* The app uses no `localStorage`, `sessionStorage` or IndexedDB, with one exception: `src/lib/theme.ts` remembers the chosen colour theme name (a short fixed identifier, nothing else) in `localStorage`. The bundle check allows storage in that one file only.
 * `scripts/check-bundle.sh` (run by `make web-build`, hence `make verify`)
   fails if the built bundle contains credential variable names or any real
   secret value from the local `.env`, or if the source uses browser storage.
@@ -48,3 +48,16 @@ API. The dashboard has additionally been loaded in headless Chrome against a
 live API, worker, PostgreSQL and S3-compatible store to produce the screenshots
 in `docs/images/` and to check layout in light and dark themes; there is no
 automated browser test suite.
+
+## Themes
+
+Six built-in colour themes, chosen from the picker at the right of the top bar:
+Daylight, Mint (light) and Midnight, Ocean, Nord, Terminal (dark). The choice is
+remembered in the browser (theme name only; see the storage note above). With no
+saved choice the dashboard follows the OS light/dark setting. A `?theme=<id>` URL
+parameter selects a theme for that view, which is how the screenshots in
+`docs/images/` are produced.
+
+Each theme in `web/src/themes.css` defines the full set of design tokens
+(colours, code-editor colours, radius, focus ring), and components only read
+tokens, so a new theme is one CSS block plus one entry in `web/src/lib/theme.ts`.

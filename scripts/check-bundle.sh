@@ -1,7 +1,8 @@
 #!/bin/sh
 # Fails if the built web bundle or its source could expose object-store or
 # database credentials: credential variable names in the bundle, any real value
-# from the local .env, or browser storage use in the source.
+# from the local .env, or browser storage use in the source. The single allowed
+# exception is src/lib/theme.ts, which stores only the chosen theme name.
 set -eu
 dist="${1:-web/dist}"
 src="${2:-web/src}"
@@ -25,7 +26,7 @@ if [ -f .env ]; then
 fi
 
 if grep -rnE '\b(localStorage|sessionStorage|indexedDB)\b' "$src" --include='*.ts' --include='*.tsx' \
-   --exclude='*.test.ts' --exclude='*.test.tsx' >/dev/null 2>&1; then
+   --exclude='*.test.ts' --exclude='*.test.tsx' --exclude='theme.ts' >/dev/null 2>&1; then
   echo "check-bundle: browser storage used in $src; the app must keep no data there" >&2
   fail=1
 fi

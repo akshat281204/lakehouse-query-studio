@@ -6,6 +6,7 @@ import { UploadPage } from './pages/UploadPage'
 import { OverviewPage } from './pages/OverviewPage'
 import { QueryPage } from './pages/QueryPage'
 import { HistoryPage } from './pages/HistoryPage'
+import { ThemePicker } from './components/ThemePicker'
 
 type Route =
   | { view: 'overview' }
@@ -187,7 +188,10 @@ export default function App() {
           </span>
         </div>
         <Nav active={active} />
-        <SystemStatus />
+        <div className="top-actions">
+          <SystemStatus />
+          <ThemePicker />
+        </div>
       </aside>
       <div className="main">{page}</div>
     </div>
