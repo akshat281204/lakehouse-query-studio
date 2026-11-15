@@ -14,8 +14,9 @@ body {
   position: relative;
 }
 
-/* Topographic terrain: the lake seen from above. Lines are a mask filled with the
-   accent. A glow copy shows only near the pointer; scroll shifts it slowly. */
+/* Topographic terrain: nested contour rings, the lake seen from above. Lines are a
+   mask filled with the accent. Interactions are deliberately faint: a soft glow
+   under the pointer, a few px of drift against it, one ripple per click. */
 .terrain {
   position: fixed;
   inset: 0;
@@ -23,10 +24,12 @@ body {
   overflow: hidden;
   pointer-events: none;
   animation: terrain-in 2.2s ease-out both;
+  translate: calc(var(--px, 0) * -10px) calc(var(--py, 0) * -7px);
+  transition: translate 0.9s cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 .terrain i {
   position: absolute;
-  inset: -30px 0 -150px 0;
+  inset: -30px -20px -150px;
   background: var(--accent);
   -webkit-mask-repeat: no-repeat;
   mask-repeat: no-repeat;
@@ -44,29 +47,29 @@ body {
     0 0;
   -webkit-mask-composite: source-in;
   mask-composite: intersect;
-  will-change: transform;
+  animation: terrain-breathe 18s ease-in-out infinite alternate;
 }
 .t-base {
-  opacity: calc(var(--contour-alpha, 0.1) * 1.5);
+  opacity: var(--contour-alpha, 0.1);
   -webkit-mask-image: url('./assets/contours.svg'),
-    linear-gradient(#000 0%, rgba(0, 0, 0, 0.6) 55%, rgba(0, 0, 0, 0.35) 100%);
+    linear-gradient(#000 16%, transparent 74%);
   mask-image: url('./assets/contours.svg'),
-    linear-gradient(#000 0%, rgba(0, 0, 0, 0.6) 55%, rgba(0, 0, 0, 0.35) 100%);
+    linear-gradient(#000 16%, transparent 74%);
 }
 .t-glow {
-  opacity: calc(var(--contour-alpha, 0.1) * 8);
+  opacity: calc(var(--contour-alpha, 0.1) * 4.5);
   -webkit-mask-image: url('./assets/contours.svg'),
     radial-gradient(
-      280px circle at var(--mx, -999px) var(--my, -999px),
+      230px circle at var(--mx, -999px) var(--my, -999px),
       #000 0%,
-      rgba(0, 0, 0, 0.5) 45%,
+      rgba(0, 0, 0, 0.4) 50%,
       transparent 100%
     );
   mask-image: url('./assets/contours.svg'),
     radial-gradient(
-      280px circle at var(--mx, -999px) var(--my, -999px),
+      230px circle at var(--mx, -999px) var(--my, -999px),
       #000 0%,
-      rgba(0, 0, 0, 0.5) 45%,
+      rgba(0, 0, 0, 0.4) 50%,
       transparent 100%
     );
 }
@@ -78,21 +81,53 @@ body {
     opacity: 1;
   }
 }
+@keyframes terrain-breathe {
+  from {
+    scale: 1;
+  }
+  to {
+    scale: 1.02;
+  }
+}
 @supports (animation-timeline: scroll()) {
   .terrain i {
-    animation: terrain-shift linear both;
-    animation-timeline: scroll(root);
+    animation:
+      terrain-breathe 18s ease-in-out infinite alternate,
+      terrain-shift linear both;
+    animation-timeline: auto, scroll(root);
   }
   @keyframes terrain-shift {
     to {
-      transform: translateY(-140px);
+      transform: translateY(-90px);
     }
+  }
+}
+.ripple {
+  position: absolute;
+  width: 200px;
+  height: 200px;
+  margin: -100px 0 0 -100px;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  opacity: 0;
+  animation: ripple 1.6s cubic-bezier(0.2, 0.6, 0.3, 1) forwards;
+}
+@keyframes ripple {
+  from {
+    transform: scale(0.1);
+    opacity: 0.35;
+  }
+  to {
+    transform: scale(1.25);
+    opacity: 0;
   }
 }
 @media (prefers-reduced-motion: reduce) {
   .terrain,
-  .terrain i {
+  .terrain i,
+  .ripple {
     animation: none;
+    transition: none;
   }
 }
 .shell {
