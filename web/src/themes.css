@@ -1,51 +1,53 @@
 /* ==========================================================================
    Themes. Every theme defines the complete token set, so components never
    hard-code a colour. The active theme is the `data-theme` attribute on <html>
-   (see src/lib/theme.ts); Daylight is the default.
+   (see src/lib/theme.ts); Strata is the default.
    ========================================================================== */
 
+/* Strata: cool paper, ink and cobalt; the default. */
 :root,
-:root[data-theme='daylight'] {
-  --font-sans: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI',
-    sans-serif;
+:root[data-theme='strata'] {
+  --font-sans: 'Instrument Sans', ui-sans-serif, system-ui, -apple-system,
+    'Segoe UI', sans-serif;
   --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-  --bg: #eef1f8;
+  --bg: #f3f6f7;
   --surface: #ffffff;
-  --surface-2: #f6f8fc;
-  --surface-hover: #eff3fb;
-  --border: #e4e8f1;
-  --border-strong: #d2d9e7;
-  --text: #1a2233;
-  --text-2: #4b566b;
-  --text-3: #7b869b;
-  --accent: #3b78f2;
-  --accent-hover: #2f66d6;
-  --accent-soft: #e8f0fe;
+  --surface-2: #f7fafa;
+  --surface-hover: #eaf0f2;
+  --border: #dfe7ea;
+  --border-strong: #c7d3d8;
+  --text: #0b1a22;
+  --text-2: #3d525c;
+  --text-3: #6f838d;
+  --accent: #2447f0;
+  --accent-hover: #1b38c9;
+  --accent-soft: #e6ebff;
   --accent-text: #ffffff;
-  --ok: #17a34a;
-  --ok-soft: #e3f6ea;
-  --err: #dc3b3b;
-  --err-soft: #fdeaea;
-  --warn: #d98a06;
-  --warn-soft: #fdf1da;
-  --info: #3b78f2;
-  --info-soft: #e8f0fe;
-  --chart-1: #3b78f2;
-  --chart-grid: #e8ecf4;
-  --code-bg: #101828;
-  --code-text: #e2e8f0;
-  --code-border: #1e293b;
-  --code-caret: #c7d2fe;
-  --tok-keyword: #93c5fd;
-  --tok-string: #86efac;
-  --tok-number: #fcd34d;
-  --tok-comment: #64748b;
-  --shadow-sm: 0 1px 2px rgba(26, 34, 51, 0.04);
-  --shadow-md: 0 8px 24px rgba(26, 34, 51, 0.1);
-  --radius: 12px;
-  --radius-sm: 8px;
-  --ring: 0 0 0 3px rgba(59, 120, 242, 0.3);
-  --scrollbar: #c5cde0;
+  --ok: #0e9f83;
+  --ok-soft: #dcf3ee;
+  --err: #e5493a;
+  --err-soft: #fde8e5;
+  --warn: #e09a1a;
+  --warn-soft: #fcf0d6;
+  --info: #2447f0;
+  --info-soft: #e6ebff;
+  --chart-1: #2447f0;
+  --chart-grid: #e3eaed;
+  --contour-alpha: 0.075;
+  --code-bg: #0b1a22;
+  --code-text: #e2ecf0;
+  --code-border: #1b2f3a;
+  --code-caret: #9db4ff;
+  --tok-keyword: #9db4ff;
+  --tok-string: #7fe0cb;
+  --tok-number: #f7c971;
+  --tok-comment: #5e7886;
+  --shadow-sm: 0 1px 2px rgba(11, 26, 34, 0.05);
+  --shadow-md: 0 14px 34px rgba(11, 26, 34, 0.14);
+  --radius: 14px;
+  --radius-sm: 9px;
+  --ring: 0 0 0 3px rgba(36, 71, 240, 0.28);
+  --scrollbar: #c3d0d6;
   color-scheme: light;
 }
 
@@ -82,36 +84,40 @@
   color-scheme: light;
 }
 
-:root[data-theme='midnight'] {
-  --bg: #15151f;
-  --surface: #1e1e2d;
-  --surface-2: #232335;
-  --surface-hover: #2a2a3f;
-  --border: #2d2d44;
-  --border-strong: #3d3d5a;
-  --text: #f4f4fa;
-  --text-2: #b6b6cc;
-  --text-3: #8888a6;
-  --accent: #ff4a1c;
-  --accent-hover: #ff6a42;
-  --accent-soft: rgba(255, 74, 28, 0.15);
-  --accent-text: #ffffff;
-  --ok: #2fd36e;
-  --ok-soft: rgba(47, 211, 110, 0.15);
-  --err: #ff4d5e;
-  --err-soft: rgba(255, 77, 94, 0.15);
-  --warn: #ffb02e;
-  --warn-soft: rgba(255, 176, 46, 0.15);
-  --info: #3d8bff;
-  --info-soft: rgba(61, 139, 255, 0.15);
-  --chart-1: #ff4a1c;
-  --chart-grid: #2d2d44;
-  --code-bg: #12121c;
-  --code-border: #2d2d44;
+/* Abyss: deep water, the dark counterpart of Strata. */
+:root[data-theme='abyss'] {
+  --bg: #060f15;
+  --surface: #0c1a22;
+  --surface-2: #09151c;
+  --surface-hover: #112431;
+  --border: #17303c;
+  --border-strong: #254655;
+  --text: #e7f1f4;
+  --text-2: #a3bcc5;
+  --text-3: #6f8c98;
+  --accent: #6c8dff;
+  --accent-hover: #8ba5ff;
+  --accent-soft: rgba(108, 141, 255, 0.16);
+  --accent-text: #07101c;
+  --ok: #3dd6b8;
+  --ok-soft: rgba(61, 214, 184, 0.14);
+  --err: #ff6f5e;
+  --err-soft: rgba(255, 111, 94, 0.15);
+  --warn: #f0b64a;
+  --warn-soft: rgba(240, 182, 74, 0.15);
+  --info: #6c8dff;
+  --info-soft: rgba(108, 141, 255, 0.16);
+  --chart-1: #6c8dff;
+  --chart-grid: #14293a;
+  --contour-alpha: 0.1;
+  --code-bg: #040b10;
+  --code-border: #17303c;
   --shadow-sm: none;
-  --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.5);
-  --ring: 0 0 0 3px rgba(255, 74, 28, 0.4);
-  --scrollbar: #3d3d5a;
+  --shadow-md: 0 14px 40px rgba(0, 0, 0, 0.55);
+  --radius: 14px;
+  --radius-sm: 9px;
+  --ring: 0 0 0 3px rgba(108, 141, 255, 0.4);
+  --scrollbar: #254655;
   color-scheme: dark;
 }
 

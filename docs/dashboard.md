@@ -52,7 +52,7 @@ automated browser test suite.
 ## Themes
 
 Six built-in colour themes, chosen from the picker at the right of the top bar:
-Daylight, Mint (light) and Midnight, Ocean, Nord, Terminal (dark). The choice is
+Strata (the default), Mint (light) and Abyss, Ocean, Nord, Terminal (dark). The choice is
 remembered in the browser (theme name only; see the storage note above). With no
 saved choice the dashboard follows the OS light/dark setting. A `?theme=<id>` URL
 parameter selects a theme for that view, which is how the screenshots in

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { api, ApiError } from '../api/client'
 import type {
   IngestionJob,
@@ -12,7 +12,6 @@ import {
   Donut,
   LatencyHistogram,
   RangeBar,
-  Sparkline,
 } from '../components/charts'
 import { compact, formatBytesLong, ms, timeAgo } from '../lib/format'
 
@@ -53,42 +52,6 @@ interface Data {
 const msg = (e: unknown) => (e instanceof ApiError ? e.message : String(e))
 const statusClass = (s: string) =>
   `status status-${s.toLowerCase().replace('_', '-')}`
-
-function Kpi({
-  label,
-  value,
-  hint,
-  testId,
-  tone,
-  visual,
-}: {
-  label: string
-  value: string
-  hint?: string
-  testId: string
-  tone?: 'ok' | 'err' | 'warn'
-  visual?: ReactNode
-}) {
-  return (
-    <div className={`kpi${tone ? ` kpi-${tone}` : ''}`}>
-      <span className="kpi-label">{label}</span>
-      <strong data-testid={testId}>{value}</strong>
-      {hint ? <span className="kpi-hint">{hint}</span> : null}
-      {visual ? <div className="kpi-visual">{visual}</div> : null}
-    </div>
-  )
-}
-
-/** Fill gaps (buckets with no data) with the previous value so a trend reads as a line. */
-function carry(values: (number | null)[]): number[] {
-  let last = 0
-  const first = values.find((v) => v !== null)
-  if (first !== undefined && first !== null) last = first
-  return values.map((v) => {
-    if (v !== null) last = v
-    return last
-  })
-}
 
 export function OverviewPage() {
   const [win, setWin] = useState<StatsWindow>('24h')
@@ -180,8 +143,24 @@ export function OverviewPage() {
   )
   const failedTotal = q ? q.failed + q.timedOut : 0
 
+  const healthy = d.ready
+    ? Object.values(d.ready.dependencies).every((x) => x.ok)
+    : false
+  const rate =
+    successRate === null
+      ? na
+      : `${successRate.toFixed(successRate === 100 ? 0 : 1)}%`
+  const rateTone =
+    successRate === null
+      ? ''
+      : successRate >= 95
+        ? 'tone-ok'
+        : successRate >= 80
+          ? 'tone-warn'
+          : 'tone-err'
+
   return (
-    <main className="page">
+    <main className="page overview">
       {header}
 
       {d.errors.map((e) => (
@@ -190,147 +169,111 @@ export function OverviewPage() {
         </p>
       ))}
 
-      <section aria-label="Key metrics" className="kpi-card">
-        <div className="kpi-primary">
-          <Kpi
-            testId="kpi-queries"
-            label="Queries"
-            value={q ? compact(q.total) : na}
-            hint={`last ${winLabel}`}
-            visual={
-              s ? (
-                <Sparkline
-                  label="Queries over time"
-                  values={s.timeline.map(
-                    (b) => b.succeeded + b.failed + b.cancelled,
-                  )}
-                />
-              ) : null
-            }
-          />
-          <Kpi
-            testId="kpi-success-rate"
-            label="Success rate"
-            value={
-              successRate === null
-                ? na
-                : `${successRate.toFixed(successRate === 100 ? 0 : 1)}%`
-            }
-            hint={q ? `${q.succeeded} of ${finished} finished` : undefined}
-            tone={
-              successRate === null
-                ? undefined
-                : successRate >= 95
-                  ? 'ok'
-                  : successRate >= 80
-                    ? 'warn'
-                    : 'err'
-            }
-            visual={
-              s ? (
-                <Sparkline
-                  tone="ok"
-                  label="Success rate over time"
-                  values={carry(
-                    s.timeline.map((b) => {
-                      const f = b.succeeded + b.failed
-                      return f > 0 ? (b.succeeded / f) * 100 : null
-                    }),
-                  )}
-                />
-              ) : null
-            }
-          />
-          <Kpi
-            testId="kpi-p50"
-            label="Median latency"
-            value={q && q.succeeded > 0 ? ms(q.p50Ms) : na}
-            hint="succeeded queries"
-            visual={
-              s ? (
-                <Sparkline
-                  tone="info"
-                  label="Median latency over time"
-                  values={carry(
-                    s.timeline.map((b) => (b.p50Ms > 0 ? b.p50Ms : null)),
-                  )}
-                />
-              ) : null
-            }
-          />
-          <Kpi
-            testId="kpi-p95"
-            label="p95 latency"
-            value={q && q.succeeded > 0 ? ms(q.p95Ms) : na}
-            hint={q && q.succeeded > 0 ? `max ${ms(q.maxMs)}` : undefined}
-            visual={
-              q && q.succeeded > 0 ? (
+      <section aria-label="Key metrics" className="hero">
+        <p className="hero-sentence">
+          <strong data-testid="kpi-queries">{q ? compact(q.total) : na}</strong>{' '}
+          queries in the last {winLabel}.{' '}
+          <strong data-testid="kpi-success-rate" className={rateTone}>
+            {rate}
+          </strong>{' '}
+          succeeded, with a median of{' '}
+          <strong data-testid="kpi-p50">
+            {q && q.succeeded > 0 ? ms(q.p50Ms) : na}
+          </strong>{' '}
+          and a p95 of{' '}
+          <strong data-testid="kpi-p95">
+            {q && q.succeeded > 0 ? ms(q.p95Ms) : na}
+          </strong>
+          .
+        </p>
+        <dl className="figures">
+          <div>
+            <dt>Rows returned</dt>
+            <dd data-testid="kpi-rows">{q ? compact(q.rowsReturned) : na}</dd>
+            <span>last {winLabel}</span>
+          </div>
+          <div>
+            <dt>Data staged</dt>
+            <dd data-testid="kpi-staged">
+              {q ? formatBytesLong(q.bytesStaged) : na}
+            </dd>
+            <span>read from object store</span>
+          </div>
+          <div>
+            <dt>Datasets</dt>
+            <dd data-testid="kpi-datasets">{s ? String(s.datasets) : na}</dd>
+            <span>active</span>
+          </div>
+          <div>
+            <dt>In flight</dt>
+            <dd data-testid="kpi-queue">
+              {q ? String(q.queued + q.running) : na}
+            </dd>
+            <span>{q ? `${q.running} running · ${q.queued} queued` : ' '}</span>
+          </div>
+          <div className="figure-range">
+            <dt>Latency spread</dt>
+            <dd className="range-dd">
+              {q && q.succeeded > 0 ? (
                 <RangeBar p50={q.p50Ms} p95={q.p95Ms} max={q.maxMs} />
-              ) : null
-            }
-          />
-        </div>
-        <div className="kpi-secondary">
-          <Kpi
-            testId="kpi-rows"
-            label="Rows returned"
-            value={q ? compact(q.rowsReturned) : na}
-            hint={`last ${winLabel}`}
-          />
-          <Kpi
-            testId="kpi-staged"
-            label="Data staged"
-            value={q ? formatBytesLong(q.bytesStaged) : na}
-            hint="read from object store"
-          />
-          <Kpi
-            testId="kpi-datasets"
-            label="Datasets"
-            value={s ? String(s.datasets) : na}
-            hint="active"
-          />
-          <Kpi
-            testId="kpi-queue"
-            label="In flight"
-            value={q ? String(q.queued + q.running) : na}
-            hint={q ? `${q.running} running · ${q.queued} queued` : undefined}
-          />
-        </div>
+              ) : (
+                na
+              )}
+            </dd>
+            <span>
+              {q && q.succeeded > 0
+                ? `median ${ms(q.p50Ms)} · max ${ms(q.maxMs)}`
+                : ' '}
+            </span>
+          </div>
+        </dl>
       </section>
 
-      <div className="dash-grid">
-        <section className="panel span-2" aria-label="Query activity">
-          <div className="panel-head">
-            <h2>Query activity</h2>
-            <div className="legend">
-              <span>
-                <i className="sw bar-ok" /> Succeeded
-              </span>
-              <span>
-                <i className="sw bar-err" /> Failed
-              </span>
-              <span>
-                <i className="sw bar-warn" /> Cancelled
-              </span>
-            </div>
+      <section className="sheet activity" aria-label="Query activity">
+        <div className="sheet-head">
+          <h2>Query activity</h2>
+          <div className="legend">
+            <span>
+              <i className="sw bar-ok" /> Succeeded
+            </span>
+            <span>
+              <i className="sw bar-err" /> Failed
+            </span>
+            <span>
+              <i className="sw bar-warn" /> Cancelled
+            </span>
+          </div>
+        </div>
+        {s ? (
+          <ActivityChart
+            timeline={s.timeline}
+            windowSeconds={s.windowSeconds}
+          />
+        ) : (
+          <p className="muted">Unavailable</p>
+        )}
+        {s?.truncated ? (
+          <p className="note">
+            Showing the most recent 50,000 queries in this window.
+          </p>
+        ) : null}
+      </section>
+
+      <div className="split">
+        <section className="sheet" aria-label="Latency distribution">
+          <div className="sheet-head">
+            <h2>Latency distribution</h2>
+            <span className="muted">succeeded queries, last {winLabel}</span>
           </div>
           {s ? (
-            <ActivityChart
-              timeline={s.timeline}
-              windowSeconds={s.windowSeconds}
-            />
+            <LatencyHistogram buckets={s.latencyHistogram} />
           ) : (
             <p className="muted">Unavailable</p>
           )}
-          {s?.truncated ? (
-            <p className="note">
-              Showing the most recent 50,000 queries in this window.
-            </p>
-          ) : null}
         </section>
 
-        <section className="panel" aria-label="Outcomes">
-          <div className="panel-head">
+        <section className="sheet" aria-label="Outcomes">
+          <div className="sheet-head">
             <h2>Outcomes</h2>
           </div>
           {q ? (
@@ -382,22 +325,17 @@ export function OverviewPage() {
             <p className="muted">Unavailable</p>
           )}
         </section>
+      </div>
 
-        <section className="panel span-2" aria-label="Latency distribution">
-          <div className="panel-head">
-            <h2>Latency distribution</h2>
-            <span className="muted">succeeded queries, last {winLabel}</span>
-          </div>
-          {s ? (
-            <LatencyHistogram buckets={s.latencyHistogram} />
-          ) : (
-            <p className="muted">Unavailable</p>
-          )}
-        </section>
-
-        <section className="panel" aria-label="System health">
-          <div className="panel-head">
+      <div className="triple">
+        <section className="sheet" aria-label="System health">
+          <div className="sheet-head">
             <h2>System health</h2>
+            {d.ready ? (
+              <span className={healthy ? 'pill-ok' : 'pill-bad'}>
+                {healthy ? 'all ready' : 'degraded'}
+              </span>
+            ) : null}
           </div>
           {d.ready ? (
             <ul className="health-list">
@@ -453,8 +391,8 @@ export function OverviewPage() {
           ) : null}
         </section>
 
-        <section className="panel" aria-label="Failure reasons">
-          <div className="panel-head">
+        <section className="sheet" aria-label="Failure reasons">
+          <div className="sheet-head">
             <h2>Why queries fail</h2>
             <span className="muted">{failedTotal} failed</span>
           </div>
@@ -476,56 +414,8 @@ export function OverviewPage() {
           </ul>
         </section>
 
-        <section className="panel span-2" aria-label="Recent queries">
-          <div className="panel-head">
-            <h2>Recent queries</h2>
-            <a href="#/history">View all</a>
-          </div>
-          {d.recent && d.recent.length === 0 ? (
-            <p className="empty">
-              No queries yet. Run one from the SQL workbench.
-            </p>
-          ) : null}
-          {d.recent && d.recent.length > 0 ? (
-            <table className="data-table flat">
-              <thead>
-                <tr>
-                  <th>Statement</th>
-                  <th>Status</th>
-                  <th className="num">Duration</th>
-                  <th className="num">Rows</th>
-                  <th className="num">When</th>
-                </tr>
-              </thead>
-              <tbody>
-                {d.recent.map((j) => (
-                  <tr key={j.id}>
-                    <td>
-                      <code className="statement">
-                        {j.statement.length > 90
-                          ? `${j.statement.slice(0, 90)}…`
-                          : j.statement}
-                      </code>
-                    </td>
-                    <td>
-                      <span className={statusClass(j.status)}>
-                        {j.status.replace('_', ' ')}
-                      </span>
-                    </td>
-                    <td className="num">
-                      {j.durationMs === undefined ? '—' : ms(j.durationMs)}
-                    </td>
-                    <td className="num">{j.rowsReturned ?? '—'}</td>
-                    <td className="num">{timeAgo(j.createdAt, d.at)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          ) : null}
-        </section>
-
-        <section className="panel" aria-label="Recent ingestions">
-          <div className="panel-head">
+        <section className="sheet" aria-label="Recent ingestions">
+          <div className="sheet-head">
             <h2>Recent ingestions</h2>
             <a href="#/upload">Upload</a>
           </div>
@@ -546,6 +436,54 @@ export function OverviewPage() {
           </ul>
         </section>
       </div>
+
+      <section className="sheet" aria-label="Recent queries">
+        <div className="sheet-head">
+          <h2>Recent queries</h2>
+          <a href="#/history">View all</a>
+        </div>
+        {d.recent && d.recent.length === 0 ? (
+          <p className="empty">
+            No queries yet. Run one from the SQL workbench.
+          </p>
+        ) : null}
+        {d.recent && d.recent.length > 0 ? (
+          <table className="data-table flat">
+            <thead>
+              <tr>
+                <th>Statement</th>
+                <th>Status</th>
+                <th className="num">Duration</th>
+                <th className="num">Rows</th>
+                <th className="num">When</th>
+              </tr>
+            </thead>
+            <tbody>
+              {d.recent.map((j) => (
+                <tr key={j.id}>
+                  <td>
+                    <code className="statement">
+                      {j.statement.length > 110
+                        ? `${j.statement.slice(0, 110)}…`
+                        : j.statement}
+                    </code>
+                  </td>
+                  <td>
+                    <span className={statusClass(j.status)}>
+                      {j.status.replace('_', ' ')}
+                    </span>
+                  </td>
+                  <td className="num">
+                    {j.durationMs === undefined ? '—' : ms(j.durationMs)}
+                  </td>
+                  <td className="num">{j.rowsReturned ?? '—'}</td>
+                  <td className="num">{timeAgo(j.createdAt, d.at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : null}
+      </section>
 
       <p className="note foot">
         Updated {new Date(d.at).toLocaleTimeString()} · refreshes every 15 s ·

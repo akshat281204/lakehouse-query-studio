@@ -8,10 +8,10 @@ export interface ThemeInfo {
 
 export const THEMES: ThemeInfo[] = [
   {
-    id: 'daylight',
-    label: 'Daylight',
+    id: 'strata',
+    label: 'Strata',
     dark: false,
-    swatch: ['#eef1f8', '#ffffff', '#3b78f2', '#1a2233'],
+    swatch: ['#f3f6f7', '#ffffff', '#2447f0', '#0b1a22'],
   },
   {
     id: 'mint',
@@ -20,10 +20,10 @@ export const THEMES: ThemeInfo[] = [
     swatch: ['#ecf3ef', '#fcfefd', '#0f9d6b', '#13231c'],
   },
   {
-    id: 'midnight',
-    label: 'Midnight',
+    id: 'abyss',
+    label: 'Abyss',
     dark: true,
-    swatch: ['#15151f', '#1e1e2d', '#ff4a1c', '#f4f4fa'],
+    swatch: ['#060f15', '#0c1a22', '#6c8dff', '#e7f1f4'],
   },
   {
     id: 'ocean',
@@ -45,13 +45,13 @@ export const THEMES: ThemeInfo[] = [
   },
 ]
 
-export const DEFAULT_THEME = 'daylight'
+export const DEFAULT_THEME = 'strata'
 const KEY = 'lqs-theme'
 
 export const isTheme = (id: string | null | undefined): id is string =>
   THEMES.some((t) => t.id === id)
 
-/** A `?theme=` URL parameter (for sharing a view), else the saved theme, else the OS preference (Midnight when dark), else Daylight. */
+/** A `?theme=` URL parameter (for sharing a view), else the saved theme, else the OS preference (Abyss when dark), else Strata. */
 export function loadTheme(): string {
   try {
     const q = new URLSearchParams(window.location.search).get('theme')
@@ -67,7 +67,7 @@ export function loadTheme(): string {
   }
   try {
     if (window.matchMedia?.('(prefers-color-scheme: dark)').matches) {
-      return 'midnight'
+      return 'abyss'
     }
   } catch {
     /* ignore */

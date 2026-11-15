@@ -88,9 +88,9 @@ export function ActivityChart({
 }) {
   const uid = useId()
   const [hover, setHover] = useState<number | null>(null)
-  const W = 760
-  const H = 250
-  const pad = { l: 34, r: 10, t: 14, b: 28 }
+  const W = 1160
+  const H = 300
+  const pad = { l: 34, r: 6, t: 14, b: 28 }
   const n = timeline.length
   const totals = timeline.map((b) => b.succeeded + b.failed + b.cancelled)
   const max = Math.max(1, ...totals)
@@ -187,11 +187,10 @@ export function ActivityChart({
               <path d={layer(c2, c1)} fill={`url(#${uid}-err)`} />
               <path d={layer(c1, null)} fill={`url(#${uid}-ok)`} />
               <path d={smooth(top(c1))} className="area-line line-ok" />
-              <path d={smooth(top(c2))} className="area-line line-err" />
             </>
           ) : null}
         </g>
-        {timeline.map((b, i) => (
+        {timeline.map((b) => (
           <g key={b.start} data-testid="activity-bar">
             <title>{`${fmt(b.start)}: ${b.succeeded} succeeded, ${b.failed} failed, ${b.cancelled} cancelled`}</title>
           </g>
