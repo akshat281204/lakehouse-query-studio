@@ -33,8 +33,8 @@ const job: QueryJob = {
 
 const results = (rows: QueryResults['rows']): QueryResults => ({
   columns: [
-    { name: 'region', type: 'string', position: 0 },
-    { name: 'price', type: 'double', position: 1 },
+    { name: 'region', type: 'string' },
+    { name: 'price', type: 'double' },
   ],
   rows,
   totalRows: rows.length,
