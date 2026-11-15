@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { api, ApiError } from '../api/client'
 import type {
   IngestionJob,
@@ -7,7 +7,13 @@ import type {
   StatsWindow,
   Summary,
 } from '../api/types'
-import { ActivityChart, Donut, LatencyHistogram } from '../components/charts'
+import {
+  ActivityChart,
+  Donut,
+  LatencyHistogram,
+  RangeBar,
+  Sparkline,
+} from '../components/charts'
 import { compact, formatBytesLong, ms, timeAgo } from '../lib/format'
 
 const WINDOWS: { key: StatsWindow; label: string }[] = [
@@ -54,20 +60,34 @@ function Kpi({
   hint,
   testId,
   tone,
+  visual,
 }: {
   label: string
   value: string
   hint?: string
   testId: string
   tone?: 'ok' | 'err' | 'warn'
+  visual?: ReactNode
 }) {
   return (
     <div className={`kpi${tone ? ` kpi-${tone}` : ''}`}>
       <span className="kpi-label">{label}</span>
       <strong data-testid={testId}>{value}</strong>
       {hint ? <span className="kpi-hint">{hint}</span> : null}
+      {visual ? <div className="kpi-visual">{visual}</div> : null}
     </div>
   )
+}
+
+/** Fill gaps (buckets with no data) with the previous value so a trend reads as a line. */
+function carry(values: (number | null)[]): number[] {
+  let last = 0
+  const first = values.find((v) => v !== null)
+  if (first !== undefined && first !== null) last = first
+  return values.map((v) => {
+    if (v !== null) last = v
+    return last
+  })
 }
 
 export function OverviewPage() {
@@ -112,7 +132,12 @@ export function OverviewPage() {
     <header className="page-header">
       <div>
         <h1>Overview</h1>
-        <p>Service health, query activity and data volume</p>
+        <p>
+          <span className="live" aria-hidden="true" />
+          {d
+            ? `Live · updated ${new Date(d.at).toLocaleTimeString()}`
+            : 'Connecting…'}
+        </p>
       </div>
       <div className="header-actions">
         <div className="segmented" role="group" aria-label="Time window">
@@ -165,68 +190,112 @@ export function OverviewPage() {
         </p>
       ))}
 
-      <section aria-label="Key metrics" className="kpi-grid">
-        <Kpi
-          testId="kpi-queries"
-          label="Queries"
-          value={q ? compact(q.total) : na}
-          hint={`last ${winLabel}`}
-        />
-        <Kpi
-          testId="kpi-success-rate"
-          label="Success rate"
-          value={
-            successRate === null
-              ? na
-              : `${successRate.toFixed(successRate === 100 ? 0 : 1)}%`
-          }
-          hint={q ? `${q.succeeded} of ${finished} finished` : undefined}
-          tone={
-            successRate === null
-              ? undefined
-              : successRate >= 95
-                ? 'ok'
-                : successRate >= 80
-                  ? 'warn'
-                  : 'err'
-          }
-        />
-        <Kpi
-          testId="kpi-p50"
-          label="Median latency"
-          value={q && q.succeeded > 0 ? ms(q.p50Ms) : na}
-          hint="succeeded queries"
-        />
-        <Kpi
-          testId="kpi-p95"
-          label="p95 latency"
-          value={q && q.succeeded > 0 ? ms(q.p95Ms) : na}
-          hint={q && q.succeeded > 0 ? `max ${ms(q.maxMs)}` : undefined}
-        />
-        <Kpi
-          testId="kpi-rows"
-          label="Rows returned"
-          value={q ? compact(q.rowsReturned) : na}
-          hint={`last ${winLabel}`}
-        />
-        <Kpi
-          testId="kpi-staged"
-          label="Data staged"
-          value={q ? formatBytesLong(q.bytesStaged) : na}
-          hint="read from object store"
-        />
-        <Kpi
-          testId="kpi-datasets"
-          label="Datasets"
-          value={s ? String(s.datasets) : na}
-          hint="active"
-        />
-        <Kpi
-          testId="kpi-queue"
-          label="In flight"
-          value={q ? String(q.queued + q.running) : na}
-          hint={q ? `${q.running} running · ${q.queued} queued` : undefined}
-        />
+      <section aria-label="Key metrics" className="kpi-card">
+        <div className="kpi-primary">
+          <Kpi
+            testId="kpi-queries"
+            label="Queries"
+            value={q ? compact(q.total) : na}
+            hint={`last ${winLabel}`}
+            visual={
+              s ? (
+                <Sparkline
+                  label="Queries over time"
+                  values={s.timeline.map(
+                    (b) => b.succeeded + b.failed + b.cancelled,
+                  )}
+                />
+              ) : null
+            }
+          />
+          <Kpi
+            testId="kpi-success-rate"
+            label="Success rate"
+            value={
+              successRate === null
+                ? na
+                : `${successRate.toFixed(successRate === 100 ? 0 : 1)}%`
+            }
+            hint={q ? `${q.succeeded} of ${finished} finished` : undefined}
+            tone={
+              successRate === null
+                ? undefined
+                : successRate >= 95
+                  ? 'ok'
+                  : successRate >= 80
+                    ? 'warn'
+                    : 'err'
+            }
+            visual={
+              s ? (
+                <Sparkline
+                  tone="ok"
+                  label="Success rate over time"
+                  values={carry(
+                    s.timeline.map((b) => {
+                      const f = b.succeeded + b.failed
+                      return f > 0 ? (b.succeeded / f) * 100 : null
+                    }),
+                  )}
+                />
+              ) : null
+            }
+          />
+          <Kpi
+            testId="kpi-p50"
+            label="Median latency"
+            value={q && q.succeeded > 0 ? ms(q.p50Ms) : na}
+            hint="succeeded queries"
+            visual={
+              s ? (
+                <Sparkline
+                  tone="info"
+                  label="Median latency over time"
+                  values={carry(
+                    s.timeline.map((b) => (b.p50Ms > 0 ? b.p50Ms : null)),
+                  )}
+                />
+              ) : null
+            }
+          />
+          <Kpi
+            testId="kpi-p95"
+            label="p95 latency"
+            value={q && q.succeeded > 0 ? ms(q.p95Ms) : na}
+            hint={q && q.succeeded > 0 ? `max ${ms(q.maxMs)}` : undefined}
+            visual={
+              q && q.succeeded > 0 ? (
+                <RangeBar p50={q.p50Ms} p95={q.p95Ms} max={q.maxMs} />
+              ) : null
+            }
+          />
+        </div>
+        <div className="kpi-secondary">
+          <Kpi
+            testId="kpi-rows"
+            label="Rows returned"
+            value={q ? compact(q.rowsReturned) : na}
+            hint={`last ${winLabel}`}
+          />
+          <Kpi
+            testId="kpi-staged"
+            label="Data staged"
+            value={q ? formatBytesLong(q.bytesStaged) : na}
+            hint="read from object store"
+          />
+          <Kpi
+            testId="kpi-datasets"
+            label="Datasets"
+            value={s ? String(s.datasets) : na}
+            hint="active"
+          />
+          <Kpi
+            testId="kpi-queue"
+            label="In flight"
+            value={q ? String(q.queued + q.running) : na}
+            hint={q ? `${q.running} running · ${q.queued} queued` : undefined}
+          />
+        </div>
       </section>
 
       <div className="dash-grid">

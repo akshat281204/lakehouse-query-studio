@@ -9,6 +9,7 @@ import '@fontsource/geist-mono/600.css'
 import App from './App'
 import './index.css'
 import './themes.css'
+import './premium.css'
 import { applyTheme, loadTheme } from './lib/theme'
 
 applyTheme(loadTheme())
