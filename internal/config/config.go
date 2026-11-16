@@ -42,6 +42,9 @@ type Config struct {
 	// APIToken is an optional single deployment token. Empty disables token
 	// authentication.
 	APIToken string
+
+	// Query holds the query engine, worker and result limits.
+	Query QueryConfig
 }
 
 // Load reads configuration from the environment, applies defaults, and
@@ -65,6 +68,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.MinIOUseSSL, err = getenvBool("MINIO_USE_SSL", false); err != nil {
 		return nil, fmt.Errorf("MINIO_USE_SSL: %w", err)
+	}
+	if cfg.Query, err = loadQuery(); err != nil {
+		return nil, err
 	}
 	if err = cfg.Validate(); err != nil {
 		return nil, err
