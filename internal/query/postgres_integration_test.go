@@ -349,3 +349,121 @@ func TestPGEndToEndRealQueryThroughRunner(t *testing.T) {
 		t.Fatalf("wrong aggregate: %v", rr.Rows)
 	}
 }
+
+func TestPGRetentionAndStats(t *testing.T) {
+	db := pg(t)
+	ctx := context.Background()
+	store := catalog.NewPostgresQueryStore(db)
+
+	finish := func(stmt, ref string, age time.Duration) string {
+		id := newUUIDT(t)
+		if _, err := store.Submit(ctx, catalog.SubmitQuery{ID: id, Statement: stmt, StatementHash: "h"}); err != nil {
+			t.Fatal(err)
+		}
+		j, _ := store.ClaimQuery(ctx, "w", time.Minute)
+		if j == nil || j.ID != id {
+			t.Fatalf("claimed %+v", j)
+		}
+		if err := store.Succeed(ctx, id, j.FencingToken, catalog.QueryResult{ResultRef: ref, RowsReturned: 1, ResultBytes: 10}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE query_jobs SET finished_at = now() - make_interval(secs => $2) WHERE id = $1`, id, age.Seconds()); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	oldID := finish("SELECT 1", "exports/default/old/attempt=1/result.parquet", 48*time.Hour)
+	freshID := finish("SELECT 2", "exports/default/fresh/attempt=1/result.parquet", time.Hour)
+	ancientID := finish("SELECT 3", "exports/default/ancient/attempt=1/result.parquet", 90*24*time.Hour)
+
+	runningID := newUUIDT(t)
+	_, _ = store.Submit(ctx, catalog.SubmitQuery{ID: runningID, Statement: "SELECT 4", StatementHash: "h"})
+	_, _ = store.ClaimQuery(ctx, "w", time.Minute)
+	queuedID := newUUIDT(t)
+	_, _ = store.Submit(ctx, catalog.SubmitQuery{ID: queuedID, Statement: "SELECT 5", StatementHash: "h"})
+
+	st, err := store.Stats(ctx)
+	if err != nil || st.QueryRunning != 1 || st.QueryQueued != 1 || st.IngestQueued != 0 {
+		t.Fatalf("stats %+v %v", st, err)
+	}
+
+	// Expire results older than 24h: returns the OLD keys (not NULLs).
+	refs, err := store.ExpireResults(ctx, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"exports/default/old/attempt=1/result.parquet": true, "exports/default/ancient/attempt=1/result.parquet": true}
+	if len(refs) != 2 || !want[refs[0]] || !want[refs[1]] {
+		t.Fatalf("expired refs = %v", refs)
+	}
+	for _, id := range []string{oldID, ancientID} {
+		j, _ := store.GetQuery(ctx, id)
+		if j.ResultRef != "" || j.ResultBytes != nil || j.Status != catalog.QuerySucceeded {
+			t.Fatalf("%+v", j)
+		}
+	}
+	if j, _ := store.GetQuery(ctx, freshID); j.ResultRef == "" {
+		t.Fatal("fresh result expired")
+	}
+	if again, _ := store.ExpireResults(ctx, time.Now().Add(-24*time.Hour)); len(again) != 0 {
+		t.Fatalf("second expire returned %v", again)
+	}
+
+	// Purge history older than 30 days: only the ancient terminal row goes.
+	n, _, err := store.PurgeHistory(ctx, time.Now().Add(-30*24*time.Hour))
+	if err != nil || n != 1 {
+		t.Fatalf("purged %d %v", n, err)
+	}
+	if _, err := store.GetQuery(ctx, ancientID); !errors.Is(err, catalog.ErrNotFound) {
+		t.Fatalf("ancient row survived: %v", err)
+	}
+	for _, id := range []string{oldID, freshID, runningID, queuedID} {
+		if _, err := store.GetQuery(ctx, id); err != nil {
+			t.Fatalf("%s purged: %v", id, err)
+		}
+	}
+	// Even a very old cutoff never deletes active queries.
+	if n, _, _ := store.PurgeHistory(ctx, time.Now().Add(24*time.Hour)); n != 2 {
+		t.Fatalf("purge-all removed %d, want only the 2 finished rows left", n)
+	}
+	for _, id := range []string{runningID, queuedID} {
+		if _, err := store.GetQuery(ctx, id); err != nil {
+			t.Fatalf("active query %s purged: %v", id, err)
+		}
+	}
+}
+
+func TestPGSummaryAggregatesRealRows(t *testing.T) {
+	db := pg(t)
+	ctx := context.Background()
+	pgRegister(t, db, "sum-ds", "data/sum", nil, []catalog.SchemaColumn{{Name: "id", Type: "int64"}})
+	store := catalog.NewPostgresQueryStore(db)
+	ok := func(dur int64, rows int64) {
+		id := newUUIDT(t)
+		_, _ = store.Submit(ctx, catalog.SubmitQuery{ID: id, Statement: "SELECT 1", StatementHash: "h"})
+		j, _ := store.ClaimQuery(ctx, "w", time.Minute)
+		_ = store.Succeed(ctx, j.ID, j.FencingToken, catalog.QueryResult{ResultRef: "exports/x", RowsReturned: rows, ResultBytes: 1, BytesStaged: 10, Duration: time.Duration(dur) * time.Millisecond})
+	}
+	ok(20, 3)
+	ok(80, 4)
+	id := newUUIDT(t)
+	_, _ = store.Submit(ctx, catalog.SubmitQuery{ID: id, Statement: "SELECT 2", StatementHash: "h"})
+	j, _ := store.ClaimQuery(ctx, "w", time.Minute)
+	_ = store.Finish(ctx, j.ID, j.FencingToken, catalog.QueryFailed, catalog.ReasonEngineError, "boom", time.Millisecond)
+	_, _ = store.Submit(ctx, catalog.SubmitQuery{ID: newUUIDT(t), Statement: "SELECT 3", StatementHash: "h"})
+
+	s, err := store.Summary(ctx, time.Hour, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := s.Queries
+	if q.Total != 4 || q.Succeeded != 2 || q.Failed != 1 || q.Queued != 1 || q.RowsReturned != 7 || q.BytesStaged != 20 {
+		t.Fatalf("%+v", q)
+	}
+	if q.P50Ms != 20 || q.MaxMs != 80 {
+		t.Fatalf("latency %+v", q)
+	}
+	if s.Datasets != 1 || len(s.Timeline) != 12 || len(s.FailureReasons) != 1 {
+		t.Fatalf("datasets=%d timeline=%d reasons=%v", s.Datasets, len(s.Timeline), s.FailureReasons)
+	}
+}

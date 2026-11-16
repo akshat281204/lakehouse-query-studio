@@ -98,16 +98,32 @@ type QueryResult struct {
 
 // Relation is a READY dataset version a query may read.
 type Relation struct {
-	DatasetName      string
-	Version          int
-	VersionID        string
-	ObjectPrefix     string
+	DatasetName  string
+	Version      int
+	VersionID    string
+	ObjectPrefix string
+	// BaseSegments are earlier prefixes whose files are part of this version
+	// (appended data), oldest first.
+	BaseSegments     []string
 	Format           string
 	PartitionColumns []string
 	// HivePartitioned is true for registered data whose partition values live
 	// only in directory names. Converted data keeps partition columns in the
 	// files, so it must not be hive-decoded a second time.
 	HivePartitioned bool
+}
+
+// Prefixes returns every object prefix holding the relation's files: the base
+// segments (oldest first), then ObjectPrefix.
+func (r Relation) Prefixes() []string {
+	out := make([]string, 0, len(r.BaseSegments)+1)
+	out = append(out, r.BaseSegments...)
+	return append(out, r.ObjectPrefix)
+}
+
+// QueueStats counts jobs by kind and state, for queue-depth metrics.
+type QueueStats struct {
+	QueryQueued, QueryRunning, IngestQueued, IngestRunning int
 }
 
 // QueryStore is the durable query-job surface used by the API and worker.
@@ -135,6 +151,19 @@ type QueryStore interface {
 	Succeed(ctx context.Context, id, token string, r QueryResult) error
 	// Finish records FAILED, CANCELLED or TIMED_OUT conditional on the token.
 	Finish(ctx context.Context, id, token, status, reason, summary string, d time.Duration) error
+	// ExpireResults clears the result reference of SUCCEEDED queries finished
+	// before cutoff and returns the spool keys, so the API answers
+	// `result_expired` and the caller can delete the objects.
+	ExpireResults(ctx context.Context, cutoff time.Time) ([]string, error)
+	// PurgeHistory deletes terminal queries finished before cutoff (statement
+	// text included) and returns any spool keys they still referenced.
+	PurgeHistory(ctx context.Context, cutoff time.Time) (deleted int, refs []string, err error)
+	// Summary aggregates the last `window` of activity for the dashboard
+	// (timeline in `buckets` slices). It reads at most 50,000 query jobs and
+	// sets Truncated when the window held more.
+	Summary(ctx context.Context, window time.Duration, buckets int) (Summary, error)
+	// Stats returns current queue depths (queries and ingestion jobs).
+	Stats(ctx context.Context) (QueueStats, error)
 	// RequestCancel cancels a QUEUED query immediately, or flags a RUNNING one
 	// for its worker to stop. Terminal queries return ErrInvalidState.
 	RequestCancel(ctx context.Context, id string) (QueryJob, error)

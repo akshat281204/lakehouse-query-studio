@@ -11,11 +11,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/akshat281204/lakehouse-query-studio/internal/catalog"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
 	"github.com/akshat281204/lakehouse-query-studio/internal/parquet"
 	"github.com/akshat281204/lakehouse-query-studio/internal/query"
+	"github.com/akshat281204/lakehouse-query-studio/internal/telemetry"
 )
 
 // QueryLimits are the API-side bounds of design §9 and §12.
@@ -39,6 +41,8 @@ type QueryDeps struct {
 	Validator *query.Validator
 	Objects   objectstore.Store
 	Limits    QueryLimits
+	// Metrics is optional.
+	Metrics *telemetry.Metrics
 }
 
 // WithQueries enables the query endpoints.
@@ -58,6 +62,10 @@ const (
 	defaultHistory   = 25
 	maxHistory       = 100
 	maxResultRowsAPI = 100_000
+
+	// Long-poll bounds for GET /api/v1/queries/{id}?waitMs=N.
+	maxQueryWaitMs = 5000
+	queryWaitStep  = 10 * time.Millisecond
 )
 
 func (h *Handler) registerQueries(mux *http.ServeMux) {
@@ -67,6 +75,7 @@ func (h *Handler) registerQueries(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/queries/{id}/cancel", h.handleCancelQuery)
 	mux.HandleFunc("GET /api/v1/queries/{id}/results", h.handleQueryResults)
 	mux.HandleFunc("GET /api/v1/queries/{id}/export", h.handleQueryExport)
+	mux.HandleFunc("GET /api/v1/stats", h.handleStats)
 }
 
 func (h *Handler) requireQueries(w http.ResponseWriter) bool {
@@ -179,10 +188,31 @@ func (h *Handler) handleGetQuery(w http.ResponseWriter, r *http.Request) {
 	if !h.requireQueries(w) {
 		return
 	}
-	job, err := h.queries.Store.GetQuery(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	job, err := h.queries.Store.GetQuery(r.Context(), id)
 	if err != nil {
 		writeQueryError(w, err)
 		return
+	}
+	// Optional long-poll: ?waitMs=N holds the request until the query reaches a
+	// final state or N milliseconds pass (capped), so a client learns the moment
+	// a fast query finishes instead of at its next poll tick. Without the
+	// parameter the response is immediate, as before.
+	if ms, _ := strconv.Atoi(r.URL.Query().Get("waitMs")); ms > 0 && !catalog.IsTerminalQuery(job.Status) {
+		deadline := time.Now().Add(time.Duration(min(ms, maxQueryWaitMs)) * time.Millisecond)
+		tick := time.NewTicker(queryWaitStep)
+		defer tick.Stop()
+		for !catalog.IsTerminalQuery(job.Status) && time.Now().Before(deadline) {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-tick.C:
+			}
+			if job, err = h.queries.Store.GetQuery(r.Context(), id); err != nil {
+				writeQueryError(w, err)
+				return
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, job)
 }
@@ -195,6 +225,9 @@ func (h *Handler) handleCancelQuery(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeQueryError(w, err)
 		return
+	}
+	if h.queries.Metrics != nil {
+		h.queries.Metrics.QueryCancels.Inc()
 	}
 	writeJSON(w, http.StatusAccepted, job)
 }
@@ -424,4 +457,38 @@ func (h *Handler) handleQueryExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Export-Truncated", strconv.FormatBool(truncated))
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, &buf)
+}
+
+// statsWindows maps the accepted window names to a duration and a timeline
+// resolution (bucket count).
+var statsWindows = map[string]struct {
+	d       time.Duration
+	buckets int
+}{
+	"1h":  {time.Hour, 30},
+	"6h":  {6 * time.Hour, 36},
+	"24h": {24 * time.Hour, 24},
+	"7d":  {7 * 24 * time.Hour, 28},
+}
+
+func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
+	if !h.requireQueries(w) {
+		return
+	}
+	name := r.URL.Query().Get("window")
+	if name == "" {
+		name = "24h"
+	}
+	win, ok := statsWindows[name]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_argument", "window must be one of 1h, 6h, 24h, 7d")
+		return
+	}
+	sum, err := h.queries.Store.Summary(r.Context(), win.d, win.buckets)
+	if err != nil {
+		writeQueryError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, sum)
 }

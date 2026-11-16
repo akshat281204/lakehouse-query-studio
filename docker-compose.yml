@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (run make up to generate .env)}
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-55432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -18,23 +18,26 @@ services:
       retries: 10
       start_period: 5s
 
-  minio:
-    image: quay.io/minio/minio:RELEASE.2025-10-15T17-29-55Z
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-lakehouse}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set (run make up to generate .env)}
+  # S3-compatible object store. The community MinIO images are no longer
+  # published (the minio/minio repositories are gone), so the default local
+  # store is SeaweedFS. The apps speak plain S3 (SigV4, path-style) and keep the
+  # historical MINIO_* variable names; any S3-compatible store works by pointing
+  # MINIO_ENDPOINT/MINIO_ACCESS_KEY/MINIO_SECRET_KEY at it. The credentials come
+  # from .env via the gitignored .s3-config.json that `make up` generates.
+  s3:
+    image: chrislusf/seaweedfs:4.05
+    command: ["server", "-s3", "-s3.config=/etc/seaweedfs/s3.json", "-dir=/data", "-ip.bind=0.0.0.0"]
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:${S3_HOST_PORT:-8333}:8333"
     volumes:
-      - miniodata:/data
+      - ./.s3-config.json:/etc/seaweedfs/s3.json:ro
+      - s3data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      test: ["CMD-SHELL", "nc -z localhost 8333 && wget -q -O /dev/null http://localhost:9333/cluster/status"]
       interval: 5s
       timeout: 5s
-      retries: 10
-      start_period: 5s
+      retries: 20
+      start_period: 10s
 
   api:
     build:
@@ -43,21 +46,25 @@ services:
     command: ["/app/api"]
     environment:
       HTTP_ADDR: ":8080"
+      # Closed Host/Origin allowlists (docs/security.md). They follow the
+      # published host ports so changing WEB_HOST_PORT/API_HOST_PORT keeps working.
+      ALLOWED_HOSTS: "localhost:${WEB_HOST_PORT:-5173},127.0.0.1:${WEB_HOST_PORT:-5173},localhost:${API_HOST_PORT:-8080},127.0.0.1:${API_HOST_PORT:-8080},api:8080"
+      ALLOWED_ORIGINS: "http://localhost:${WEB_HOST_PORT:-5173},http://127.0.0.1:${WEB_HOST_PORT:-5173},http://localhost:${API_HOST_PORT:-8080},http://127.0.0.1:${API_HOST_PORT:-8080}"
       LOG_LEVEL: ${LOG_LEVEL:-info}
       LOG_FORMAT: json
       SHUTDOWN_TIMEOUT: 10s
       POSTGRES_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lakehouse}?sslmode=disable
-      MINIO_ENDPOINT: minio:9000
+      MINIO_ENDPOINT: s3:8333
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-lakehouse}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: ${MINIO_BUCKET:-lakehouse}
       MINIO_USE_SSL: "false"
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${API_HOST_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy
-      minio:
+      s3:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/healthz"]
@@ -77,10 +84,14 @@ services:
     environment:
       DUCKDB_MEMORY: ${DUCKDB_MEMORY:-2GiB}
       QUERY_WORKERS: ${QUERY_WORKERS:-2}
+      # Worker /metrics: reachable on the Compose network only (not published).
+      METRICS_ADDR: ":9100"
+      EXPORT_TTL: ${EXPORT_TTL:-24h}
+      HISTORY_RETENTION: ${HISTORY_RETENTION:-720h}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       LOG_FORMAT: json
       POSTGRES_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lakehouse}?sslmode=disable
-      MINIO_ENDPOINT: minio:9000
+      MINIO_ENDPOINT: s3:8333
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-lakehouse}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: ${MINIO_BUCKET:-lakehouse}
@@ -88,7 +99,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      minio:
+      s3:
         condition: service_healthy
 
   web:
@@ -96,11 +107,41 @@ services:
       context: ./web
       dockerfile: Dockerfile
     ports:
-      - "127.0.0.1:5173:80"
+      - "127.0.0.1:${WEB_HOST_PORT:-5173}:80"
     depends_on:
       api:
         condition: service_started
 
+  # --- Service operations (opt-in): docker compose --profile ops up -d ---------
+  # Separate from the user-facing SQL dashboard. Both bind to loopback only.
+  prometheus:
+    profiles: ["ops"]
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - api
+      - worker
+
+  grafana:
+    profiles: ["ops"]
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+
 volumes:
   pgdata:
-  miniodata:
+  s3data:

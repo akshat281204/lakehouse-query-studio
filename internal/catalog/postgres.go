@@ -188,7 +188,7 @@ func (s *postgresStore) Get(ctx context.Context, id string) (Dataset, error) {
 
 func (s *postgresStore) GetLatestVersion(ctx context.Context, datasetID string) (DatasetVersion, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, dataset_id, version, object_prefix, format, partition_columns, status, error_summary, row_count, created_at
+		SELECT `+versionCols+`
 		FROM dataset_versions
 		WHERE dataset_id = $1
 		ORDER BY version DESC
@@ -240,12 +240,15 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+// versionCols is the column list scanVersion reads.
+const versionCols = `id, dataset_id, version, object_prefix, format, partition_columns, status, error_summary, row_count, created_at, base_segments`
+
 func scanVersion(row rowScanner) (DatasetVersion, error) {
 	var v DatasetVersion
-	var parts []byte
+	var parts, segments []byte
 	var errSummary sql.NullString
 	var rowCount sql.NullInt64
-	if err := row.Scan(&v.ID, &v.DatasetID, &v.Version, &v.ObjectPrefix, &v.Format, &parts, &v.Status, &errSummary, &rowCount, &v.CreatedAt); err != nil {
+	if err := row.Scan(&v.ID, &v.DatasetID, &v.Version, &v.ObjectPrefix, &v.Format, &parts, &v.Status, &errSummary, &rowCount, &v.CreatedAt, &segments); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DatasetVersion{}, fmt.Errorf("%w: version", ErrNotFound)
 		}
@@ -253,6 +256,9 @@ func scanVersion(row rowScanner) (DatasetVersion, error) {
 	}
 	if err := json.Unmarshal(parts, &v.PartitionColumns); err != nil {
 		return DatasetVersion{}, fmt.Errorf("decode partition columns: %w", err)
+	}
+	if err := json.Unmarshal(segments, &v.BaseSegments); err != nil {
+		return DatasetVersion{}, fmt.Errorf("decode base segments: %w", err)
 	}
 	if errSummary.Valid {
 		v.ErrorSummary = errSummary.String

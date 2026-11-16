@@ -80,7 +80,32 @@ func (m *MemoryIngestStore) nextVersion(datasetID string) int {
 	return n + 1
 }
 
+// latestReady returns the dataset's highest READY version.
+func (m *MemoryIngestStore) latestReady(datasetID string) (*DatasetVersion, bool) {
+	var best *DatasetVersion
+	for _, v := range m.versions {
+		if v.DatasetID == datasetID && v.Status == VersionReady && (best == nil || v.Version > best.Version) {
+			best = v
+		}
+	}
+	return best, best != nil
+}
+
 func (m *MemoryIngestStore) enqueue(ds *Dataset, req CreateConvert) (Job, error) {
+	mode, baseID := req.Mode, ""
+	if mode == "" {
+		mode = ModeReplace
+	}
+	if mode == ModeAppend {
+		base, ok := m.latestReady(ds.ID)
+		if !ok {
+			return Job{}, fmt.Errorf("%w: dataset %q has no READY version to append to", ErrInvalidArgument, ds.Name)
+		}
+		if err := CheckAppendable(ds.Name, *base); err != nil {
+			return Job{}, err
+		}
+		baseID, req.PartitionColumns = base.ID, base.PartitionColumns
+	}
 	vid, err := newUUID()
 	if err != nil {
 		return Job{}, err
@@ -96,7 +121,7 @@ func (m *MemoryIngestStore) enqueue(ds *Dataset, req CreateConvert) (Job, error)
 		ID: req.JobID, DatasetID: ds.ID, DatasetName: ds.Name, VersionID: vid, Version: n,
 		Kind: KindConvert, Status: JobQueued, InputRef: req.InputRef, InputFormat: req.InputFormat,
 		PartitionColumns: orEmpty(req.PartitionColumns), RetryOf: req.RetryOf,
-		RetainOriginal: ds.RetainOriginal, CreatedAt: now,
+		RetainOriginal: ds.RetainOriginal, CreatedAt: now, Mode: mode, BaseVersionID: baseID,
 	}
 	m.jobs[j.ID] = j
 	m.order = append(m.order, j.ID)
@@ -107,6 +132,9 @@ func (m *MemoryIngestStore) CreateConvert(_ context.Context, req CreateConvert) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ds, ok := m.datasets[req.Name]
+	if !ok && req.Mode == ModeAppend {
+		return Job{}, Dataset{}, fmt.Errorf("%w: dataset %q does not exist; an append needs an existing dataset", ErrNotFound, req.Name)
+	}
 	if !ok {
 		id, err := newUUID()
 		if err != nil {
@@ -144,7 +172,7 @@ func (m *MemoryIngestStore) Retry(_ context.Context, sourceID, newID string) (Jo
 	ds := m.datasets[src.DatasetName]
 	return m.enqueue(ds, CreateConvert{
 		JobID: newID, Name: ds.Name, InputRef: src.InputRef, InputFormat: src.InputFormat,
-		PartitionColumns: src.PartitionColumns, RetryOf: sourceID,
+		PartitionColumns: src.PartitionColumns, RetryOf: sourceID, Mode: src.Mode,
 	})
 }
 
@@ -217,11 +245,27 @@ func (m *MemoryIngestStore) Complete(_ context.Context, id, token string, p Publ
 	if err != nil {
 		return err
 	}
-	now := m.Now()
-	j.Status, j.FinishedAt, j.Retryable, j.FailureReason, j.ErrorSummary = JobSucceeded, &now, false, "", ""
 	v := m.versions[j.VersionID]
 	rc := p.RowCount
-	v.Status, v.ObjectPrefix, v.RowCount, v.PartitionColumns = VersionReady, p.ObjectPrefix, &rc, orEmpty(p.PartitionColumns)
+	rowCount := &rc
+	var segments []string
+	if j.Mode == ModeAppend {
+		if latest, ok := m.latestReady(j.DatasetID); !ok || latest.ID != j.BaseVersionID {
+			return ErrBaseChanged
+		}
+		base := m.versions[j.BaseVersionID]
+		segments = append(append(segments, base.BaseSegments...), base.ObjectPrefix)
+		if base.RowCount == nil {
+			rowCount = nil
+		} else {
+			total := *base.RowCount + p.RowCount
+			rowCount = &total
+		}
+	}
+	now := m.Now()
+	j.Status, j.FinishedAt, j.Retryable, j.FailureReason, j.ErrorSummary = JobSucceeded, &now, false, "", ""
+	v.Status, v.ObjectPrefix, v.RowCount, v.PartitionColumns = VersionReady, p.ObjectPrefix, rowCount, orEmpty(p.PartitionColumns)
+	v.BaseSegments = segments
 	cols := make([]SchemaColumn, len(p.Columns))
 	for i, c := range p.Columns {
 		c.VersionID, c.Position = v.ID, i
@@ -243,4 +287,28 @@ func (m *MemoryIngestStore) Fail(_ context.Context, id, token, reason, summary s
 	v := m.versions[j.VersionID]
 	v.Status, v.ErrorSummary = VersionFailed, summary
 	return nil
+}
+
+func (m *MemoryIngestStore) AppendBase(_ context.Context, baseVersionID string) (DatasetVersion, []SchemaColumn, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.versions[baseVersionID]
+	if !ok {
+		return DatasetVersion{}, nil, fmt.Errorf("%w: base version", ErrNotFound)
+	}
+	return *v, append([]SchemaColumn(nil), m.columns[baseVersionID]...), nil
+}
+
+func (m *MemoryIngestStore) ReadySchema(_ context.Context, name string) (DatasetVersion, []SchemaColumn, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ds, ok := m.datasets[name]
+	if !ok || ds.Status != DatasetActive {
+		return DatasetVersion{}, nil, fmt.Errorf("%w: dataset %q", ErrNotFound, name)
+	}
+	v, ok := m.latestReady(ds.ID)
+	if !ok {
+		return DatasetVersion{}, nil, fmt.Errorf("%w: dataset %q has no READY version", ErrNotFound, name)
+	}
+	return *v, append([]SchemaColumn(nil), m.columns[v.ID]...), nil
 }

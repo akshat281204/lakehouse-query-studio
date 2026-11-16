@@ -30,6 +30,29 @@ Errors use the §11 envelope. `query_denied` is `400`, `invalid_state` `409`,
 `result_expired` `410`, `resource_exhausted` `429`. Messages never echo the
 statement.
 
+## Saved queries (phase 10)
+
+A small library of named, reusable statements: `POST|GET /api/v1/saved-queries`,
+`GET|PUT|DELETE /api/v1/saved-queries/{id}`. A name is 1-120 characters and unique ignoring case
+(409 `already_exists`); a description is at most 500; at most 500 saved queries exist (the cap is
+enforced under an advisory lock, because a count check alone races under READ COMMITTED; a
+concurrency test covers it). The statement must pass **the same validator as a submitted
+query**, so the library can never hold SQL the engine would refuse (`query_denied`, nothing is
+stored); it is validated again, like every statement, when it is run. Saving never runs anything
+and statement text is never logged. In the dashboard: *Save…* / *Update saved…* in the run bar,
+the *Saved queries* list under the datasets (click to load, a second click to delete), and the
+command palette (Cmd/Ctrl+K) opens one in the editor without running it.
+
+## Start-up latency
+
+An idle worker does not wait out its poll interval: submitting a query (and creating an ingestion job)
+sends a PostgreSQL `NOTIFY` in the same transaction, and the worker holds a dedicated `LISTEN` connection per
+runner, so a committed job is claimed in a few milliseconds. A notification that never arrives (a dropped
+listener connection, which reconnects with backoff) only costs latency: the one-second poll
+is kept as the fallback and still finds the job. `GET /api/v1/queries/{id}?waitMs=N` holds the request until the
+query reaches a final state or `N` ms (at most 5000) pass; without it the response is immediate. See
+[`evaluation.md`](evaluation.md) for the measurement.
+
 ## Job state machine
 
 `QUEUED → RUNNING → SUCCEEDED | FAILED | CANCELLED | TIMED_OUT`, backed by the
@@ -108,7 +131,7 @@ Known limits of this boundary:
 
 ## Execution and results
 
-* The worker lists the version's `object_prefix`, downloads each `.parquet`
+* The worker lists each prefix of the version (its own `object_prefix` and any appended base segments; segments are kept in separate `s<n>/` directories so equal file names cannot collide), downloads each `.parquet`
   object (bounded per query by `MAX_SCAN_BYTES`, default 1 GiB, and 10,000
   files) into a private `0700` scratch directory preserving relative keys, so
   hive partition directories survive. Registered partitioned data is read with
@@ -138,6 +161,53 @@ Known limits of this boundary:
   summaries for engine errors may carry the first line of a DuckDB binder,
   catalog, conversion or parser message, which can mention a column name or a
   data value from the caller's own query; other errors are generic.
+
+## File pruning and the stage cache (phase 9)
+
+Staging is the dominant cost of a query (see [`evaluation.md`](evaluation.md)), so the
+worker avoids staging bytes a query cannot need.
+
+**File pruning.** For a statement of the shape `SELECT ... FROM <one dataset> WHERE c1 AND c2 ...`
+the validator also records the top-level `AND` conjuncts of the form `column <op> literal`
+(`= <> < <= > >=`, `IN (...)`, `BETWEEN`; the parser turns `NOT (a = b)` into `a <> b` and a
+reversed `5 < col` is flipped). A file is **skipped only when its statistics prove no row can
+satisfy one of them**:
+
+* *Footer statistics.* Each file's Parquet footer is read (two range reads, memoised by
+  object key + size + modified time) and its per-column min / max / null count compared with the
+  literal. Supported types: `int32`, `int64`, `double`, `string`, `boolean`. Doubles are compared
+  with the literal widened by a few ULPs, `<>` on doubles never prunes, and a column that is
+  entirely `NULL` cannot match any comparison.
+* *Hive directory names* (registered, hive-partitioned data only): `name=value` segments are
+  compared only when DuckDB's type auto-detection cannot change their meaning (canonical
+  integers against integer literals, purely alphabetic strings against string literals).
+* The in-repo writer now emits `min_value` / `max_value` / `null_count`, so ingested data is
+  prunable; files written by other tools are prunable when they carry statistics, and are simply
+  kept when they do not.
+
+Pruning is **off** (every file is staged) for anything it cannot reason about with certainty:
+no `WHERE`, `OR`, expressions or function calls on the column, a join, subquery, `WITH`, set
+operation, `USING SAMPLE`, `QUALIFY`, a literal whose kind does not match the column, an unknown
+column, missing or unreadable statistics. If every file is ruled out, the smallest is still staged
+so the engine can read the schema (it returns no rows). Skipped files do not count against
+`MAX_SCAN_BYTES`. Pruning never changes a result: `TestPruningNeverChangesResults` runs a
+filter set with pruning on and off and compares the rows, a randomised property test checks the
+skip decision against a brute-force oracle, and the benchmark verifies identical answers across
+configurations. Disable with `QUERY_PRUNING=off`.
+
+**Stage cache.** `STAGE_CACHE_BYTES` (default 512 MiB, `0` disables) keeps staged objects on local
+disk in a private `0700` directory under `QUERY_TMP_DIR`, evicted least-recently-used. A query
+"stages" a cached object by hard-linking it into its scratch directory (a copy only where links are
+unavailable), so a repeat read copies no bytes and eviction never disturbs a running query. An
+entry is keyed by object key, size and modified time; **dataset prefixes must be treated as
+immutable** (ingestion always writes new versioned prefixes), because an object rewritten in place
+with the same size inside the timestamp's resolution would be served stale. The cache directory is
+removed on a clean worker shutdown; directories left by a crashed worker are removed at the next
+start once a day old. Bytes in the cache are dataset bytes: it has the same trust boundary as the
+scratch directories (single operator, local disk).
+
+Counters `lqs_stage_files_total`, `lqs_stage_files_pruned_total`, `lqs_stage_bytes_pruned_total`
+and `lqs_stage_cache_hits_total` are exported by the worker.
 
 ## Deviations from the phase-0 design
 
@@ -170,7 +240,9 @@ and `autocomplete`; no extension is loaded or installable at query time.
   stale worker, repeated-death failure, cancel, combined queue depth under
   racing submits, relation resolution, and a real DuckDB query joining a
   hive-partitioned registered dataset with a flat one.
-* **Not covered here:** a MinIO-backed run (the MinIO image could not be pulled
-  in the build environment), so object storage is the in-memory store in these
-  tests and the S3 client keeps its own HTTP-level tests; a full
-  `docker compose up` run; the dashboard (phase 5).
+* **Object storage in these tests** is the in-memory store. The real S3 client
+  is covered separately by HTTP-level tests and, since phase 8, an opt-in
+  integration test against a real S3-compatible server (SeaweedFS); the
+  end-to-end demo (`make demo`) was run against real PostgreSQL, a real
+  S3-compatible store and real DuckDB (see `docs/runbook.md` for exactly what
+  was and was not exercised).

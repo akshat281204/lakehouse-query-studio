@@ -191,3 +191,67 @@ func TestQueryConfigRejectsGarbage(t *testing.T) {
 		t.Fatal("non-numeric QUERY_WORKERS accepted")
 	}
 }
+
+func TestQueryObjectStoreCredentialMustBeSetAsAPair(t *testing.T) {
+	t.Setenv("QUERY_MINIO_ACCESS_KEY", "only-the-key")
+	if _, err := Load(); err == nil {
+		t.Fatal("half a credential pair accepted")
+	}
+	t.Setenv("QUERY_MINIO_SECRET_KEY", "and-the-secret")
+	cfg, err := Load()
+	if err != nil || cfg.QueryMinIOAccessKey == "" {
+		t.Fatalf("%v %+v", err, cfg)
+	}
+}
+
+func TestAPITokenMustBeLongEnough(t *testing.T) {
+	t.Setenv("API_TOKEN", "short")
+	if _, err := Load(); err == nil {
+		t.Fatal("short API_TOKEN accepted")
+	}
+	t.Setenv("API_TOKEN", "a-sufficiently-long-token")
+	if _, err := Load(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAllowedHostsDefaultFromListenPortAndCanBeOverridden(t *testing.T) {
+	t.Setenv("HTTP_ADDR", "127.0.0.1:9191")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, h := range cfg.AllowedHosts {
+		if h == "localhost:9191" {
+			found = true
+		}
+		if h == "*" || h == "" {
+			t.Fatalf("wildcard host %q", h)
+		}
+	}
+	if !found {
+		t.Fatalf("hosts %v", cfg.AllowedHosts)
+	}
+	t.Setenv("ALLOWED_HOSTS", "dash.internal:8080, api.internal:8080")
+	cfg, _ = Load()
+	if len(cfg.AllowedHosts) != 2 || cfg.AllowedHosts[1] != "api.internal:8080" {
+		t.Fatalf("hosts %v", cfg.AllowedHosts)
+	}
+}
+
+func TestRetentionBounds(t *testing.T) {
+	for k, v := range map[string]string{"EXPORT_TTL": "10s", "STAGING_TTL": "30m", "SWEEP_INTERVAL": "100ms"} {
+		t.Run(k, func(t *testing.T) {
+			t.Setenv(k, v)
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s=%s accepted", k, v)
+			}
+		})
+	}
+	t.Setenv("EXPORT_TTL", "48h")
+	t.Setenv("HISTORY_RETENTION", "24h")
+	if _, err := Load(); err == nil {
+		t.Fatal("history retention shorter than export TTL accepted")
+	}
+}

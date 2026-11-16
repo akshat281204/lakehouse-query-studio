@@ -437,3 +437,109 @@ func TestQueryEndpointsUnavailableWithoutDependencies(t *testing.T) {
 		}
 	}
 }
+
+func TestStatsEndpointReflectsRealQueryActivity(t *testing.T) {
+	e := newQueryEnv(t, nil, nil)
+	e.submit("SELECT id FROM sales")
+	e.submit("SELECT nope FROM sales")
+	e.runAll()
+	e.submit("SELECT 1") // stays queued
+
+	rec := e.do("GET", "/api/v1/stats?window=1h", "")
+	if rec.Code != 200 || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("%d %v", rec.Code, rec.Header())
+	}
+	var s catalog.Summary
+	if err := json.Unmarshal(rec.Body.Bytes(), &s); err != nil {
+		t.Fatal(err)
+	}
+	if s.WindowSeconds != 3600 || len(s.Timeline) != 30 {
+		t.Fatalf("window/buckets: %d %d", s.WindowSeconds, len(s.Timeline))
+	}
+	q := s.Queries
+	if q.Total != 3 || q.Succeeded != 1 || q.Failed != 1 || q.Queued != 1 || q.RowsReturned != 3 {
+		t.Fatalf("%+v", q)
+	}
+	if len(s.FailureReasons) != 1 || s.FailureReasons[0].Reason != catalog.ReasonEngineError {
+		t.Fatalf("%+v", s.FailureReasons)
+	}
+	if strings.Contains(rec.Body.String(), "SELECT") {
+		t.Fatalf("stats must not carry statement text: %s", rec.Body.String())
+	}
+	for _, w := range []string{"6h", "24h", "7d", ""} {
+		if r := e.do("GET", "/api/v1/stats?window="+w, ""); r.Code != 200 {
+			t.Errorf("window %q: %d", w, r.Code)
+		}
+	}
+	for _, w := range []string{"1y", "0", "-1h", "1h%3Bdrop"} {
+		if r := e.do("GET", "/api/v1/stats?window="+w, ""); r.Code != 400 {
+			t.Errorf("window %q: %d", w, r.Code)
+		}
+	}
+}
+
+func TestQueryStatusLongPollReturnsAsSoonAsTheQueryFinishes(t *testing.T) {
+	e := newQueryEnv(t, nil, nil)
+	job, _ := e.submit("SELECT id FROM sales ORDER BY id")
+
+	type out struct {
+		job     catalog.QueryJob
+		elapsed time.Duration
+	}
+	done := make(chan out, 1)
+	go func() {
+		start := time.Now()
+		rec := e.do("GET", "/api/v1/queries/"+job.ID+"?waitMs=4000", "")
+		var j catalog.QueryJob
+		_ = json.Unmarshal(rec.Body.Bytes(), &j)
+		done <- out{j, time.Since(start)}
+	}()
+	time.Sleep(120 * time.Millisecond) // the request is now parked on a QUEUED job
+	select {
+	case <-done:
+		t.Fatal("long poll returned while the query was still queued")
+	default:
+	}
+	e.runAll()
+	select {
+	case o := <-done:
+		if o.job.Status != catalog.QuerySucceeded {
+			t.Fatalf("status = %s", o.job.Status)
+		}
+		if o.elapsed > 2*time.Second {
+			t.Fatalf("returned %s after the query finished", o.elapsed-120*time.Millisecond)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("long poll did not return after the query finished")
+	}
+}
+
+func TestQueryStatusLongPollTimesOutWithTheCurrentState(t *testing.T) {
+	e := newQueryEnv(t, nil, nil)
+	job, _ := e.submit("SELECT id FROM sales")
+	start := time.Now()
+	rec := e.do("GET", "/api/v1/queries/"+job.ID+"?waitMs=80", "")
+	var j catalog.QueryJob
+	_ = json.Unmarshal(rec.Body.Bytes(), &j)
+	if rec.Code != 200 || j.Status != catalog.QueryQueued {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	if d := time.Since(start); d < 60*time.Millisecond || d > time.Second {
+		t.Fatalf("waited %s, want about 80ms", d)
+	}
+}
+
+func TestQueryStatusIsImmediateWithoutWaitMsAndIgnoresBadValues(t *testing.T) {
+	e := newQueryEnv(t, nil, nil)
+	job, _ := e.submit("SELECT id FROM sales")
+	for _, q := range []string{"", "?waitMs=0", "?waitMs=-5", "?waitMs=abc"} {
+		start := time.Now()
+		rec := e.do("GET", "/api/v1/queries/"+job.ID+q, "")
+		if rec.Code != 200 || time.Since(start) > 200*time.Millisecond {
+			t.Fatalf("%q: %d after %s", q, rec.Code, time.Since(start))
+		}
+	}
+	if rec := e.do("GET", "/api/v1/queries/00000000-0000-4000-8000-000000000000?waitMs=50", ""); rec.Code != 404 {
+		t.Fatalf("unknown id with waitMs: %d", rec.Code)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"github.com/akshat281204/lakehouse-query-studio/internal/catalog"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
 	"github.com/akshat281204/lakehouse-query-studio/internal/parquet"
+	"github.com/akshat281204/lakehouse-query-studio/internal/telemetry"
 )
 
 // Failure reasons recorded on jobs.
@@ -18,6 +19,7 @@ const (
 	ReasonUploadGone   = "upload_missing"
 	ReasonStorage      = "object_store_error"
 	ReasonInternal     = "internal"
+	ReasonBaseChanged  = "base_changed"
 )
 
 // Runner claims and executes conversion jobs. Run it from the worker process;
@@ -29,7 +31,11 @@ type Runner struct {
 	Lease   time.Duration
 	Limits  Limits
 	Poll    time.Duration
-	Log     *slog.Logger
+	// Wake, if set, ends the idle wait early; polling remains the fallback.
+	Wake <-chan struct{}
+	Log  *slog.Logger
+	// Metrics is optional; labels come from closed sets only.
+	Metrics *telemetry.Metrics
 }
 
 // NewRunner returns a Runner with the documented defaults.
@@ -50,10 +56,13 @@ func (r *Runner) Run(ctx context.Context) {
 		if worked && err == nil {
 			continue
 		}
+		t := time.NewTimer(r.Poll)
 		select {
 		case <-ctx.Done():
-		case <-time.After(r.Poll):
+		case <-r.Wake:
+		case <-t.C:
 		}
+		t.Stop()
 	}
 }
 
@@ -83,6 +92,13 @@ func lakePrefix(job *catalog.Job) string {
 func (r *Runner) process(ctx context.Context, job *catalog.Job) {
 	log := r.Log.With("job_id", job.ID, "dataset", job.DatasetName, "version", job.Version, "attempt", job.Attempt)
 	log.Info("ingestion started")
+	started := time.Now()
+	record := func(outcome string) {
+		if r.Metrics != nil {
+			r.Metrics.IngestJobs.Inc(outcome)
+			r.Metrics.IngestDuration.Observe(time.Since(started).Seconds())
+		}
+	}
 
 	timeout := max(r.Lease-time.Minute, r.Lease/2)
 	jctx, cancel := context.WithTimeout(ctx, timeout)
@@ -97,6 +113,7 @@ func (r *Runner) process(ctx context.Context, job *catalog.Job) {
 		if errors.Is(err, catalog.ErrFenced) {
 			log.Warn("job fenced; discarding attempt output")
 			r.cleanup(ctx, written)
+			record("abandoned")
 			return
 		}
 	}
@@ -104,6 +121,7 @@ func (r *Runner) process(ctx context.Context, job *catalog.Job) {
 		if ctx.Err() != nil {
 			// Shutting down mid-job: leave it RUNNING; lease expiry recovers it.
 			log.Warn("ingestion interrupted by shutdown")
+			record("abandoned")
 			return
 		}
 		// This attempt is the sole writer of its attempt-scoped keys and has
@@ -114,6 +132,7 @@ func (r *Runner) process(ctx context.Context, job *catalog.Job) {
 		if ferr := r.Store.Fail(ctx, job.ID, job.FencingToken, reason, summary, retryable); ferr != nil && !errors.Is(ferr, catalog.ErrFenced) {
 			log.Error("record failure", "error", ferr.Error())
 		}
+		record("failed")
 		return
 	}
 
@@ -124,6 +143,7 @@ func (r *Runner) process(ctx context.Context, job *catalog.Job) {
 			log.Warn("delete original upload", "error", derr.Error())
 		}
 	}
+	record("succeeded")
 	log.Info("ingestion succeeded", "rows", publish.RowCount, "prefix", prefix)
 }
 
@@ -147,13 +167,53 @@ func (r *Runner) convert(ctx context.Context, job *catalog.Job, written *[]strin
 		return catalog.Publish{}, err
 	}
 
-	table, err := Parse(job.InputFormat, data, r.Limits)
-	if err != nil {
-		return catalog.Publish{}, err
+	// An append is checked against the base version recorded when the job was
+	// created (not whatever is latest now: publishing refuses if that changed).
+	var base []catalog.SchemaColumn
+	if job.Mode == catalog.ModeAppend {
+		if _, base, err = r.Store.AppendBase(ctx, job.BaseVersionID); err != nil {
+			return catalog.Publish{}, err
+		}
 	}
-	parts, err := Convert(table, job.PartitionColumns, r.Limits)
-	if err != nil {
-		return catalog.Publish{}, err
+
+	var (
+		parts    []Part
+		incoming []catalog.IncomingColumn
+		cols     []catalog.SchemaColumn
+	)
+	partitions := job.PartitionColumns
+	if job.InputFormat == catalog.InputFormatParquet {
+		// Direct import: the uploaded file becomes one part, unchanged.
+		info, err := ParseParquet(data, r.Limits)
+		if err != nil {
+			return catalog.Publish{}, err
+		}
+		if base != nil {
+			if issues := catalog.CheckAppendSchema(base, info.Columns, false); len(issues) > 0 {
+				return catalog.Publish{}, userErrf("the Parquet file does not match the dataset: %s", joinIssues(issues))
+			}
+		}
+		id, err := catalog.NewUUID()
+		if err != nil {
+			return catalog.Publish{}, err
+		}
+		parts = []Part{{RelPath: "part-" + id + ".parquet", Data: data, Rows: int(info.Rows)}}
+		incoming = info.Columns
+		partitions = nil // an imported file keeps its own layout
+	} else {
+		table, err := Parse(job.InputFormat, data, r.Limits)
+		if err != nil {
+			return catalog.Publish{}, err
+		}
+		if base != nil {
+			if table, err = Conform(table, base); err != nil {
+				return catalog.Publish{}, err
+			}
+		}
+		if parts, err = Convert(table, partitions, r.Limits); err != nil {
+			return catalog.Publish{}, err
+		}
+		incoming = IncomingColumns(table)
 	}
 
 	stage, lake := stagingPrefix(job), lakePrefix(job)
@@ -180,15 +240,19 @@ func (r *Runner) convert(ctx context.Context, job *catalog.Job, written *[]strin
 		return catalog.Publish{}, err
 	}
 
-	partSet := map[string]bool{}
-	for _, p := range job.PartitionColumns {
-		partSet[p] = true
+	if base != nil {
+		cols = catalog.MergeAppendSchema(base, incoming)
+	} else {
+		partSet := map[string]bool{}
+		for _, p := range partitions {
+			partSet[p] = true
+		}
+		cols = make([]catalog.SchemaColumn, len(incoming))
+		for i, c := range incoming {
+			cols[i] = catalog.SchemaColumn{Name: c.Name, Type: c.Type, Nullable: c.Nullable, IsPartition: partSet[c.Name]}
+		}
 	}
-	cols := make([]catalog.SchemaColumn, len(table.Columns))
-	for i, c := range table.Columns {
-		cols[i] = catalog.SchemaColumn{Name: c.Name, Type: c.Type, Nullable: c.Nullable, IsPartition: partSet[c.Name]}
-	}
-	return catalog.Publish{ObjectPrefix: lake, PartitionColumns: job.PartitionColumns, RowCount: rows, Columns: cols}, nil
+	return catalog.Publish{ObjectPrefix: lake, PartitionColumns: partitions, RowCount: rows, Columns: cols}, nil
 }
 
 // verify checks that exactly the expected number of part objects are present
@@ -231,6 +295,8 @@ func classifyFailure(err error) (reason, summary string, retryable bool) {
 	switch {
 	case errors.As(err, &ue):
 		return ReasonInvalidInput, ue.Msg, false
+	case errors.Is(err, catalog.ErrBaseChanged):
+		return ReasonBaseChanged, "the dataset changed while this append was running; retry the job to append to the latest version", true
 	case errors.Is(err, objectstore.ErrNotFound):
 		return ReasonUploadGone, "the uploaded file is no longer available; upload it again", false
 	case errors.Is(err, objectstore.ErrUnavailable), errors.Is(err, objectstore.ErrAccessDenied):

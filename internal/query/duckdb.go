@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/akshat281204/lakehouse-query-studio/internal/parquet"
+	duckdb "github.com/marcboeker/go-duckdb/v2"
 )
 
 // DuckDB is the single-node DuckDB implementation of Engine. Every query runs
@@ -220,8 +221,80 @@ func (d *DuckDB) run(ctx context.Context, conn *sql.Conn, req Request, lim Limit
 		return nil, classifyEngineError(ctx, err, req)
 	}
 	_ = rows.Close()
+	finalizeWide(res, kinds)
 	res.PlanSummary = d.plan(ctx, conn, req)
 	return res, nil
+}
+
+// finalizeWide settles columns of kind kindWide: int64 if every value fits,
+// otherwise text (exact decimal digits, never a rounded double).
+func finalizeWide(res *Result, kinds []string) {
+	for i, k := range kinds {
+		if k == kindDecimal {
+			finalizeDecimal(res, i)
+			continue
+		}
+		if k != kindWide {
+			continue
+		}
+		fits := true
+		for _, row := range res.Rows {
+			if b, ok := row[i].(*big.Int); ok && !b.IsInt64() {
+				fits = false
+				break
+			}
+		}
+		for _, row := range res.Rows {
+			b, ok := row[i].(*big.Int)
+			if !ok {
+				if row[i] != nil {
+					row[i] = textOf(row[i])
+				}
+				continue
+			}
+			if fits {
+				row[i] = b.Int64()
+			} else {
+				row[i] = b.String()
+			}
+		}
+		if fits {
+			res.Columns[i].Type = parquet.TypeInt64
+		} else {
+			res.Columns[i].Type = parquet.TypeString
+		}
+	}
+}
+
+// finalizeDecimal turns a DECIMAL column into doubles when no value has more
+// than 15 significant digits, else into exact text.
+func finalizeDecimal(res *Result, i int) {
+	exact := true
+	for _, row := range res.Rows {
+		if d, ok := row[i].(duckdb.Decimal); ok {
+			if len(new(big.Int).Abs(d.Value).String()) > 15 {
+				exact = false
+				break
+			}
+		}
+	}
+	for _, row := range res.Rows {
+		if row[i] == nil {
+			continue
+		}
+		if exact {
+			if f, ok := row[i].(interface{ Float64() float64 }); ok {
+				row[i] = f.Float64()
+				continue
+			}
+		}
+		row[i] = textOf(row[i])
+	}
+	if exact {
+		res.Columns[i].Type = parquet.TypeDouble
+	} else {
+		res.Columns[i].Type = parquet.TypeString
+	}
 }
 
 // plan returns a bounded EXPLAIN of the already-validated statement with local
@@ -247,8 +320,41 @@ func scrubPaths(s string, req Request) string {
 	return strings.ReplaceAll(s, strings.TrimRight(req.WorkDir, "/"), "<work>")
 }
 
+// kindWide marks integer columns wider than int64 (HUGEINT, UBIGINT): DuckDB
+// widens integer SUMs to HUGEINT, so these are common. The final spool type is
+// decided after materialization: int64 when every value fits, text otherwise.
+const kindWide = "wide-int"
+
+// kindDecimal marks DECIMAL columns, settled by finalizeWide.
+const kindDecimal = "decimal"
+
+// decimalPrecision parses DECIMAL(p,s) and returns p.
+func decimalPrecision(dbType string) int {
+	up := strings.ToUpper(dbType)
+	if !strings.HasPrefix(up, "DECIMAL(") {
+		return 0
+	}
+	inner := strings.TrimSuffix(strings.TrimPrefix(up, "DECIMAL("), ")")
+	p, _, _ := strings.Cut(inner, ",")
+	n := 0
+	for _, c := range strings.TrimSpace(p) {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
 func parquetKind(dbType string) string {
+	// DECIMALs are numeric when every value has at most 15 significant digits
+	// (exact in a double), decided after materialization; otherwise exact text.
+	if decimalPrecision(dbType) > 0 {
+		return kindDecimal
+	}
 	switch strings.ToUpper(dbType) {
+	case "HUGEINT", "UBIGINT":
+		return kindWide
 	case "BOOLEAN":
 		return parquet.TypeBoolean
 	case "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER":
@@ -297,6 +403,19 @@ func convert(kind string, v any) (any, int64) {
 			return float64(x), 8
 		case float64:
 			return x, 8
+		case interface{ Float64() float64 }: // DuckDB DECIMAL
+			return x.Float64(), 8
+		}
+	case kindDecimal:
+		if d, ok := v.(interface{ Float64() float64 }); ok {
+			return d, 16
+		}
+	case kindWide:
+		switch x := v.(type) {
+		case *big.Int:
+			return x, 16
+		case uint64:
+			return new(big.Int).SetUint64(x), 16
 		}
 	}
 	s := textOf(v)

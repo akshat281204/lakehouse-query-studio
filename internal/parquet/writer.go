@@ -63,6 +63,7 @@ func Encode(cols []WriteColumn, rows [][]any) ([]byte, error) {
 		totalBytes int64
 	}
 	chunks := make([]chunk, len(cols))
+	stats := make([]colStats, len(cols))
 
 	for i, c := range cols {
 		levels, values, err := splitColumn(c, rows, i)
@@ -73,6 +74,9 @@ func Encode(cols []WriteColumn, rows [][]any) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		// plainValues has validated every value's Go type, so the statistics
+		// type assertions below cannot fail.
+		stats[i] = computeStats(physical[i], values, int64(len(rows)-len(values)))
 
 		var body []byte
 		if c.Nullable {
@@ -148,6 +152,7 @@ func Encode(cols []WriteColumn, rows [][]any) ([]byte, error) {
 		fw.fieldI64(6, chunks[i].totalBytes)
 		fw.fieldI64(7, chunks[i].totalBytes)
 		fw.fieldI64(9, chunks[i].offset)
+		writeStats(fw, stats[i])
 		fw.endStruct() // meta_data
 		fw.endStruct() // column chunk
 		rgBytes += chunks[i].totalBytes
@@ -332,4 +337,107 @@ func (w *thriftWriter) listI32(v int32) { w.zigzag(int64(v)) }
 func (w *thriftWriter) listString(s string) {
 	w.varint(uint64(len(s)))
 	w.buf = append(w.buf, s...)
+}
+
+// colStats are the per-column statistics the writer emits (Parquet Statistics
+// fields null_count, max_value, min_value). min/max are absent when the column
+// has no non-null values or a value that makes ordering unreliable (NaN, or a
+// string too long to store).
+type colStats struct {
+	nullCount int64
+	hasMinMax bool
+	min, max  []byte
+}
+
+// maxStatString caps the string bytes kept as a min or max statistic; longer
+// strings simply produce no min/max (pruning then keeps the file).
+const maxStatString = 256
+
+func computeStats(typ int32, values []any, nulls int64) colStats {
+	st := colStats{nullCount: nulls}
+	if len(values) == 0 {
+		return st
+	}
+	switch typ {
+	case typeInt64:
+		lo, hi := values[0].(int64), values[0].(int64)
+		for _, v := range values[1:] {
+			x := v.(int64)
+			if x < lo {
+				lo = x
+			}
+			if x > hi {
+				hi = x
+			}
+		}
+		st.min, st.max = le64(uint64(lo)), le64(uint64(hi))
+	case typeDouble:
+		lo, hi := values[0].(float64), values[0].(float64)
+		for _, v := range values {
+			x := v.(float64)
+			if math.IsNaN(x) {
+				return st // NaN has no order: publish no min/max
+			}
+			if x < lo {
+				lo = x
+			}
+			if x > hi {
+				hi = x
+			}
+		}
+		st.min, st.max = le64(math.Float64bits(lo)), le64(math.Float64bits(hi))
+	case typeByteArray:
+		lo, hi := values[0].(string), values[0].(string)
+		for _, v := range values[1:] {
+			x := v.(string)
+			if x < lo {
+				lo = x
+			}
+			if x > hi {
+				hi = x
+			}
+		}
+		if len(lo) > maxStatString || len(hi) > maxStatString {
+			return st
+		}
+		st.min, st.max = []byte(lo), []byte(hi)
+	case typeBoolean:
+		anyFalse, anyTrue := false, false
+		for _, v := range values {
+			if v.(bool) {
+				anyTrue = true
+			} else {
+				anyFalse = true
+			}
+		}
+		lo, hi := byte(0), byte(0)
+		if anyTrue {
+			hi = 1
+		}
+		if !anyFalse {
+			lo = 1
+		}
+		st.min, st.max = []byte{lo}, []byte{hi}
+	default:
+		return st
+	}
+	st.hasMinMax = true
+	return st
+}
+
+func le64(v uint64) []byte {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], v)
+	return b[:]
+}
+
+// writeStats appends the Statistics struct (ColumnMetaData field 12).
+func writeStats(fw *thriftWriter, st colStats) {
+	fw.fieldStruct(12)
+	fw.fieldI64(3, st.nullCount)
+	if st.hasMinMax {
+		fw.fieldString(5, string(st.max))
+		fw.fieldString(6, string(st.min))
+	}
+	fw.endStruct()
 }

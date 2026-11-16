@@ -43,6 +43,14 @@ PostgreSQL. In this phase registration is a **reference** to existing data
 (`object_prefix == source_prefix`); copying source objects into the canonical
 `lake/…` layout arrives with ingestion (phase 3).
 
+## Versions, segments and ingestion modes (phase 11)
+
+`dataset_versions.base_segments` (JSON, default `[]`) lists the earlier prefixes whose files are part
+of the version, oldest first; the version's files are those under each base segment and under its own
+`object_prefix`. `DatasetVersion.Prefixes()` / `Relation.Prefixes()` return that list and every reader
+(query staging, preview, profile) iterates it. `ingestion_jobs.mode` is `replace` (default) or `append`;
+an append job also records `base_version_id`, the latest READY version when the job was created.
+
 ## APIs
 
 - `POST /api/v1/datasets` — register a Parquet prefix.
@@ -50,6 +58,14 @@ PostgreSQL. In this phase registration is a **reference** to existing data
 - `GET /api/v1/datasets/{id}` — dataset detail plus latest version and schema.
 - `GET /api/v1/datasets/{id}/schema` — schema columns.
 - `GET /api/v1/datasets/{id}/preview?limit=` — bounded sample rows.
+- `GET /api/v1/datasets/{id}/profile` — row count and, per column, min / max / null count, read from
+  the Parquet **footers only** (no row data is read). A range is reported only when **every** file
+  supplies it (`MergeStats`): if any footer cannot be read, or a file carries no statistics for a
+  column, that column (or the whole response, for an unreadable footer) reports no range rather
+  than a partial one. At most 200 files are read; a larger dataset is reported by schema only.
+  Files written before phase 9 carry no statistics; uploading the data again adds them. Strings
+  are clipped to 80 characters for display (`truncated`), and 64-bit extremes are returned as
+  exact text.
 
 All non-2xx responses use the `docs/design.md` §11 error envelope.
 

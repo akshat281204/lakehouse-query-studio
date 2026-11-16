@@ -26,7 +26,7 @@ type harness struct {
 
 func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-func newHarness(t *testing.T, engine Engine, mutate func(*RunnerConfig)) *harness {
+func newHarness(t testing.TB, engine Engine, mutate func(*RunnerConfig)) *harness {
 	t.Helper()
 	store := catalog.NewMemoryQueryStore()
 	objects := objectstore.NewMemory()
@@ -513,6 +513,54 @@ func TestCleanStaleScratch(t *testing.T) {
 	for d, want := range map[string]bool{old: false, fresh: true, other: true} {
 		if _, err := os.Stat(d); (err == nil) != want {
 			t.Errorf("%s exists=%v want %v", d, err == nil, want)
+		}
+	}
+}
+
+// An idle runner with a very long poll interval must still pick a job up the
+// moment it is signalled; without the signal it waits for the poll.
+func TestRunnerWakesOnSignalInsteadOfWaitingForThePoll(t *testing.T) {
+	wake := make(chan struct{}, 1)
+	h := newHarness(t, nil, func(c *RunnerConfig) { c.Poll = time.Hour })
+	h.runner.Wake = wake
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { h.runner.Run(ctx); close(done) }()
+	time.Sleep(150 * time.Millisecond) // the runner is now idle, waiting out a one-hour poll
+
+	job := h.submit(t, "SELECT 1 AS one")
+	start := time.Now()
+	wake <- struct{}{}
+	deadline := time.After(5 * time.Second)
+	for {
+		if j := h.get(t, job.ID); j.Status == catalog.QuerySucceeded {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("job was not picked up after the wake-up signal")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("took %s after the signal", d)
+	}
+	cancel()
+	<-done
+}
+
+func TestRunnerStillPollsWithoutASignal(t *testing.T) {
+	h := newHarness(t, nil, func(c *RunnerConfig) { c.Poll = 30 * time.Millisecond })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runner.Run(ctx)
+	job := h.submit(t, "SELECT 1 AS one")
+	deadline := time.After(5 * time.Second)
+	for h.get(t, job.ID).Status != catalog.QuerySucceeded {
+		select {
+		case <-deadline:
+			t.Fatal("polling fallback did not pick the job up")
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 }

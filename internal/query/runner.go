@@ -16,6 +16,7 @@ import (
 	"github.com/akshat281204/lakehouse-query-studio/internal/catalog"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
 	"github.com/akshat281204/lakehouse-query-studio/internal/parquet"
+	"github.com/akshat281204/lakehouse-query-studio/internal/telemetry"
 )
 
 // maxStagedFiles bounds how many objects one query may stage.
@@ -34,6 +35,12 @@ type RunnerConfig struct {
 	Poll      time.Duration // idle poll interval
 	TmpDir    string        // parent of per-query scratch directories
 	Limits    Limits
+	// StageCacheBytes bounds the on-disk cache of staged dataset objects;
+	// 0 disables it (every query downloads the files it reads).
+	StageCacheBytes int64
+	// DisablePruning turns off statistics-based file pruning (diagnostics and
+	// benchmarking; pruning never changes results).
+	DisablePruning bool
 }
 
 // DefaultRunnerConfig returns the design defaults.
@@ -55,6 +62,37 @@ type Runner struct {
 	Owner     string
 	Cfg       RunnerConfig
 	Log       *slog.Logger
+	// Metrics is optional; every recorded label comes from a closed set.
+	Metrics *telemetry.Metrics
+	// OnTimings, if set, is called after each executed query with where its
+	// time went. Used by the benchmark; carries no statement text.
+	OnTimings func(Timings)
+	// Wake, if set, ends the idle wait early (the worker connects it to
+	// PostgreSQL LISTEN/NOTIFY). Polling every Cfg.Poll remains the fallback.
+	Wake <-chan struct{}
+
+	cache *StageCache
+	stats statsMemo
+}
+
+// Timings breaks one query's wall time into its stages.
+type Timings struct {
+	Stage       time.Duration // download dataset files to local scratch
+	Execute     time.Duration // DuckDB execution and result materialization
+	Spool       time.Duration // encode and write the result
+	BytesStaged int64
+	Err         error
+
+	// File-level accounting for the staging step.
+	FilesListed int   // Parquet objects under the dataset prefix
+	FilesStaged int   // objects actually staged for the query
+	FilesPruned int   // objects skipped because their statistics rule them out
+	BytesPruned int64 // bytes those skipped objects would have cost
+	CacheHits   int   // staged objects served from the local cache
+	// PruneWork is true when pruning evaluated more than one candidate object.
+	// False means pruning had nothing to decide (no usable filter, or a single
+	// file), so a run with pruning on executes the same work as one with it off.
+	PruneWork bool
 }
 
 // NewRunner builds a Runner, applying defaults for zero config fields.
@@ -82,7 +120,31 @@ func NewRunner(store catalog.QueryStore, objects objectstore.ReadWriter, engine 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	return &Runner{Store: store, Objects: objects, Engine: engine, Validator: v, Owner: owner, Cfg: cfg, Log: log}, nil
+	r := &Runner{Store: store, Objects: objects, Engine: engine, Validator: v, Owner: owner, Cfg: cfg, Log: log}
+	if cfg.StageCacheBytes > 0 {
+		c, err := NewStageCache(cfg.TmpDir, cfg.StageCacheBytes)
+		if err != nil {
+			return nil, err
+		}
+		r.cache = c
+	}
+	return r, nil
+}
+
+// Close releases the stage cache, if any.
+func (r *Runner) Close() error {
+	if r.cache != nil {
+		return r.cache.Close()
+	}
+	return nil
+}
+
+// CacheStats reports the stage cache counters (zero when it is disabled).
+func (r *Runner) CacheStats() CacheStats {
+	if r.cache == nil {
+		return CacheStats{}
+	}
+	return r.cache.Stats()
 }
 
 // Validate rejects configurations outside the design bounds (§12).
@@ -118,6 +180,9 @@ func (r *Runner) Run(ctx context.Context) {
 	if n := CleanStaleScratch(r.Cfg.TmpDir, time.Hour); n > 0 {
 		r.Log.Warn("removed stale query scratch directories", "count", n)
 	}
+	if r.Metrics != nil {
+		r.Metrics.WorkerSlots.Set(float64(r.Cfg.Workers))
+	}
 	slots := make(chan struct{}, r.Cfg.Workers)
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -138,10 +203,13 @@ func (r *Runner) Run(ctx context.Context) {
 			if err != nil && ctx.Err() == nil {
 				r.Log.Error("query claim failed", "error", err.Error())
 			}
+			t := time.NewTimer(r.Cfg.Poll)
 			select {
 			case <-ctx.Done():
-			case <-time.After(r.Cfg.Poll):
+			case <-r.Wake:
+			case <-t.C:
 			}
+			t.Stop()
 			continue
 		}
 		wg.Add(1)
@@ -181,6 +249,10 @@ func ResultKey(queryID string, attempt int) string {
 // or shutting down). It never logs SQL text or credentials.
 func (r *Runner) Process(ctx context.Context, job catalog.QueryJob) {
 	start := time.Now()
+	if r.Metrics != nil {
+		r.Metrics.WorkerInflight.Add(1)
+		defer r.Metrics.WorkerInflight.Add(-1)
+	}
 	jobCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
@@ -199,9 +271,11 @@ func (r *Runner) Process(ctx context.Context, job catalog.QueryJob) {
 	switch {
 	case errors.Is(cause, errFenced):
 		r.Log.Warn("query fenced, discarding work", "query", job.ID, "attempt", job.Attempt)
+		r.count("abandoned", "", dur)
 		return
 	case ctx.Err() != nil && err != nil:
 		r.Log.Info("query interrupted by shutdown; it will be requeued after its lease expires", "query", job.ID)
+		r.count("abandoned", "", dur)
 		return
 	}
 
@@ -314,6 +388,19 @@ func (r *Runner) heartbeat(ctx context.Context, job catalog.QueryJob, cancel con
 	}
 }
 
+// count records a finished attempt in metrics (outcome and reason are closed
+// sets; duration is wall time from claim).
+func (r *Runner) count(outcome, reason string, dur time.Duration) {
+	if r.Metrics == nil {
+		return
+	}
+	r.Metrics.QueryJobs.Inc(outcome)
+	if reason != "" {
+		r.Metrics.QueryFailures.Inc(reason)
+	}
+	r.Metrics.QueryDuration.Observe(dur.Seconds())
+}
+
 func (r *Runner) succeed(ctx context.Context, job catalog.QueryJob, res *spooled, staged int64, dur time.Duration) {
 	err := r.Store.Succeed(ctx, job.ID, job.FencingToken, catalog.QueryResult{
 		ResultRef: res.key, RowsReturned: int64(res.rows), Truncated: res.truncated,
@@ -323,10 +410,16 @@ func (r *Runner) succeed(ctx context.Context, job catalog.QueryJob, res *spooled
 		// Lost the race: our spool is attempt-scoped and never referenced.
 		_ = r.Objects.Delete(ctx, res.key)
 		r.Log.Warn("query result fenced", "query", job.ID)
+		r.count("abandoned", "", dur)
 		return
 	}
 	if err != nil {
 		r.Log.Error("recording query success failed", "query", job.ID, "error", "store error")
+		return
+	}
+	r.count("succeeded", "", dur)
+	if r.Metrics != nil {
+		r.Metrics.QueryRowsReturned.Add(float64(res.rows))
 	}
 	r.Log.Info("query succeeded", "query", job.ID, "rows", res.rows, "truncated", res.truncated,
 		"duration_ms", dur.Milliseconds(), "statement_hash", job.StatementHash)
@@ -336,12 +429,14 @@ func (r *Runner) finish(ctx context.Context, job catalog.QueryJob, status, reaso
 	err := r.Store.Finish(ctx, job.ID, job.FencingToken, status, reason, summary, dur)
 	if errors.Is(err, catalog.ErrFenced) {
 		r.Log.Warn("query finish fenced", "query", job.ID)
+		r.count("abandoned", "", dur)
 		return
 	}
 	if err != nil {
 		r.Log.Error("recording query end failed", "query", job.ID, "error", "store error")
 		return
 	}
+	r.count(map[string]string{catalog.QueryFailed: "failed", catalog.QueryCancelled: "cancelled", catalog.QueryTimedOut: "timed_out"}[status], reason, dur)
 	r.Log.Info("query finished", "query", job.ID, "status", status, "reason", reason,
 		"duration_ms", dur.Milliseconds(), "statement_hash", job.StatementHash)
 }
@@ -386,6 +481,23 @@ func (r *Runner) execute(ctx context.Context, job catalog.QueryJob) (*spooled, i
 	}
 
 	var staged int64
+	var tm Timings
+	var info stageInfo
+	defer func() {
+		if r.Metrics != nil {
+			r.Metrics.StageFiles.Add(float64(info.staged))
+			r.Metrics.StageFilesPruned.Add(float64(info.pruned))
+			r.Metrics.StageBytesPruned.Add(float64(info.bytesPruned))
+			r.Metrics.StageCacheHits.Add(float64(info.cacheHits))
+		}
+		if r.OnTimings != nil {
+			tm.BytesStaged = staged
+			tm.FilesListed, tm.FilesStaged, tm.FilesPruned = info.listed, info.staged, info.pruned
+			tm.BytesPruned, tm.CacheHits, tm.PruneWork = info.bytesPruned, info.cacheHits, info.pruneWork
+			r.OnTimings(tm)
+		}
+	}()
+	stageStart := time.Now()
 	req := Request{Statement: job.Statement, WorkDir: work, Limits: r.Cfg.Limits}
 	for i, id := range order {
 		rel, err := r.Store.RelationByVersionID(ctx, id)
@@ -396,7 +508,15 @@ func (r *Runner) execute(ctx context.Context, job catalog.QueryJob) (*spooled, i
 			return nil, 0, err
 		}
 		dir := filepath.Join(root, fmt.Sprintf("data%d", i))
-		n, err := r.stage(ctx, rel.ObjectPrefix, dir, r.Cfg.Limits.MaxScanBytes-staged)
+		var prune *Pruning
+		if v.Pruning != nil && len(v.Tables) == 1 && !r.Cfg.DisablePruning {
+			for _, name := range byVersion[id].Names {
+				if strings.EqualFold(name, v.Pruning.Table) {
+					prune = v.Pruning
+				}
+			}
+		}
+		n, err := r.stage(ctx, rel.Prefixes(), dir, r.Cfg.Limits.MaxScanBytes-staged, prune, rel.HivePartitioned, &info)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -406,73 +526,224 @@ func (r *Runner) execute(ctx context.Context, job catalog.QueryJob) (*spooled, i
 		req.Sources = append(req.Sources, *src)
 	}
 
+	tm.Stage = time.Since(stageStart)
+	execStart := time.Now()
 	res, err := r.Engine.Execute(ctx, req)
+	tm.Execute = time.Since(execStart)
 	if err != nil {
+		tm.Err = err
 		return nil, staged, err
 	}
+	spoolStart := time.Now()
 	sp, err := r.spool(ctx, job, res)
+	tm.Spool, tm.Err = time.Since(spoolStart), err
 	return sp, staged, err
 }
 
-// stage downloads every Parquet object under prefix into dir, preserving the
-// relative key so hive partition directories survive. DuckDB never sees
-// credentials or object URLs: it reads only these local files.
-func (r *Runner) stage(ctx context.Context, prefix, dir string, budget int64) (int64, error) {
-	prefix = strings.TrimRight(prefix, "/") + "/"
-	var total int64
-	files := 0
-	token := ""
-	for {
-		page, err := r.Objects.List(ctx, objectstore.ListOptions{Prefix: prefix, MaxKeys: 1000, Token: token})
-		if err != nil {
-			if ctx.Err() != nil {
-				return 0, ctx.Err()
-			}
-			return 0, fmt.Errorf("%w: list: %v", errStorage, err)
-		}
-		for _, o := range page.Objects {
-			if !strings.HasSuffix(strings.ToLower(o.Key), ".parquet") || o.Size == 0 {
-				continue
-			}
-			rel := strings.TrimPrefix(o.Key, prefix)
-			local, ok := safeJoin(dir, rel)
-			if !ok {
-				return 0, fmt.Errorf("%w: dataset contains an unsupported object key", ErrEngine)
-			}
-			files++
-			if files > maxStagedFiles {
-				return 0, fmt.Errorf("%w: dataset has too many files to query", ErrLimit)
-			}
-			total += o.Size
-			if total > budget {
-				return 0, fmt.Errorf("%w: dataset is larger than the per-query scan limit", ErrLimit)
-			}
-			data, err := r.Objects.Get(ctx, o.Key, o.Size+1)
+// stageInfo accumulates what the staging step did, across a query's relations.
+type stageInfo struct {
+	listed, staged, pruned, cacheHits int
+	bytesPruned                       int64
+	pruneWork                         bool
+}
+
+// stagedObject is an object chosen for staging: rel is its key relative to the
+// segment prefix it was listed under (what a Hive directory name is read from),
+// local its path under the query's data directory.
+type stagedObject struct {
+	objectstore.Object
+	rel   string
+	local string
+}
+
+// stage places the Parquet objects of one relation that a query can need into
+// dir. A relation is one or more prefixes (an appended version has one per
+// segment); keys keep their path below their prefix so Hive partition
+// directories survive. When prune is non-nil, objects whose directory names or
+// footer statistics prove that no row can satisfy the query's filters are
+// skipped. DuckDB never sees credentials or object URLs: it reads only these
+// local files.
+func (r *Runner) stage(ctx context.Context, prefixes []string, dir string, budget int64, prune *Pruning, hive bool, info *stageInfo) (int64, error) {
+	var objs []stagedObject
+	for si, prefix := range prefixes {
+		prefix = strings.TrimRight(prefix, "/") + "/"
+		token := ""
+		for {
+			page, err := r.Objects.List(ctx, objectstore.ListOptions{Prefix: prefix, MaxKeys: 1000, Token: token})
 			if err != nil {
 				if ctx.Err() != nil {
 					return 0, ctx.Err()
 				}
-				if errors.Is(err, objectstore.ErrTooLarge) {
-					return 0, fmt.Errorf("%w: dataset object changed during staging", ErrEngine)
+				return 0, fmt.Errorf("%w: list: %v", errStorage, err)
+			}
+			for _, o := range page.Objects {
+				if !strings.HasSuffix(strings.ToLower(o.Key), ".parquet") || o.Size == 0 {
+					continue
 				}
-				return 0, fmt.Errorf("%w: get: %v", errStorage, err)
+				rel := strings.TrimPrefix(o.Key, prefix)
+				// Segments are kept apart so equal relative names cannot collide.
+				localRel := rel
+				if len(prefixes) > 1 {
+					localRel = fmt.Sprintf("s%d/%s", si, rel)
+				}
+				local, ok := safeJoin(dir, localRel)
+				if !ok {
+					return 0, fmt.Errorf("%w: dataset contains an unsupported object key", ErrEngine)
+				}
+				if len(objs) >= maxStagedFiles {
+					return 0, fmt.Errorf("%w: dataset has too many files to query", ErrLimit)
+				}
+				objs = append(objs, stagedObject{Object: o, rel: rel, local: local})
 			}
-			if err := os.MkdirAll(filepath.Dir(local), 0o700); err != nil {
-				return 0, fmt.Errorf("stage: %w", err)
+			if !page.Truncated || page.NextToken == "" {
+				break
 			}
-			if err := os.WriteFile(local, data, 0o600); err != nil {
-				return 0, fmt.Errorf("stage: %w", err)
-			}
+			token = page.NextToken
 		}
-		if !page.Truncated || page.NextToken == "" {
-			break
-		}
-		token = page.NextToken
 	}
-	if files == 0 {
+	if len(objs) == 0 {
 		return 0, fmt.Errorf("%w: dataset has no Parquet files", ErrEngine)
 	}
+	info.listed += len(objs)
+
+	keep := objs
+	if prune != nil {
+		keep = r.pruneObjects(ctx, objs, prune.Constraints, hive)
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		if len(keep) == 0 {
+			// Every file is ruled out. The engine still needs one to read the
+			// schema from, and it will return no rows from it: keep the smallest.
+			smallest := objs[0]
+			for _, o := range objs[1:] {
+				if o.Size < smallest.Size {
+					smallest = o
+				}
+			}
+			keep = []stagedObject{smallest}
+		}
+		for _, o := range objs {
+			info.bytesPruned += o.Size
+		}
+		for _, o := range keep {
+			info.bytesPruned -= o.Size
+		}
+		info.pruned += len(objs) - len(keep)
+		info.pruneWork = info.pruneWork || len(objs) > 1
+	}
+
+	var total int64
+	for _, o := range keep {
+		total += o.Size
+		if total > budget {
+			return 0, fmt.Errorf("%w: dataset is larger than the per-query scan limit", ErrLimit)
+		}
+	}
+	for _, o := range keep {
+		hit, err := r.fetch(ctx, o.Object, o.local)
+		if err != nil {
+			return 0, err
+		}
+		if hit {
+			info.cacheHits++
+		}
+		info.staged++
+	}
 	return total, nil
+}
+
+// fetch places one object at local, from the stage cache when it holds it.
+func (r *Runner) fetch(ctx context.Context, o objectstore.Object, local string) (hit bool, err error) {
+	load := func() ([]byte, error) {
+		data, err := r.Objects.Get(ctx, o.Key, o.Size+1)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if errors.Is(err, objectstore.ErrTooLarge) {
+				return nil, fmt.Errorf("%w: dataset object changed during staging", ErrEngine)
+			}
+			return nil, fmt.Errorf("%w: get: %v", errStorage, err)
+		}
+		return data, nil
+	}
+	if r.cache != nil {
+		return r.cache.Stage(ctx, o.Key, o.Size, o.LastModified, local, load)
+	}
+	data, err := load()
+	if err != nil {
+		return false, err
+	}
+	return false, writeFile(local, data)
+}
+
+// pruneObjects returns the objects that may contain a row matching cons.
+func (r *Runner) pruneObjects(ctx context.Context, objs []stagedObject, cons []Constraint, hive bool) []stagedObject {
+	cand := objs
+	if hive {
+		cand = make([]stagedObject, 0, len(objs))
+		for _, o := range objs {
+			if MayMatchPartition(cons, o.rel) {
+				cand = append(cand, o)
+			}
+		}
+	}
+	if len(cand) <= 1 {
+		return cand // nothing more to gain: skip the footer reads
+	}
+	verdict := make([]bool, len(cand))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for i, o := range cand {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, o stagedObject) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			verdict[i] = MayMatchFile(cons, r.fileStats(ctx, o.Object))
+		}(i, o)
+	}
+	wg.Wait()
+	keep := make([]stagedObject, 0, len(cand))
+	for i, o := range cand {
+		if verdict[i] {
+			keep = append(keep, o)
+		}
+	}
+	return keep
+}
+
+// statsMemo remembers parsed footer statistics so repeated queries read each
+// footer once. Entries are keyed like cache entries (key, size, modified time).
+type statsMemo struct {
+	mu sync.Mutex
+	m  map[string]*parquet.FileStats
+}
+
+const maxStatsMemo = 50_000
+
+// fileStats returns the footer statistics of o, or nil when they cannot be read
+// (the caller then keeps the file).
+func (r *Runner) fileStats(ctx context.Context, o objectstore.Object) *parquet.FileStats {
+	id := cacheID(o.Key, o.Size, o.LastModified)
+	r.stats.mu.Lock()
+	if st, ok := r.stats.m[id]; ok {
+		r.stats.mu.Unlock()
+		return st
+	}
+	r.stats.mu.Unlock()
+	st, err := parquet.ReadStats(ctx, r.Objects, o.Key, o.Size)
+	if err != nil {
+		return nil
+	}
+	r.stats.mu.Lock()
+	if r.stats.m == nil || len(r.stats.m) >= maxStatsMemo {
+		r.stats.m = map[string]*parquet.FileStats{}
+	}
+	r.stats.m[id] = st
+	r.stats.mu.Unlock()
+	return st
 }
 
 // safeJoin maps an object-key suffix to a path under dir, rejecting anything

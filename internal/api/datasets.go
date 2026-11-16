@@ -21,6 +21,7 @@ type Handler struct {
 	registrar *catalog.Registrar
 	ingest    IngestDeps
 	queries   QueryDeps
+	saved     SavedDeps
 }
 
 // New builds the dataset handler. A nil store or object store reports
@@ -40,8 +41,10 @@ func New(store catalog.Store, objects objectstore.Store, opts ...Option) http.Ha
 	mux.HandleFunc("GET /api/v1/datasets/{id}", h.handleGet)
 	mux.HandleFunc("GET /api/v1/datasets/{id}/schema", h.handleSchema)
 	mux.HandleFunc("GET /api/v1/datasets/{id}/preview", h.handlePreview)
+	mux.HandleFunc("GET /api/v1/datasets/{id}/profile", h.handleProfile)
 	h.registerIngest(mux)
 	h.registerQueries(mux)
+	h.registerSaved(mux)
 	return mux
 }
 
@@ -266,7 +269,7 @@ func (h *Handler) handlePreview(w http.ResponseWriter, r *http.Request) {
 		limit = 100
 	}
 
-	objects, err := catalog.ListParquetObjects(r.Context(), h.objects, v.ObjectPrefix)
+	objects, err := listVersionObjects(r.Context(), h.objects, v)
 	if err != nil {
 		writeMappedError(w, err)
 		return

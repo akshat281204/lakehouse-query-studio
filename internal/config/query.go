@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -29,6 +30,11 @@ type QueryConfig struct {
 	Threads        int           // DUCKDB_THREADS
 	Memory         string        // DUCKDB_MEMORY, e.g. "2GiB"
 	TmpDir         string        // QUERY_TMP_DIR: per-query scratch parent
+	// StageCacheBytes is STAGE_CACHE_BYTES: disk budget for caching staged
+	// dataset objects across queries (0 disables the cache).
+	StageCacheBytes int64
+	// DisablePruning is QUERY_PRUNING=off: skip statistics-based file pruning.
+	DisablePruning bool
 }
 
 const (
@@ -46,6 +52,14 @@ func loadQuery() (QueryConfig, error) {
 		MaxRows: 10_000, MaxResultBytes: 256 * mib, MaxRowBytes: mib, MaxPageBytes: 4 * mib,
 		MaxExportBytes: 64 * mib, MaxExportRows: 50_000, MaxScanBytes: gib, QueueDepth: 100,
 		Threads: threads, Memory: getenv("DUCKDB_MEMORY", "2GiB"), TmpDir: getenv("QUERY_TMP_DIR", os.TempDir()),
+		StageCacheBytes: 512 * mib,
+	}
+	switch strings.ToLower(getenv("QUERY_PRUNING", "on")) {
+	case "on", "":
+	case "off":
+		q.DisablePruning = true
+	default:
+		return q, fmt.Errorf("QUERY_PRUNING must be on or off")
 	}
 	var err error
 	ints := []struct {
@@ -62,7 +76,8 @@ func loadQuery() (QueryConfig, error) {
 		key string
 		dst *int64
 	}{{"MAX_RESULT_BYTES", &q.MaxResultBytes}, {"MAX_ROW_BYTES", &q.MaxRowBytes}, {"MAX_PAGE_BYTES", &q.MaxPageBytes},
-		{"MAX_EXPORT_BYTES", &q.MaxExportBytes}, {"MAX_SCAN_BYTES", &q.MaxScanBytes}}
+		{"MAX_EXPORT_BYTES", &q.MaxExportBytes}, {"MAX_SCAN_BYTES", &q.MaxScanBytes},
+		{"STAGE_CACHE_BYTES", &q.StageCacheBytes}}
 	for _, f := range int64s {
 		v, err := getenvInt(f.key, int(*f.dst))
 		if err != nil {
@@ -113,6 +128,8 @@ func (q QueryConfig) Validate() error {
 		return fmt.Errorf("MAX_EXPORT_ROWS must be positive (it is also capped by MAX_RESULT_ROWS)")
 	case q.MaxScanBytes < 1:
 		return fmt.Errorf("MAX_SCAN_BYTES must be positive")
+	case q.StageCacheBytes < 0 || q.StageCacheBytes > 64*gib:
+		return fmt.Errorf("STAGE_CACHE_BYTES must be between 0 (off) and 64 GiB")
 	case q.QueueDepth < 1:
 		return fmt.Errorf("QUEUE_DEPTH must be positive")
 	case q.Threads < 1:

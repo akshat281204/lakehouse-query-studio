@@ -33,6 +33,9 @@ type TableRef struct {
 // Validated is the outcome of a successful validation.
 type Validated struct {
 	Tables []TableRef
+	// Pruning is non-nil only for a simple single-table filter that allows
+	// skipping files whose statistics cannot match (see prune.go).
+	Pruning *Pruning
 }
 
 // Validator parses SQL with DuckDB's own parser (json_serialize_sql, which
@@ -118,7 +121,7 @@ func (v *Validator) Validate(ctx context.Context, statement string) (*Validated,
 	if err := w.walk(node, 0); err != nil {
 		return nil, err
 	}
-	out := &Validated{}
+	out := &Validated{Pruning: extractPruning(stmt.Node)}
 	for name := range w.tables {
 		out.Tables = append(out.Tables, TableRef{Name: name})
 	}
