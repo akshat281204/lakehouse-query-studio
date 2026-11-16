@@ -11,9 +11,28 @@ import (
 	"github.com/akshat281204/lakehouse-query-studio/migrations"
 )
 
+// migrationLockID is the arbitrary advisory-lock key guarding migrations.
+const migrationLockID = 727274
+
 // Migrate applies pending migrations to db in filename order, each in its own
 // transaction, recording applied migrations in schema_migrations.
+//
+// A session-level advisory lock serializes concurrent runners (the API and the
+// worker both migrate at startup), so the second one waits and then finds
+// everything applied.
 func Migrate(ctx context.Context, db *sql.DB) error {
+	lock, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("migration lock connection: %w", err)
+	}
+	defer func() { _ = lock.Close() }()
+	if _, err := lock.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrationLockID); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer func() {
+		_, _ = lock.ExecContext(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, migrationLockID)
+	}()
+
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version    text PRIMARY KEY,
 		applied_at timestamptz NOT NULL DEFAULT now()

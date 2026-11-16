@@ -3,6 +3,9 @@ import type {
   DatasetDetail,
   DatasetListResponse,
   HealthResponse,
+  IngestionJob,
+  IngestionListResponse,
+  InspectResponse,
   PreviewResponse,
   ReadyResponse,
   SchemaResponse,
@@ -61,6 +64,23 @@ export interface RegisterDatasetInput {
   partitionColumns?: string[]
 }
 
+export interface UploadOptions {
+  name?: string
+  partitionColumns?: string[]
+  retainOriginal?: boolean
+}
+
+function uploadQuery(file: File, opts: UploadOptions): string {
+  const params = new URLSearchParams()
+  params.set('filename', file.name)
+  if (opts.name) params.set('name', opts.name)
+  if (opts.partitionColumns?.length) {
+    params.set('partitionColumns', opts.partitionColumns.join(','))
+  }
+  if (opts.retainOriginal) params.set('retainOriginal', 'true')
+  return `?${params.toString()}`
+}
+
 function listDatasetsQuery(opts: ListDatasetsOptions): string {
   const params = new URLSearchParams()
   if (opts.offset !== undefined) params.set('offset', String(opts.offset))
@@ -102,4 +122,27 @@ export const api = {
       `/api/v1/datasets/${encodeURIComponent(id)}/preview${qs}`,
     )
   },
+
+  inspectUpload: (file: File) =>
+    request<InspectResponse>(
+      `/api/v1/ingestions/inspect${uploadQuery(file, {})}`,
+      { method: 'POST', body: file },
+    ),
+
+  uploadDataset: (file: File, opts: UploadOptions) =>
+    request<IngestionJob>(`/api/v1/ingestions${uploadQuery(file, opts)}`, {
+      method: 'POST',
+      body: file,
+    }),
+
+  listIngestions: () => request<IngestionListResponse>('/api/v1/ingestions'),
+
+  getIngestion: (id: string) =>
+    request<IngestionJob>(`/api/v1/ingestions/${encodeURIComponent(id)}`),
+
+  retryIngestion: (id: string) =>
+    request<IngestionJob>(
+      `/api/v1/ingestions/${encodeURIComponent(id)}/retry`,
+      { method: 'POST' },
+    ),
 }

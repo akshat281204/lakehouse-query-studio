@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -18,12 +19,16 @@ type Handler struct {
 	store     catalog.Store
 	objects   objectstore.Store
 	registrar *catalog.Registrar
+	ingest    IngestDeps
 }
 
 // New builds the dataset handler. A nil store or object store reports
 // unavailable rather than crashing.
-func New(store catalog.Store, objects objectstore.Store) http.Handler {
+func New(store catalog.Store, objects objectstore.Store, opts ...Option) http.Handler {
 	h := &Handler{store: store, objects: objects}
+	for _, o := range opts {
+		o(h)
+	}
 	if store != nil && objects != nil {
 		h.registrar = catalog.NewRegistrar(store, objects)
 	}
@@ -34,6 +39,7 @@ func New(store catalog.Store, objects objectstore.Store) http.Handler {
 	mux.HandleFunc("GET /api/v1/datasets/{id}", h.handleGet)
 	mux.HandleFunc("GET /api/v1/datasets/{id}/schema", h.handleSchema)
 	mux.HandleFunc("GET /api/v1/datasets/{id}/preview", h.handlePreview)
+	h.registerIngest(mux)
 	return mux
 }
 
@@ -183,15 +189,28 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		writeMappedError(w, err)
 		return
 	}
+	// The detail shows the newest version of any status (so a pending or failed
+	// ingestion is visible) but the schema of the newest READY version only.
 	v, err := h.store.GetLatestVersion(r.Context(), id)
 	if err != nil {
 		writeMappedError(w, err)
 		return
 	}
-	cols, err := h.store.GetSchema(r.Context(), v.ID)
-	if err != nil {
-		writeMappedError(w, err)
-		return
+	cols := []catalog.SchemaColumn{}
+	ready := v
+	if v.Status != catalog.VersionReady {
+		ready, err = h.store.GetLatestReadyVersion(r.Context(), id)
+		if err != nil && !errors.Is(err, catalog.ErrNotFound) {
+			writeMappedError(w, err)
+			return
+		}
+	}
+	if err == nil {
+		cols, err = h.store.GetSchema(r.Context(), ready.ID)
+		if err != nil {
+			writeMappedError(w, err)
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, datasetDetail{Dataset: d, Version: v, Columns: cols})
 }
@@ -205,7 +224,7 @@ func (h *Handler) handleSchema(w http.ResponseWriter, r *http.Request) {
 		writeMappedError(w, err)
 		return
 	}
-	v, err := h.store.GetLatestVersion(r.Context(), id)
+	v, err := h.store.GetLatestReadyVersion(r.Context(), id)
 	if err != nil {
 		writeMappedError(w, err)
 		return
@@ -231,7 +250,7 @@ func (h *Handler) handlePreview(w http.ResponseWriter, r *http.Request) {
 		writeMappedError(w, err)
 		return
 	}
-	v, err := h.store.GetLatestVersion(r.Context(), id)
+	v, err := h.store.GetLatestReadyVersion(r.Context(), id)
 	if err != nil {
 		writeMappedError(w, err)
 		return

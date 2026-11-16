@@ -45,6 +45,7 @@ func run() error {
 
 	var db *sql.DB
 	var catalogStore catalog.Store
+	var ingestStore catalog.IngestStore
 	if cfg.PostgresURL != "" {
 		db, err = sql.Open("pgx", cfg.PostgresURL)
 		if err != nil {
@@ -57,6 +58,7 @@ func run() error {
 				log.Warn("catalog migration failed; dataset endpoints will report unavailable", "error", err)
 			} else {
 				catalogStore = catalog.NewPostgresStore(db)
+				ingestStore = catalog.NewPostgresIngestStore(db)
 			}
 			cancel()
 		}
@@ -71,10 +73,20 @@ func run() error {
 		UseSSL:    cfg.MinIOUseSSL,
 	})
 
+	// Best effort: the bucket may not exist on a clean MinIO. Failure is not
+	// fatal because readiness reports the object store separately.
+	bctx, bcancel := context.WithTimeout(ctx, 10*time.Second)
+	if err := objects.EnsureBucket(bctx); err != nil {
+		log.Warn("ensure bucket failed", "error", err.Error())
+	}
+	bcancel()
+
 	srv := server.New(cfg, log, server.Deps{
 		Ready:   buildReady(cfg, db),
 		Catalog: catalogStore,
 		Objects: objects,
+		Ingest:  ingestStore,
+		Writer:  objects,
 	})
 	if err := srv.Run(ctx); err != nil {
 		return fmt.Errorf("server: %w", err)

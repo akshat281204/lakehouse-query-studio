@@ -38,6 +38,8 @@ func classify(err error) (int, string) {
 		return http.StatusNotFound, "not_found"
 	case errors.Is(err, catalog.ErrAlreadyExists):
 		return http.StatusConflict, "already_exists"
+	case errors.Is(err, objectstore.ErrTooLarge):
+		return http.StatusRequestEntityTooLarge, "payload_too_large"
 	case errors.Is(err, catalog.ErrInvalidArgument):
 		return http.StatusBadRequest, "invalid_argument"
 	case errors.Is(err, catalog.ErrUnavailable),

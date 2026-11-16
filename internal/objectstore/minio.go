@@ -1,7 +1,10 @@
 package objectstore
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -192,4 +195,117 @@ type listBucketResult struct {
 		ETag         string `xml:"ETag"`
 		Size         int64  `xml:"Size"`
 	} `xml:"Contents"`
+}
+
+func (c *Client) statusErr(op string, status int) error {
+	switch status {
+	case http.StatusNotFound:
+		return ErrNotFound
+	case http.StatusForbidden:
+		return ErrAccessDenied
+	default:
+		return fmt.Errorf("%w: %s returned status %d", ErrUnavailable, op, status)
+	}
+}
+
+// Put writes data to key. The payload is hashed for SigV4; ingestion objects
+// are bounded in memory by the caller.
+func (c *Client) Put(ctx context.Context, key string, data []byte) error {
+	rawURL := c.scheme() + "://" + c.cfg.Endpoint + c.path(key)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, rawURL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	c.sign(req, http.MethodPut, c.path(key), "", sha256Hex(data))
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return c.statusErr("put", resp.StatusCode)
+	}
+	return nil
+}
+
+// Get reads the whole object, failing with ErrTooLarge beyond maxBytes.
+func (c *Client) Get(ctx context.Context, key string, maxBytes int64) ([]byte, error) {
+	rawURL := c.scheme() + "://" + c.cfg.Endpoint + c.path(key)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.sign(req, http.MethodGet, c.path(key), "", emptyPayloadHash)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.statusErr("get", resp.StatusCode)
+	}
+	if resp.ContentLength > maxBytes {
+		return nil, ErrTooLarge
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: read object: %v", ErrUnavailable, err)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, ErrTooLarge
+	}
+	return data, nil
+}
+
+// Delete removes the object at key; a missing object is not an error.
+func (c *Client) Delete(ctx context.Context, key string) error {
+	rawURL := c.scheme() + "://" + c.cfg.Endpoint + c.path(key)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	c.sign(req, http.MethodDelete, c.path(key), "", emptyPayloadHash)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusNoContent, http.StatusNotFound:
+		return nil
+	default:
+		return c.statusErr("delete", resp.StatusCode)
+	}
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+var _ ReadWriter = (*Client)(nil)
+
+// EnsureBucket creates the configured bucket when it does not exist. An
+// already-existing bucket is not an error, so API and worker may both call it.
+func (c *Client) EnsureBucket(ctx context.Context) error {
+	rawURL := c.scheme() + "://" + c.cfg.Endpoint + c.path("")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	c.sign(req, http.MethodPut, c.path(""), "", emptyPayloadHash)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusConflict:
+		return nil // created, or BucketAlreadyOwnedByYou
+	default:
+		return c.statusErr("create bucket", resp.StatusCode)
+	}
 }
