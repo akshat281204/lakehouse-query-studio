@@ -64,4 +64,39 @@ describe('api client', () => {
 
     await expect(api.serviceInfo()).rejects.toBeInstanceOf(ApiError)
   })
+
+  it('lists datasets with query parameters', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({ datasets: [], offset: 0, limit: 10, total: 0 }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.listDatasets({ q: 'sales', limit: 10 })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/datasets?limit=10&q=sales',
+      undefined,
+    )
+  })
+
+  it('registers a dataset with a JSON POST body', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      statusText: 'Created',
+      json: async () => ({ id: 'd1', name: 'sales' }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.registerDataset({ name: 'sales', prefix: 'data/sales' })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/datasets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'sales', prefix: 'data/sales' }),
+    })
+  })
 })
