@@ -122,13 +122,15 @@ export function UploadPage({ onOpenDataset, pollMs = 1500 }: UploadPageProps) {
   return (
     <main className="page">
       <header className="page-header">
-        <h1>Upload data</h1>
-        <p>
-          Convert a CSV, JSON, or JSONL file into a versioned Parquet dataset.
-        </p>
+        <div>
+          <h1>Upload data</h1>
+          <p>
+            Convert a CSV, JSON, or JSONL file into a versioned Parquet dataset.
+          </p>
+        </div>
       </header>
 
-      <form className="upload-form" onSubmit={handleSubmit}>
+      <form className="upload-form card" onSubmit={handleSubmit}>
         <label className="field">
           <span>File (.csv, .json, .jsonl)</span>
           <input

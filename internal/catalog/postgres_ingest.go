@@ -128,6 +128,9 @@ func newVersionAndJob(ctx context.Context, tx *sql.Tx, ds Dataset, req CreateCon
 		req.JobID, ds.ID, versionID, KindConvert, JobQueued, req.InputRef, req.InputFormat, parts, retryOf, now); err != nil {
 		return "", fmt.Errorf("insert job: %w", err)
 	}
+	if err := notify(ctx, tx, ChannelIngestJobs); err != nil {
+		return "", fmt.Errorf("notify workers: %w", err)
+	}
 	return versionID, nil
 }
 

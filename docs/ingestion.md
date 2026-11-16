@@ -52,7 +52,10 @@ Directories use the percent-encoding of design §4.1 (`region=us%2Feast/`, null
 as `%00`). At most 256 distinct directories are allowed so a high-cardinality
 column fails fast instead of producing an explosion of tiny files. Within a
 directory, files are split at 100,000 rows. Partition columns are also kept in
-the file data, so every part carries the complete schema.
+the file data, so every part carries the complete schema. Every column chunk also carries
+Parquet statistics (`min_value`, `max_value`, `null_count`; omitted for an all-null column, a
+column containing `NaN`, or a string over 256 bytes) so queries can skip files that cannot match
+(see [`queries.md`](queries.md)).
 
 ## Durability and recovery
 
@@ -106,5 +109,8 @@ TEST_POSTGRES_URL=postgres://user:pass@127.0.0.1:5432/db?sslmode=disable make te
 
 They cover the catalog, job claiming and fencing, crash recovery, retries, and
 concurrent claim/create against real SQL. The object store is exercised through
-an in-memory fake plus HTTP-level tests of the S3 client; a MinIO-backed run is
-not part of this phase's automated tests.
+an in-memory fake plus HTTP-level tests of the S3 client. Since phase 8 the
+client (hand-written SigV4) is also tested against a real S3-compatible server
+(`internal/objectstore/s3_integration_test.go`, opt-in via `TEST_S3_ENDPOINT`;
+run against SeaweedFS), including keys with spaces, non-ASCII characters and
+literal `%`/`+`.

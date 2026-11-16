@@ -84,26 +84,28 @@ export function DatasetDetailPage({ id, onBack }: DatasetDetailPageProps) {
 
           <section>
             <h2>Schema</h2>
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Column</th>
-                  <th>Type</th>
-                  <th>Nullable</th>
-                  <th>Partition</th>
-                </tr>
-              </thead>
-              <tbody>
-                {detail.schema.map((c) => (
-                  <tr key={`${c.position}-${c.name}`}>
-                    <td>{c.name}</td>
-                    <td>{c.type}</td>
-                    <td>{c.nullable ? 'yes' : 'no'}</td>
-                    <td>{c.isPartition ? 'yes' : 'no'}</td>
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Column</th>
+                    <th>Type</th>
+                    <th>Nullable</th>
+                    <th>Partition</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {detail.schema.map((c) => (
+                    <tr key={`${c.position}-${c.name}`}>
+                      <td>{c.name}</td>
+                      <td>{c.type}</td>
+                      <td>{c.nullable ? 'yes' : 'no'}</td>
+                      <td>{c.isPartition ? 'yes' : 'no'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </section>
 
           <section>
@@ -115,26 +117,31 @@ export function DatasetDetailPage({ id, onBack }: DatasetDetailPageProps) {
             ) : null}
             {preview && preview.rows.length > 0 ? (
               <>
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      {preview.columns.map((c) => (
-                        <th key={`${c.position}-${c.name}`}>{c.name}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {preview.rows.map((row, i) => (
-                      <tr key={i}>
+                <div className="table-scroll">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
                         {preview.columns.map((c) => (
-                          <td key={`${c.position}-${c.name}`}>
-                            {String(row[c.name] ?? '')}
-                          </td>
+                          <th key={`${c.position}-${c.name}`}>{c.name}</th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {preview.rows.map((row, i) => (
+                        <tr key={i}>
+                          {preview.columns.map((c) => (
+                            <td
+                              key={`${c.position}-${c.name}`}
+                              title={String(row[c.name] ?? '')}
+                            >
+                              {String(row[c.name] ?? '')}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
                 {preview.truncated ? (
                   <p className="note">Showing a sample of rows.</p>
                 ) : null}

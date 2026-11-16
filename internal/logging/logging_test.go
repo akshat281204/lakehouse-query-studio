@@ -2,6 +2,7 @@ package logging
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -79,5 +80,25 @@ func TestNewRejectsUnknownLevel(t *testing.T) {
 func TestNewRejectsUnknownFormat(t *testing.T) {
 	if _, err := New(&bytes.Buffer{}, "info", "xml"); err == nil {
 		t.Fatal("New() expected error for unknown format")
+	}
+}
+
+func TestStatementTextAndURLCredentialsAreRedacted(t *testing.T) {
+	var buf bytes.Buffer
+	log, _ := New(&buf, "info", "json")
+	log.Info("x", "statement", "SELECT 'sentinel-literal'", "sql", "SELECT 2", "statement_hash", "abc123",
+		"error", errors.New("dial postgres://lakehouse:sentinel-password@db:5432/x failed"),
+		"note", "see https://user:sentinel-pass2@host/path")
+	out := buf.String()
+	for _, bad := range []string{"sentinel-literal", "SELECT 2", "sentinel-password", "sentinel-pass2"} {
+		if strings.Contains(out, bad) {
+			t.Fatalf("%q leaked: %s", bad, out)
+		}
+	}
+	if !strings.Contains(out, "abc123") {
+		t.Fatalf("statement_hash must stay visible: %s", out)
+	}
+	if !strings.Contains(out, "db:5432/x failed") {
+		t.Fatalf("scrubbing must keep the useful part: %s", out)
 	}
 }

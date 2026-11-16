@@ -1,0 +1,1247 @@
+{
+  "generated_at": "2026-11-15T10:47:58.459826Z",
+  "environment": {
+    "goos": "darwin",
+    "goarch": "arm64",
+    "cpu_model": "Apple M4",
+    "logical_cpus": 10,
+    "memory_bytes": 17179869184,
+    "go_version": "go1.26.3",
+    "duckdb_version": "v1.4.1",
+    "git_commit": "1071148a0f2ad9f25a6649a82a32939a7ae8c103",
+    "git_dirty": true,
+    "os_cache": "not dropped (needs root); 'first' runs are first-after-generation, not guaranteed cold"
+  },
+  "config": {
+    "scale_factor_like": 0.1,
+    "seed": 20240601,
+    "warm_iterations": 15,
+    "concurrency_levels": [
+      1,
+      2,
+      4
+    ],
+    "concurrency_queries_per_level": 24,
+    "ingest_rows": 300000,
+    "object_store": "in-memory object store (no network latency; staging is a memory copy)",
+    "query_limits": {
+      "Timeout": 300000000000,
+      "MaxRows": 10000,
+      "MaxResultBytes": 268435456,
+      "MaxRowBytes": 1048576,
+      "MaxScanBytes": 4294967296,
+      "Threads": 4,
+      "MemoryLimit": "2GiB"
+    },
+    "limits_note": "max rows/result bytes are the product defaults."
+  },
+  "dataset": {
+    "scale": 0.1,
+    "tables": [
+      {
+        "name": "customer",
+        "prefix": "bench/customer",
+        "rows": 15000,
+        "files": 1,
+        "bytes": 555493,
+        "hive_partitioned": false
+      },
+      {
+        "name": "orders",
+        "prefix": "bench/orders",
+        "rows": 150000,
+        "files": 1,
+        "bytes": 7560254,
+        "hive_partitioned": false
+      },
+      {
+        "name": "lineitem",
+        "prefix": "bench/lineitem",
+        "rows": 600277,
+        "files": 3,
+        "bytes": 52828240,
+        "hive_partitioned": false
+      },
+      {
+        "name": "lineitem_part",
+        "prefix": "bench/lineitem_part",
+        "rows": 600277,
+        "files": 21,
+        "bytes": 48046142,
+        "hive_partitioned": true
+      }
+    ]
+  },
+  "queries": [
+    {
+      "id": "q1-selective-filter",
+      "description": "selective filter + aggregate on lineitem (flat)",
+      "sql": "SELECT count(*) AS n, sum(l_extendedprice) AS rev FROM lineitem WHERE l_year = 1994 AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity \u003c 24",
+      "rows_returned": 1,
+      "truncated": false,
+      "bytes_staged": 52828240,
+      "result_bytes": 243,
+      "first_run_ms": 30.982458,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 22.850833,
+        "p50_ms": 28.912875,
+        "p95_ms": 96.464541,
+        "p99_ms": 96.464541,
+        "max_ms": 96.464541,
+        "mean_ms": 39.5826
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 10.351833,
+        "p50_ms": 15.806208,
+        "p95_ms": 82.957583,
+        "p99_ms": 82.957583,
+        "max_ms": 82.957583,
+        "mean_ms": 26.442336133333335
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 11.067,
+        "p50_ms": 11.750916,
+        "p95_ms": 12.445084,
+        "p99_ms": 12.445084,
+        "max_ms": 12.445084,
+        "mean_ms": 11.725183399999999
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.006125,
+        "p50_ms": 0.008291,
+        "p95_ms": 0.012708,
+        "p99_ms": 0.012708,
+        "max_ms": 0.012708,
+        "mean_ms": 0.008186
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q2-year-flat",
+      "description": "group by on one year of lineitem (flat layout)",
+      "sql": "SELECT l_returnflag, count(*) AS n FROM lineitem WHERE l_year = 1995 GROUP BY l_returnflag ORDER BY l_returnflag",
+      "rows_returned": 3,
+      "truncated": false,
+      "bytes_staged": 52828240,
+      "result_bytes": 273,
+      "first_run_ms": 46.333917,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 22.954042,
+        "p50_ms": 24.130958,
+        "p95_ms": 94.034625,
+        "p99_ms": 94.034625,
+        "max_ms": 94.034625,
+        "mean_ms": 35.3319194
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 10.283916,
+        "p50_ms": 11.49175,
+        "p95_ms": 51.96325,
+        "p99_ms": 51.96325,
+        "max_ms": 51.96325,
+        "mean_ms": 18.54961946666667
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 10.794291,
+        "p50_ms": 11.46975,
+        "p95_ms": 12.947167,
+        "p99_ms": 12.947167,
+        "max_ms": 12.947167,
+        "mean_ms": 11.5595888
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.006583,
+        "p50_ms": 0.008875,
+        "p95_ms": 0.011667,
+        "p99_ms": 0.011667,
+        "max_ms": 0.011667,
+        "mean_ms": 0.008736133333333335
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q2p-year-partitioned",
+      "description": "same as q2 on the hive-partitioned layout (partition pruning)",
+      "sql": "SELECT l_returnflag, count(*) AS n FROM lineitem_part WHERE l_year = 1995 GROUP BY l_returnflag ORDER BY l_returnflag",
+      "rows_returned": 3,
+      "truncated": false,
+      "bytes_staged": 48046142,
+      "result_bytes": 273,
+      "first_run_ms": 50.309375,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 22.04025,
+        "p50_ms": 24.035625,
+        "p95_ms": 35.287541,
+        "p99_ms": 35.287541,
+        "max_ms": 35.287541,
+        "mean_ms": 25.353769399999997
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 7.367125,
+        "p50_ms": 8.070584,
+        "p95_ms": 20.231042,
+        "p99_ms": 20.231042,
+        "max_ms": 20.231042,
+        "mean_ms": 9.882341733333332
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 12.300125,
+        "p50_ms": 13.066417,
+        "p95_ms": 14.518167,
+        "p99_ms": 14.518167,
+        "max_ms": 14.518167,
+        "mean_ms": 13.092247466666667
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.00575,
+        "p50_ms": 0.008083,
+        "p95_ms": 0.013708,
+        "p99_ms": 0.013708,
+        "max_ms": 0.013708,
+        "mean_ms": 0.008655266666666666
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q3-full-aggregate",
+      "description": "full-scan pricing summary grouped by flag and status",
+      "sql": "SELECT l_returnflag, l_linestatus, sum(l_quantity) AS qty, sum(l_extendedprice) AS price, avg(l_discount) AS disc, count(*) AS n FROM lineitem GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus",
+      "rows_returned": 6,
+      "truncated": false,
+      "bytes_staged": 52828240,
+      "result_bytes": 850,
+      "first_run_ms": 27.093625,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 27.163209,
+        "p50_ms": 28.754083,
+        "p95_ms": 58.795333,
+        "p99_ms": 58.795333,
+        "max_ms": 58.795333,
+        "mean_ms": 34.13792506666667
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 10.288042,
+        "p50_ms": 10.667,
+        "p95_ms": 41.243291,
+        "p99_ms": 41.243291,
+        "max_ms": 41.243291,
+        "mean_ms": 16.747025
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 15.420458,
+        "p50_ms": 15.781542,
+        "p95_ms": 16.479292,
+        "p99_ms": 16.479292,
+        "max_ms": 16.479292,
+        "mean_ms": 15.844197200000002
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.00925,
+        "p50_ms": 0.011917,
+        "p95_ms": 0.01625,
+        "p99_ms": 0.01625,
+        "max_ms": 0.01625,
+        "mean_ms": 0.012013866666666663
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q3p-full-partitioned",
+      "description": "same as q3 on the partitioned layout (no pruning possible)",
+      "sql": "SELECT l_returnflag, l_linestatus, sum(l_quantity) AS qty, sum(l_extendedprice) AS price, avg(l_discount) AS disc, count(*) AS n FROM lineitem_part GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus",
+      "rows_returned": 6,
+      "truncated": false,
+      "bytes_staged": 48046142,
+      "result_bytes": 850,
+      "first_run_ms": 27.881291,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 27.346958,
+        "p50_ms": 29.345792,
+        "p95_ms": 70.260875,
+        "p99_ms": 70.260875,
+        "max_ms": 70.260875,
+        "mean_ms": 36.98676106666666
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 7.631375,
+        "p50_ms": 9.587917,
+        "p95_ms": 50.371541,
+        "p99_ms": 50.371541,
+        "max_ms": 50.371541,
+        "mean_ms": 15.010474999999998
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 17.19025,
+        "p50_ms": 17.625375,
+        "p95_ms": 18.377666,
+        "p99_ms": 18.377666,
+        "max_ms": 18.377666,
+        "mean_ms": 17.6812084
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.009542,
+        "p50_ms": 0.013333,
+        "p95_ms": 0.01875,
+        "p99_ms": 0.01875,
+        "max_ms": 0.01875,
+        "mean_ms": 0.013372066666666665
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q4-join",
+      "description": "orders join customer, aggregate by segment",
+      "sql": "SELECT c.c_mktsegment AS seg, count(*) AS n, sum(o.o_totalprice) AS total FROM orders o JOIN customer c ON o.o_custkey = c.c_custkey GROUP BY c.c_mktsegment ORDER BY c.c_mktsegment",
+      "rows_returned": 5,
+      "truncated": false,
+      "bytes_staged": 8115747,
+      "result_bytes": 474,
+      "first_run_ms": 15.484958,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 14.464583,
+        "p50_ms": 15.362125,
+        "p95_ms": 17.076791,
+        "p99_ms": 17.076791,
+        "max_ms": 17.076791,
+        "mean_ms": 15.649499933333335
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 1.630583,
+        "p50_ms": 2.529542,
+        "p95_ms": 3.798083,
+        "p99_ms": 3.798083,
+        "max_ms": 3.798083,
+        "mean_ms": 2.6529444666666664
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 11.825875,
+        "p50_ms": 12.225292,
+        "p95_ms": 13.112875,
+        "p99_ms": 13.112875,
+        "max_ms": 13.112875,
+        "mean_ms": 12.261777799999999
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.006125,
+        "p50_ms": 0.006959,
+        "p95_ms": 0.0135,
+        "p99_ms": 0.0135,
+        "max_ms": 0.0135,
+        "mean_ms": 0.008294666666666665
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q5-three-way-join",
+      "description": "lineitem join orders join customer, revenue by segment for one year",
+      "sql": "SELECT c.c_mktsegment AS seg, sum(l.l_extendedprice * (1 - l.l_discount)) AS revenue, count(*) AS n FROM lineitem l JOIN orders o ON l.l_orderkey = o.o_orderkey JOIN customer c ON o.o_custkey = c.c_custkey WHERE l.l_year = 1996 GROUP BY c.c_mktsegment ORDER BY c.c_mktsegment",
+      "rows_returned": 5,
+      "truncated": false,
+      "bytes_staged": 60943987,
+      "result_bytes": 478,
+      "first_run_ms": 78.879,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 30.857834,
+        "p50_ms": 31.886084,
+        "p95_ms": 69.932417,
+        "p99_ms": 69.932417,
+        "max_ms": 69.932417,
+        "mean_ms": 37.2774056
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 12.010125,
+        "p50_ms": 12.995292,
+        "p95_ms": 51.214167,
+        "p99_ms": 51.214167,
+        "max_ms": 51.214167,
+        "mean_ms": 18.1343028
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 16.909542,
+        "p50_ms": 17.424125,
+        "p95_ms": 18.084083,
+        "p99_ms": 18.084083,
+        "max_ms": 18.084083,
+        "mean_ms": 17.4336084
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.00725,
+        "p50_ms": 0.010708,
+        "p95_ms": 0.014291,
+        "p99_ms": 0.014291,
+        "max_ms": 0.014291,
+        "mean_ms": 0.010666466666666667
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q6-point-lookup",
+      "description": "single-order lookup (no index: a scan)",
+      "sql": "SELECT o_orderkey, o_custkey, o_totalprice FROM orders WHERE o_orderkey = 17",
+      "rows_returned": 1,
+      "truncated": false,
+      "bytes_staged": 7560254,
+      "result_bytes": 386,
+      "first_run_ms": 11.331333,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 10.933084,
+        "p50_ms": 12.147541,
+        "p95_ms": 38.969958,
+        "p99_ms": 38.969958,
+        "max_ms": 38.969958,
+        "mean_ms": 15.133816666666666
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 1.422125,
+        "p50_ms": 1.789417,
+        "p95_ms": 15.081167,
+        "p99_ms": 15.081167,
+        "max_ms": 15.081167,
+        "mean_ms": 2.738516666666667
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 8.936209,
+        "p50_ms": 9.575833,
+        "p95_ms": 13.764833,
+        "p99_ms": 13.764833,
+        "max_ms": 13.764833,
+        "mean_ms": 9.942158266666665
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.006,
+        "p50_ms": 0.007375,
+        "p95_ms": 0.013291,
+        "p99_ms": 0.013291,
+        "max_ms": 0.013291,
+        "mean_ms": 0.008461133333333334
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q7-large-result",
+      "description": "unfiltered projection, result truncated at the row limit",
+      "sql": "SELECT l_orderkey, l_extendedprice, l_shipdate FROM lineitem",
+      "rows_returned": 10000,
+      "truncated": true,
+      "bytes_staged": 52828240,
+      "result_bytes": 300429,
+      "first_run_ms": 27.93375,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 27.107541,
+        "p50_ms": 29.431791,
+        "p95_ms": 46.809667,
+        "p99_ms": 46.809667,
+        "max_ms": 46.809667,
+        "mean_ms": 31.308280466666663
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 10.416792,
+        "p50_ms": 11.478458,
+        "p95_ms": 30.40875,
+        "p99_ms": 30.40875,
+        "max_ms": 30.40875,
+        "mean_ms": 13.181969333333335
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 14.343417,
+        "p50_ms": 15.053083,
+        "p95_ms": 25.495667,
+        "p99_ms": 25.495667,
+        "max_ms": 25.495667,
+        "mean_ms": 16.0625832
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.398708,
+        "p50_ms": 0.42675,
+        "p95_ms": 0.56075,
+        "p99_ms": 0.56075,
+        "max_ms": 0.56075,
+        "mean_ms": 0.4504528666666667
+      },
+      "result_verified": true
+    }
+  ],
+  "concurrency": [
+    {
+      "workers": 1,
+      "queries": 24,
+      "wall_seconds": 0.661627833,
+      "queries_per_second": 36.274169257930836,
+      "latency_submit_to_done": {
+        "n": 24,
+        "min_ms": 30.677,
+        "p50_ms": 366.817,
+        "p95_ms": 638.084,
+        "p99_ms": 661.591,
+        "max_ms": 661.591,
+        "mean_ms": 371.95266666666674
+      },
+      "failed": 0
+    },
+    {
+      "workers": 2,
+      "queries": 24,
+      "wall_seconds": 0.526900583,
+      "queries_per_second": 45.5493897223492,
+      "latency_submit_to_done": {
+        "n": 24,
+        "min_ms": 45.208,
+        "p50_ms": 366.248,
+        "p95_ms": 514.473,
+        "p99_ms": 526.559,
+        "max_ms": 526.559,
+        "mean_ms": 319.9374166666667
+      },
+      "failed": 0
+    },
+    {
+      "workers": 4,
+      "queries": 24,
+      "wall_seconds": 0.615653084,
+      "queries_per_second": 38.98299322090296,
+      "latency_submit_to_done": {
+        "n": 24,
+        "min_ms": 92.36,
+        "p50_ms": 521.237,
+        "p95_ms": 606.27,
+        "p99_ms": 614.527,
+        "max_ms": 614.527,
+        "mean_ms": 418.0604583333334
+      },
+      "failed": 0
+    }
+  ],
+  "ingestion": [
+    {
+      "rows": 300000,
+      "input_bytes": 17424667,
+      "output_parquet_bytes": 26403762,
+      "output_files": 3,
+      "seconds": 0.372062875,
+      "rows_per_second": 806315.3304397812,
+      "input_mib_per_second": 44.66303548783668
+    },
+    {
+      "rows": 300000,
+      "input_bytes": 17424667,
+      "output_parquet_bytes": 26404919,
+      "output_files": 4,
+      "seconds": 0.430659917,
+      "rows_per_second": 696605.3448619413,
+      "input_mib_per_second": 38.58603211924072,
+      "partition_column": "l_returnflag"
+    }
+  ],
+  "partitioning": [
+    {
+      "pair": "filter on partition column (l_year = 1995)",
+      "flat_p50_ms": 24.130958,
+      "partitioned_p50_ms": 24.035625,
+      "flat_execute_p50_ms": 11.46975,
+      "partitioned_execute_p50_ms": 13.066417,
+      "flat_bytes_staged": 52828240,
+      "partitioned_bytes_staged": 48046142,
+      "verdict": "no measurable end-to-end difference (under 10% or 5 ms); INCONCLUSIVE: high variance (p95 \u003e 2x p50)",
+      "execute_only_verdict": "no measurable execute-time difference"
+    },
+    {
+      "pair": "full scan, no pruning possible (control)",
+      "flat_p50_ms": 28.754083,
+      "partitioned_p50_ms": 29.345792,
+      "flat_execute_p50_ms": 15.781542,
+      "partitioned_execute_p50_ms": 17.625375,
+      "flat_bytes_staged": 52828240,
+      "partitioned_bytes_staged": 48046142,
+      "verdict": "no measurable end-to-end difference (under 10% or 5 ms); INCONCLUSIVE: high variance (p95 \u003e 2x p50)",
+      "execute_only_verdict": "no measurable execute-time difference"
+    }
+  ],
+  "optimizations": [
+    {
+      "id": "o1-partition-column",
+      "description": "filter on the hive partition column (l_year = 1995), partitioned layout",
+      "sql": "SELECT l_returnflag, count(*) AS n FROM lineitem_part WHERE l_year = 1995 GROUP BY l_returnflag ORDER BY l_returnflag",
+      "rows_returned": 3,
+      "answers_identical_across_variants": true,
+      "variants": [
+        {
+          "name": "baseline (no pruning, no cache)",
+          "file_pruning": false,
+          "stage_cache_bytes": 0,
+          "first_run_ms": 22.479334,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 22.388208,
+            "p50_ms": 44.585083,
+            "p95_ms": 117.7905,
+            "p99_ms": 117.7905,
+            "max_ms": 117.7905,
+            "mean_ms": 49.64841659999999
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 7.408209,
+            "p50_ms": 7.934334,
+            "p95_ms": 40.726208,
+            "p99_ms": 40.726208,
+            "max_ms": 40.726208,
+            "mean_ms": 14.059911066666666
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 12.491625,
+            "p50_ms": 18.004875,
+            "p95_ms": 107.736541,
+            "p99_ms": 107.736541,
+            "max_ms": 107.736541,
+            "mean_ms": 31.28476386666667
+          },
+          "bytes_staged": 48046142,
+          "files_listed": 21,
+          "files_staged": 21,
+          "files_pruned": 0,
+          "cache_hits_per_run": 0,
+          "pruning_had_work": false
+        },
+        {
+          "name": "file pruning",
+          "file_pruning": true,
+          "stage_cache_bytes": 0,
+          "first_run_ms": 12.423459,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 11.617834,
+            "p50_ms": 12.060584,
+            "p95_ms": 24.0145,
+            "p99_ms": 24.0145,
+            "max_ms": 24.0145,
+            "mean_ms": 13.615091733333337
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 1.076791,
+            "p50_ms": 1.246084,
+            "p95_ms": 13.47075,
+            "p99_ms": 13.47075,
+            "max_ms": 13.47075,
+            "mean_ms": 2.7005526666666664
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 9.813333,
+            "p50_ms": 9.942583,
+            "p95_ms": 12.407459,
+            "p99_ms": 12.407459,
+            "max_ms": 12.407459,
+            "mean_ms": 10.200741733333333
+          },
+          "bytes_staged": 6850866,
+          "files_listed": 21,
+          "files_staged": 3,
+          "files_pruned": 18,
+          "cache_hits_per_run": 0,
+          "pruning_had_work": true
+        },
+        {
+          "name": "file pruning + stage cache",
+          "file_pruning": true,
+          "stage_cache_bytes": 2147483648,
+          "first_run_ms": 12.720084,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 10.851875,
+            "p50_ms": 11.224084,
+            "p95_ms": 13.293,
+            "p99_ms": 13.293,
+            "max_ms": 13.293,
+            "mean_ms": 11.5269748
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 0.78525,
+            "p50_ms": 0.795625,
+            "p95_ms": 0.82875,
+            "p99_ms": 0.82875,
+            "max_ms": 0.82875,
+            "mean_ms": 0.8013666666666666
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 9.469583,
+            "p50_ms": 9.843625,
+            "p95_ms": 11.928291,
+            "p99_ms": 11.928291,
+            "max_ms": 11.928291,
+            "mean_ms": 10.120252599999997
+          },
+          "bytes_staged": 6850866,
+          "files_listed": 21,
+          "files_staged": 3,
+          "files_pruned": 18,
+          "cache_hits_per_run": 3,
+          "pruning_had_work": true
+        }
+      ],
+      "pruning_verdict": "file pruning: 73% faster end to end (p50 12 vs 45 ms); staged 3 of 21 files, 39.3 MiB less (86% of the baseline bytes); INCONCLUSIVE: high variance (p95 \u003e 2x p50)",
+      "cache_verdict": "stage cache (on top of pruning): no measurable end-to-end difference (under 10% or 5 ms; p50 12 vs 11 ms); 3 of 3 staged files served from the cache"
+    },
+    {
+      "id": "o2-clustered-range",
+      "description": "range on the column the flat files are clustered by (l_orderkey), flat layout",
+      "sql": "SELECT count(*) AS n, sum(l_extendedprice) AS rev FROM lineitem WHERE l_orderkey BETWEEN 1 AND 20000",
+      "rows_returned": 1,
+      "answers_identical_across_variants": true,
+      "variants": [
+        {
+          "name": "baseline (no pruning, no cache)",
+          "file_pruning": false,
+          "stage_cache_bytes": 0,
+          "first_run_ms": 59.552292,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 21.548708,
+            "p50_ms": 37.386166,
+            "p95_ms": 575.620125,
+            "p99_ms": 575.620125,
+            "max_ms": 575.620125,
+            "mean_ms": 82.1164362
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 10.140833,
+            "p50_ms": 20.879458,
+            "p95_ms": 536.753333,
+            "p99_ms": 536.753333,
+            "max_ms": 536.753333,
+            "mean_ms": 65.50396106666669
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 9.909,
+            "p50_ms": 14.608125,
+            "p95_ms": 35.827625,
+            "p99_ms": 35.827625,
+            "max_ms": 35.827625,
+            "mean_ms": 15.017160933333335
+          },
+          "bytes_staged": 52828240,
+          "files_listed": 3,
+          "files_staged": 3,
+          "files_pruned": 0,
+          "cache_hits_per_run": 0,
+          "pruning_had_work": false
+        },
+        {
+          "name": "file pruning",
+          "file_pruning": true,
+          "stage_cache_bytes": 0,
+          "first_run_ms": 24.589667,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 13.744625,
+            "p50_ms": 18.559,
+            "p95_ms": 103.906292,
+            "p99_ms": 103.906292,
+            "max_ms": 103.906292,
+            "mean_ms": 27.191369400000003
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 3.341333,
+            "p50_ms": 3.902375,
+            "p95_ms": 90.490291,
+            "p99_ms": 90.490291,
+            "max_ms": 90.490291,
+            "mean_ms": 14.170869400000003
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 9.649167,
+            "p50_ms": 11.583041,
+            "p95_ms": 16.066666,
+            "p99_ms": 16.066666,
+            "max_ms": 16.066666,
+            "mean_ms": 12.188849866666667
+          },
+          "bytes_staged": 17583248,
+          "files_listed": 3,
+          "files_staged": 1,
+          "files_pruned": 2,
+          "cache_hits_per_run": 0,
+          "pruning_had_work": true
+        },
+        {
+          "name": "file pruning + stage cache",
+          "file_pruning": true,
+          "stage_cache_bytes": 2147483648,
+          "first_run_ms": 31.792167,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 9.98475,
+            "p50_ms": 10.2815,
+            "p95_ms": 15.656375,
+            "p99_ms": 15.656375,
+            "max_ms": 15.656375,
+            "mean_ms": 11.002552600000001
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 0.293958,
+            "p50_ms": 0.30475,
+            "p95_ms": 0.334333,
+            "p99_ms": 0.334333,
+            "max_ms": 0.334333,
+            "mean_ms": 0.30922493333333334
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 9.189875,
+            "p50_ms": 9.469459,
+            "p95_ms": 14.613292,
+            "p99_ms": 14.613292,
+            "max_ms": 14.613292,
+            "mean_ms": 10.1509612
+          },
+          "bytes_staged": 17583248,
+          "files_listed": 3,
+          "files_staged": 1,
+          "files_pruned": 2,
+          "cache_hits_per_run": 1,
+          "pruning_had_work": true
+        }
+      ],
+      "pruning_verdict": "file pruning: 50% faster end to end (p50 19 vs 37 ms); staged 1 of 3 files, 33.6 MiB less (67% of the baseline bytes); INCONCLUSIVE: high variance (p95 \u003e 2x p50)",
+      "cache_verdict": "stage cache (on top of pruning): 45% faster end to end (p50 10 vs 19 ms); 1 of 1 staged files served from the cache"
+    },
+    {
+      "id": "o3-spread-column",
+      "description": "filter on a column present in every file (l_year), flat layout: cannot prune",
+      "sql": "SELECT l_returnflag, count(*) AS n FROM lineitem WHERE l_year = 1995 GROUP BY l_returnflag ORDER BY l_returnflag",
+      "rows_returned": 3,
+      "answers_identical_across_variants": true,
+      "variants": [
+        {
+          "name": "baseline (no pruning, no cache)",
+          "file_pruning": false,
+          "stage_cache_bytes": 0,
+          "first_run_ms": 60.193667,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 23.313083,
+            "p50_ms": 67.324208,
+            "p95_ms": 579.255584,
+            "p99_ms": 579.255584,
+            "max_ms": 579.255584,
+            "mean_ms": 191.47978320000004
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 10.359959,
+            "p50_ms": 36.678458,
+            "p95_ms": 548.875792,
+            "p99_ms": 548.875792,
+            "max_ms": 548.875792,
+            "mean_ms": 157.08569733333331
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 10.7905,
+            "p50_ms": 12.508958,
+            "p95_ms": 95.009958,
+            "p99_ms": 95.009958,
+            "max_ms": 95.009958,
+            "mean_ms": 24.4351832
+          },
+          "bytes_staged": 52828240,
+          "files_listed": 3,
+          "files_staged": 3,
+          "files_pruned": 0,
+          "cache_hits_per_run": 0,
+          "pruning_had_work": false
+        },
+        {
+          "name": "file pruning",
+          "file_pruning": true,
+          "stage_cache_bytes": 0,
+          "first_run_ms": 69.352208,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 22.587375,
+            "p50_ms": 72.615209,
+            "p95_ms": 751.223584,
+            "p99_ms": 751.223584,
+            "max_ms": 751.223584,
+            "mean_ms": 148.6840140666667
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 10.159916,
+            "p50_ms": 55.294792,
+            "p95_ms": 606.039084,
+            "p99_ms": 606.039084,
+            "max_ms": 606.039084,
+            "mean_ms": 119.27376660000002
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 10.95,
+            "p50_ms": 13.9825,
+            "p95_ms": 143.26,
+            "p99_ms": 143.26,
+            "max_ms": 143.26,
+            "mean_ms": 27.82878593333333
+          },
+          "bytes_staged": 52828240,
+          "files_listed": 3,
+          "files_staged": 3,
+          "files_pruned": 0,
+          "cache_hits_per_run": 0,
+          "pruning_had_work": true
+        },
+        {
+          "name": "file pruning + stage cache",
+          "file_pruning": true,
+          "stage_cache_bytes": 2147483648,
+          "first_run_ms": 90.769375,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 12.152417,
+            "p50_ms": 12.631917,
+            "p95_ms": 34.131291,
+            "p99_ms": 34.131291,
+            "max_ms": 34.131291,
+            "mean_ms": 14.5558668
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 0.681417,
+            "p50_ms": 0.734417,
+            "p95_ms": 0.856375,
+            "p99_ms": 0.856375,
+            "max_ms": 0.856375,
+            "mean_ms": 0.7372778666666667
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 10.819709,
+            "p50_ms": 11.248416,
+            "p95_ms": 14.715166,
+            "p99_ms": 14.715166,
+            "max_ms": 14.715166,
+            "mean_ms": 11.848858466666668
+          },
+          "bytes_staged": 52828240,
+          "files_listed": 3,
+          "files_staged": 3,
+          "files_pruned": 0,
+          "cache_hits_per_run": 3,
+          "pruning_had_work": true
+        }
+      ],
+      "pruning_verdict": "file pruning: no measurable end-to-end difference (under 10% or 5 ms; p50 67 vs 73 ms); footers were checked but no files could be ruled out, so none were skipped; INCONCLUSIVE: high variance (p95 \u003e 2x p50)",
+      "cache_verdict": "stage cache (on top of pruning): 83% faster end to end (p50 13 vs 73 ms); 3 of 3 staged files served from the cache"
+    },
+    {
+      "id": "o4-point-lookup",
+      "description": "single-order lookup on the clustered key, orders table",
+      "sql": "SELECT o_orderkey, o_custkey, o_totalprice FROM orders WHERE o_orderkey = 17",
+      "rows_returned": 1,
+      "answers_identical_across_variants": true,
+      "variants": [
+        {
+          "name": "baseline (no pruning, no cache)",
+          "file_pruning": false,
+          "stage_cache_bytes": 0,
+          "first_run_ms": 13.477208,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 11.818875,
+            "p50_ms": 13.261209,
+            "p95_ms": 16.203166,
+            "p99_ms": 16.203166,
+            "max_ms": 16.203166,
+            "mean_ms": 13.6392974
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 1.457291,
+            "p50_ms": 1.568875,
+            "p95_ms": 4.662,
+            "p99_ms": 4.662,
+            "max_ms": 4.662,
+            "mean_ms": 1.9833332666666668
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 9.530417,
+            "p50_ms": 10.532791,
+            "p95_ms": 13.125666,
+            "p99_ms": 13.125666,
+            "max_ms": 13.125666,
+            "mean_ms": 10.966136133333332
+          },
+          "bytes_staged": 7560254,
+          "files_listed": 1,
+          "files_staged": 1,
+          "files_pruned": 0,
+          "cache_hits_per_run": 0,
+          "pruning_had_work": false
+        },
+        {
+          "name": "file pruning",
+          "file_pruning": true,
+          "stage_cache_bytes": 0,
+          "first_run_ms": 12.448541,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 11.423209,
+            "p50_ms": 12.744458,
+            "p95_ms": 166.428,
+            "p99_ms": 166.428,
+            "max_ms": 166.428,
+            "mean_ms": 26.437639066666666
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 1.449625,
+            "p50_ms": 1.601459,
+            "p95_ms": 154.504458,
+            "p99_ms": 154.504458,
+            "max_ms": 154.504458,
+            "mean_ms": 12.204461066666669
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 9.345833,
+            "p50_ms": 10.463792,
+            "p95_ms": 48.066833,
+            "p99_ms": 48.066833,
+            "max_ms": 48.066833,
+            "mean_ms": 13.463586133333331
+          },
+          "bytes_staged": 7560254,
+          "files_listed": 1,
+          "files_staged": 1,
+          "files_pruned": 0,
+          "cache_hits_per_run": 0,
+          "pruning_had_work": false
+        },
+        {
+          "name": "file pruning + stage cache",
+          "file_pruning": true,
+          "stage_cache_bytes": 2147483648,
+          "first_run_ms": 12.837959,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 9.681208,
+            "p50_ms": 11.264625,
+            "p95_ms": 27.268959,
+            "p99_ms": 27.268959,
+            "max_ms": 27.268959,
+            "mean_ms": 12.875233399999997
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 0.273417,
+            "p50_ms": 0.289209,
+            "p95_ms": 0.325042,
+            "p99_ms": 0.325042,
+            "max_ms": 0.325042,
+            "mean_ms": 0.28824726666666667
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 8.877917,
+            "p50_ms": 10.403875,
+            "p95_ms": 21.146458,
+            "p99_ms": 21.146458,
+            "max_ms": 21.146458,
+            "mean_ms": 10.9873222
+          },
+          "bytes_staged": 7560254,
+          "files_listed": 1,
+          "files_staged": 1,
+          "files_pruned": 0,
+          "cache_hits_per_run": 1,
+          "pruning_had_work": false
+        }
+      ],
+      "pruning_verdict": "pruning had nothing to decide here (no usable filter, or a single file), so baseline and pruning variants ran identical work; the p50 gap (13 vs 13 ms) is measurement noise; INCONCLUSIVE: high variance (p95 \u003e 2x p50)",
+      "cache_verdict": "stage cache (on top of pruning): no measurable end-to-end difference (under 10% or 5 ms; p50 13 vs 11 ms); 1 of 1 staged files served from the cache"
+    },
+    {
+      "id": "o5-full-scan",
+      "description": "unfiltered aggregate: nothing to prune; shows the cache alone",
+      "sql": "SELECT l_returnflag, l_linestatus, count(*) AS n, sum(l_quantity) AS qty FROM lineitem GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus",
+      "rows_returned": 6,
+      "answers_identical_across_variants": true,
+      "variants": [
+        {
+          "name": "baseline (no pruning, no cache)",
+          "file_pruning": false,
+          "stage_cache_bytes": 0,
+          "first_run_ms": 30.677209,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 40.234875,
+            "p50_ms": 90.162916,
+            "p95_ms": 249.996708,
+            "p99_ms": 249.996708,
+            "max_ms": 249.996708,
+            "mean_ms": 104.91033326666668
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 15.022042,
+            "p50_ms": 64.904083,
+            "p95_ms": 221.804375,
+            "p99_ms": 221.804375,
+            "max_ms": 221.804375,
+            "mean_ms": 76.57582226666666
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 16.573166,
+            "p50_ms": 23.944167,
+            "p95_ms": 78.275083,
+            "p99_ms": 78.275083,
+            "max_ms": 78.275083,
+            "mean_ms": 26.329472
+          },
+          "bytes_staged": 52828240,
+          "files_listed": 3,
+          "files_staged": 3,
+          "files_pruned": 0,
+          "cache_hits_per_run": 0,
+          "pruning_had_work": false
+        },
+        {
+          "name": "file pruning",
+          "file_pruning": true,
+          "stage_cache_bytes": 0,
+          "first_run_ms": 36.367708,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 31.009625,
+            "p50_ms": 106.921041,
+            "p95_ms": 494.317083,
+            "p99_ms": 494.317083,
+            "max_ms": 494.317083,
+            "mean_ms": 146.0654944
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 13.834667,
+            "p50_ms": 79.257667,
+            "p95_ms": 161.666042,
+            "p99_ms": 161.666042,
+            "max_ms": 161.666042,
+            "mean_ms": 79.4929694
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 15.504708,
+            "p50_ms": 25.17625,
+            "p95_ms": 130.074042,
+            "p99_ms": 130.074042,
+            "max_ms": 130.074042,
+            "mean_ms": 33.8630888
+          },
+          "bytes_staged": 52828240,
+          "files_listed": 3,
+          "files_staged": 3,
+          "files_pruned": 0,
+          "cache_hits_per_run": 0,
+          "pruning_had_work": false
+        },
+        {
+          "name": "file pruning + stage cache",
+          "file_pruning": true,
+          "stage_cache_bytes": 2147483648,
+          "first_run_ms": 28.407416,
+          "warm_total": {
+            "n": 15,
+            "min_ms": 16.55375,
+            "p50_ms": 18.493167,
+            "p95_ms": 98.978833,
+            "p99_ms": 98.978833,
+            "max_ms": 98.978833,
+            "mean_ms": 28.5926582
+          },
+          "warm_stage": {
+            "n": 15,
+            "min_ms": 0.689416,
+            "p50_ms": 0.725791,
+            "p95_ms": 0.752666,
+            "p99_ms": 0.752666,
+            "max_ms": 0.752666,
+            "mean_ms": 0.7232889333333333
+          },
+          "warm_execute": {
+            "n": 15,
+            "min_ms": 15.201417,
+            "p50_ms": 17.100209,
+            "p95_ms": 97.575083,
+            "p99_ms": 97.575083,
+            "max_ms": 97.575083,
+            "mean_ms": 27.132422333333338
+          },
+          "bytes_staged": 52828240,
+          "files_listed": 3,
+          "files_staged": 3,
+          "files_pruned": 0,
+          "cache_hits_per_run": 3,
+          "pruning_had_work": false
+        }
+      ],
+      "pruning_verdict": "pruning had nothing to decide here (no usable filter, or a single file), so baseline and pruning variants ran identical work; the p50 gap (90 vs 107 ms) is measurement noise; INCONCLUSIVE: high variance (p95 \u003e 2x p50)",
+      "cache_verdict": "stage cache (on top of pruning): 83% faster end to end (p50 18 vs 107 ms); 3 of 3 staged files served from the cache"
+    }
+  ],
+  "limitations": [
+    "Workload is TPC-H-LIKE (seeded, same table shapes and cardinality ratios), not TPC-H: it was not produced by dbgen and must not be reported as TPC-H.",
+    "Single machine, single process; the API, worker and benchmark share one CPU and one memory pool.",
+    "The object store is in memory unless -s3 is used, so staging cost excludes network latency and S3 throughput.",
+    "The main latency, concurrency and layout sections use the baseline runner: every query stages (downloads) all files of every dataset it references, with no file pruning and no cache, so 'warm' means a warm OS page cache and warmed code paths, not a data cache. Pruning and the stage cache are measured only in the optimisation section, against that baseline.",
+    "The OS page cache was not dropped, so 'first' is first-after-generation, not a guaranteed cold read.",
+    "'Bytes scanned' is not available from the engine; 'bytes staged' is the bytes downloaded for the query and is an upper bound on what DuckDB read.",
+    "Percentiles come from few samples; p95/p99 are at or near the maximum. Median differences under 10% or 5 ms are not reported as differences.",
+    "Dates are ISO strings and money is double because of the in-repo Parquet writer's type support."
+  ]
+}

@@ -7,6 +7,11 @@ import type {
   IngestionListResponse,
   InspectResponse,
   PreviewResponse,
+  QueryJob,
+  QueryListResponse,
+  QueryResults,
+  StatsWindow,
+  Summary,
   ReadyResponse,
   SchemaResponse,
   ServiceInfo,
@@ -27,10 +32,22 @@ export class ApiError extends Error {
 
 const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? ''
 
+/**
+ * Every state-changing request carries this header. A cross-site page cannot
+ * add it without a CORS preflight, which the API refuses for foreign origins.
+ */
+export const CSRF_HEADER = 'X-Lakehouse-CSRF'
+
+function withCsrf(init?: RequestInit): RequestInit | undefined {
+  const method = (init?.method ?? 'GET').toUpperCase()
+  if (method === 'GET' || method === 'HEAD') return init
+  return { ...init, headers: { ...init?.headers, [CSRF_HEADER]: '1' } }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response
   try {
-    res = await fetch(`${BASE_URL}${path}`, init)
+    res = await fetch(`${BASE_URL}${path}`, withCsrf(init))
   } catch (err) {
     throw new ApiError(0, 'network', `request failed: ${String(err)}`)
   }
@@ -96,7 +113,23 @@ function listDatasetsQuery(opts: ListDatasetsOptions): string {
 export const api = {
   serviceInfo: () => request<ServiceInfo>('/api/v1/info'),
   health: () => request<HealthResponse>('/healthz'),
-  ready: () => request<ReadyResponse>('/readyz'),
+  /** /readyz answers 503 *with* per-dependency detail; keep that body. */
+  ready: async (): Promise<ReadyResponse> => {
+    let res: Response
+    try {
+      res = await fetch(`${BASE_URL}/readyz`)
+    } catch (err) {
+      throw new ApiError(0, 'network', `request failed: ${String(err)}`)
+    }
+    let body: ReadyResponse | undefined
+    try {
+      body = (await res.json()) as ReadyResponse
+    } catch {
+      // fall through to the error below
+    }
+    if (body && body.dependencies) return body
+    throw new ApiError(res.status, 'unavailable', res.statusText || 'not ready')
+  },
 
   listDatasets: (opts: ListDatasetsOptions = {}) =>
     request<DatasetListResponse>(`/api/v1/datasets${listDatasetsQuery(opts)}`),
@@ -145,4 +178,40 @@ export const api = {
       `/api/v1/ingestions/${encodeURIComponent(id)}/retry`,
       { method: 'POST' },
     ),
+
+  submitQuery: (statement: string) =>
+    request<QueryJob>('/api/v1/queries', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ statement }),
+    }),
+
+  /** waitMs asks the server to hold the request until the query reaches a final
+   * state (or the wait elapses), so a fast query is seen the moment it ends. */
+  getQuery: (id: string, waitMs?: number) =>
+    request<QueryJob>(
+      `/api/v1/queries/${encodeURIComponent(id)}${waitMs ? `?waitMs=${waitMs}` : ''}`,
+    ),
+
+  listQueries: (limit = 25, offset = 0) =>
+    request<QueryListResponse>(
+      `/api/v1/queries?limit=${limit}&offset=${offset}`,
+    ),
+
+  cancelQuery: (id: string) =>
+    request<QueryJob>(`/api/v1/queries/${encodeURIComponent(id)}/cancel`, {
+      method: 'POST',
+    }),
+
+  getQueryResults: (id: string, offset = 0, limit = 100) =>
+    request<QueryResults>(
+      `/api/v1/queries/${encodeURIComponent(id)}/results?offset=${offset}&limit=${limit}`,
+    ),
+
+  /** Relative URL of the CSV download; the browser follows it directly. */
+  queryExportUrl: (id: string) =>
+    `${BASE_URL}/api/v1/queries/${encodeURIComponent(id)}/export`,
+
+  getStats: (window: StatsWindow = '24h') =>
+    request<Summary>(`/api/v1/stats?window=${window}`),
 }
