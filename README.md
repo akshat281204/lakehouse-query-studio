@@ -13,12 +13,70 @@ background jobs executed by **single-node DuckDB**.
 <p align="center">
   <img src="docs/images/overview-light.png" alt="Overview dashboard" width="98%">
 </p>
+
+## Tour
+
+Every screenshot below is the real dashboard running against a live API,
+worker, PostgreSQL and S3-compatible store (the numbers on screen come from
+the stack's own query history, not mock data).
+
+**1. Overview.** A plain-language summary of the last window (queries, success
+rate, median and p95), then activity, latency distribution, outcomes and
+failure causes, all computed from durable job records.
+
+**2. Datasets.** Register a Parquet prefix or upload a file; each dataset shows
+its version, row count and status.
+
 <p align="center">
-  <img src="docs/images/themes.png" alt="The six built-in themes" width="98%">
+  <img src="docs/images/datasets.png" alt="Dataset list" width="98%">
 </p>
+
+**3. Dataset detail and profile.** Schema, per-column min, max and null counts
+read from Parquet footers (no data scanned), and a preview of the first rows.
+
+<p align="center">
+  <img src="docs/images/dataset-profile.png" alt="Dataset detail with column profile" width="98%">
+</p>
+
+**4. SQL workbench.** One read-only statement, run as a durable job. Results
+come with column types, row numbers, run time and bytes read; the Chart tab
+plots the rows on the page; results export to CSV.
+
 <p align="center">
   <img src="docs/images/workbench-results.png" alt="SQL workbench with results" width="49%">
   <img src="docs/images/workbench-chart.png" alt="SQL workbench chart" width="49%">
+</p>
+
+**5. Saved queries.** Name and keep statements; unsafe SQL is refused at save
+time.
+
+<p align="center">
+  <img src="docs/images/workbench-saved-queries.png" alt="Saved queries in the workbench" width="98%">
+</p>
+
+**6. History.** Every query is recorded; rerun or copy any of them.
+
+<p align="center">
+  <img src="docs/images/history.png" alt="Query history" width="98%">
+</p>
+
+**7. Upload and append.** Upload CSV, JSON, JSONL or Parquet as a new dataset
+or add to an existing one. The file is checked against the dataset's schema
+*before* anything is uploaded.
+
+<p align="center">
+  <img src="docs/images/upload.png" alt="Upload page" width="49%">
+  <img src="docs/images/upload-append-check.png" alt="Append compatibility check" width="49%">
+</p>
+
+**8. Command palette and themes.** Cmd/Ctrl+K jumps to a page, dataset or saved
+query, or switches theme. Six built-in themes.
+
+<p align="center">
+  <img src="docs/images/palette.png" alt="Command palette" width="98%">
+</p>
+<p align="center">
+  <img src="docs/images/themes.png" alt="The six built-in themes" width="98%">
 </p>
 
 ## Quick start
