@@ -50,6 +50,14 @@ PostgreSQL. In this phase registration is a **reference** to existing data
 - `GET /api/v1/datasets/{id}` — dataset detail plus latest version and schema.
 - `GET /api/v1/datasets/{id}/schema` — schema columns.
 - `GET /api/v1/datasets/{id}/preview?limit=` — bounded sample rows.
+- `GET /api/v1/datasets/{id}/profile` — row count and, per column, min / max / null count, read from
+  the Parquet **footers only** (no row data is read). A range is reported only when **every** file
+  supplies it (`MergeStats`): if any footer cannot be read, or a file carries no statistics for a
+  column, that column (or the whole response, for an unreadable footer) reports no range rather
+  than a partial one. At most 200 files are read; a larger dataset is reported by schema only.
+  Files written before phase 9 carry no statistics; uploading the data again adds them. Strings
+  are clipped to 80 characters for display (`truncated`), and 64-bit extremes are returned as
+  exact text.
 
 All non-2xx responses use the `docs/design.md` §11 error envelope.
 

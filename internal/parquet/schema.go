@@ -115,6 +115,18 @@ type columnMetaData struct {
 	dataPageOffset       int64
 	dictionaryPageOffset int64
 	hasDictionaryPage    bool
+	path                 []string
+	stats                chunkStats
+}
+
+// chunkStats are the Statistics of one column chunk. Only the modern
+// min_value/max_value fields (5 and 6) are trusted: the deprecated min/max
+// used a signed byte order for strings and are ignored.
+type chunkStats struct {
+	nullCount    int64
+	hasNullCount bool
+	min, max     []byte
+	hasMinMax    bool
 }
 
 type columnChunk struct {
@@ -455,6 +467,31 @@ func (r *compactReader) readColumnMetaData(typ byte) (columnMetaData, error) {
 			if m.codec, err = r.readI32(); err != nil {
 				return m, err
 			}
+		case 3: // path_in_schema (list<string>)
+			if typ != tList {
+				return m, unexpectedType("path_in_schema", typ)
+			}
+			n, elem, err := r.readListHeader()
+			if err != nil {
+				return m, err
+			}
+			if elem != tBinary {
+				return m, unexpectedType("path element", elem)
+			}
+			for i := 0; i < n; i++ {
+				seg, err := r.readString()
+				if err != nil {
+					return m, err
+				}
+				m.path = append(m.path, seg)
+			}
+		case 12: // statistics
+			if typ != tStruct {
+				return m, unexpectedType("statistics", typ)
+			}
+			if m.stats, err = r.readStatistics(); err != nil {
+				return m, err
+			}
 		case 9: // data_page_offset (i64)
 			if typ != tI64 {
 				return m, unexpectedType("data_page_offset", typ)
@@ -643,4 +680,44 @@ func typeString(e schemaElement) string {
 			return "binary"
 		}
 	}
+}
+
+func (r *compactReader) readStatistics() (chunkStats, error) {
+	savedID := r.lastID
+	r.lastID = 0
+	defer func() { r.lastID = savedID }()
+	var st chunkStats
+	var hasMin, hasMax bool
+	for {
+		id, typ, err := r.readFieldHeader()
+		if err != nil {
+			return st, err
+		}
+		if typ == tStop {
+			break
+		}
+		switch {
+		case id == 3 && typ == tI64:
+			if st.nullCount, err = r.readI64(); err != nil {
+				return st, err
+			}
+			st.hasNullCount = true
+		case id == 5 && typ == tBinary:
+			if st.max, err = r.readBinary(); err != nil {
+				return st, err
+			}
+			hasMax = true
+		case id == 6 && typ == tBinary:
+			if st.min, err = r.readBinary(); err != nil {
+				return st, err
+			}
+			hasMin = true
+		default:
+			if err := r.skip(typ); err != nil {
+				return st, err
+			}
+		}
+	}
+	st.hasMinMax = hasMin && hasMax
+	return st, nil
 }

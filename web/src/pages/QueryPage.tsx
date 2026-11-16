@@ -1,0 +1,279 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { api, ApiError } from '../api/client'
+import type { QueryJob, SavedQuery } from '../api/types'
+import { ResultsPanel } from '../components/ResultsPanel'
+import { SavedQueries } from '../components/SavedQueries'
+import { SaveQueryForm } from '../components/SaveQueryForm'
+import { SchemaBrowser } from '../components/SchemaBrowser'
+import { SqlEditor } from '../components/SqlEditor'
+import { formatDuration, isTerminal } from '../lib/format'
+
+const DEFAULT_SQL = 'SELECT 1 AS one'
+const LONG_POLL_MS = 2000
+
+interface QueryPageProps {
+  initialStatement?: string
+  autoRun?: boolean
+  pollMs?: number
+}
+
+export function QueryPage({
+  initialStatement,
+  autoRun,
+  pollMs = 500,
+}: QueryPageProps) {
+  const [sql, setSql] = useState(initialStatement ?? DEFAULT_SQL)
+  const [job, setJob] = useState<QueryJob | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [elapsed, setElapsed] = useState(0)
+  const [saved, setSaved] = useState<SavedQuery[] | null>(null)
+  const [savedError, setSavedError] = useState<string | null>(null)
+  const [activeSaved, setActiveSaved] = useState<SavedQuery | undefined>()
+  const [showSave, setShowSave] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const runId = useRef(0)
+  const alive = useRef(true)
+
+  // Bumping the counter makes any in-flight polling loop stop on its next turn.
+  const invalidateRuns = () => {
+    runId.current++
+  }
+
+  useEffect(() => {
+    alive.current = true
+    return () => {
+      alive.current = false
+      invalidateRuns()
+    }
+  }, [])
+
+  const run = useCallback(
+    async (statement: string) => {
+      const mine = ++runId.current
+      setError(null)
+      setJob(null)
+      setSubmitting(true)
+      const started = Date.now()
+      setElapsed(0)
+      try {
+        let current = await api.submitQuery(statement)
+        if (mine !== runId.current) return
+        setJob(current)
+        // Ask the server to hold each status request until the query ends, so
+        // a fast query is seen the moment it finishes. A server that answers at
+        // once (an older one) falls back to polling: quickly at first, backing
+        // off to pollMs, so a long query stays cheap.
+        let wait = Math.min(pollMs, 25)
+        while (!isTerminal(current.status)) {
+          const asked = Date.now()
+          current = await api.getQuery(current.id, LONG_POLL_MS)
+          if (mine !== runId.current) return
+          setElapsed(Date.now() - started)
+          setJob(current)
+          if (!isTerminal(current.status) && Date.now() - asked < 250) {
+            await new Promise((r) => setTimeout(r, wait))
+            if (mine !== runId.current) return
+            wait = Math.min(pollMs, Math.ceil(wait * 1.6))
+          }
+        }
+        setElapsed(Date.now() - started)
+      } catch (e) {
+        if (mine === runId.current)
+          setError(e instanceof ApiError ? e.message : String(e))
+      } finally {
+        if (mine === runId.current && alive.current) setSubmitting(false)
+      }
+    },
+    [pollMs],
+  )
+
+  const refreshSaved = useCallback(async () => {
+    try {
+      setSaved((await api.listSavedQueries()).savedQueries)
+      setSavedError(null)
+    } catch (e) {
+      setSavedError(e instanceof ApiError ? e.message : String(e))
+    }
+  }, [])
+  useEffect(() => {
+    void refreshSaved()
+  }, [refreshSaved])
+
+  const save = async (name: string, description: string, asNew: boolean) => {
+    setSaving(true)
+    setSaveError(null)
+    const input = { name, description, statement: sql }
+    try {
+      const q =
+        activeSaved && !asNew
+          ? await api.updateSavedQuery(activeSaved.id, input)
+          : await api.createSavedQuery(input)
+      setActiveSaved(q)
+      setShowSave(false)
+      await refreshSaved()
+    } catch (e) {
+      setSaveError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const removeSaved = async (q: SavedQuery) => {
+    await api.deleteSavedQuery(q.id)
+    if (activeSaved?.id === q.id) setActiveSaved(undefined)
+    await refreshSaved()
+  }
+
+  const started = useRef(false)
+  useEffect(() => {
+    if (autoRun && initialStatement && !started.current) {
+      started.current = true
+      void run(initialStatement)
+    }
+  }, [autoRun, initialStatement, run])
+
+  const cancel = async () => {
+    if (!job) return
+    try {
+      setJob(await api.cancelQuery(job.id))
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    }
+  }
+
+  const active = job !== null && !isTerminal(job.status)
+
+  return (
+    <main className="page query-page">
+      <header className="page-header">
+        <div>
+          <h1>SQL workbench</h1>
+          <p>
+            One read-only statement over your datasets, run as a durable job
+          </p>
+        </div>
+      </header>
+      <div className="workbench">
+        <div className="workbench-side">
+          <SchemaBrowser
+            onInsert={(t) =>
+              setSql((s) => `${s}${s && !/\s$/.test(s) ? ' ' : ''}${t}`)
+            }
+          />
+          <SavedQueries
+            items={saved}
+            error={savedError}
+            activeId={activeSaved?.id}
+            onLoad={(q) => {
+              setSql(q.statement)
+              setActiveSaved(q)
+              setShowSave(false)
+            }}
+            onDelete={removeSaved}
+          />
+        </div>
+        <div className="workbench-main">
+          <SqlEditor
+            value={sql}
+            onChange={setSql}
+            onRun={() => !submitting && void run(sql)}
+            disabled={submitting}
+          />
+          <div className="toolbar">
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={() => void run(sql)}
+              disabled={submitting || !sql.trim()}
+            >
+              Run
+            </button>
+            <button
+              type="button"
+              className="btn-danger"
+              onClick={() => void cancel()}
+              disabled={!active || job?.cancelRequested}
+            >
+              {job?.cancelRequested && active ? 'Cancelling…' : 'Cancel'}
+            </button>
+            {job ? (
+              <span
+                className={`status status-${job.status.toLowerCase().replace('_', '-')}`}
+                data-testid="query-status"
+              >
+                {job.status}
+              </span>
+            ) : null}
+            {submitting || job ? (
+              <span className="muted" data-testid="elapsed">
+                {formatDuration(job?.durationMs ?? elapsed)}
+              </span>
+            ) : null}
+            <button
+              type="button"
+              onClick={() => {
+                setSaveError(null)
+                setShowSave((v) => !v)
+              }}
+              disabled={!sql.trim()}
+            >
+              {activeSaved ? 'Update saved…' : 'Save…'}
+            </button>
+            <span className="run-hint">
+              <kbd>⌘</kbd>
+              <kbd>↵</kbd> to run
+            </span>
+          </div>
+          {showSave ? (
+            <SaveQueryForm
+              key={activeSaved?.id ?? 'new'}
+              active={activeSaved}
+              busy={saving}
+              error={saveError}
+              onSave={(n, d, asNew) => void save(n, d, asNew)}
+              onCancel={() => setShowSave(false)}
+            />
+          ) : null}
+          {active ? (
+            <div
+              className="progress"
+              role="progressbar"
+              aria-label="Query in progress"
+            />
+          ) : null}
+
+          {error ? (
+            <p className="error" role="alert">
+              {error}
+            </p>
+          ) : null}
+          {job && (job.status === 'FAILED' || job.status === 'TIMED_OUT') ? (
+            <p className="error" role="alert">
+              {job.status === 'TIMED_OUT'
+                ? 'The query exceeded the execution timeout.'
+                : 'The query failed'}
+              {job.failureReason ? ` (${job.failureReason})` : ''}
+              {job.errorSummary ? (
+                <>
+                  : <span className="err-detail">{job.errorSummary}</span>
+                </>
+              ) : null}
+            </p>
+          ) : null}
+          {job?.status === 'CANCELLED' ? (
+            <p className="note" role="status">
+              The query was cancelled.
+            </p>
+          ) : null}
+          {job?.status === 'QUEUED' ? (
+            <p role="status">Queued — waiting for a worker…</p>
+          ) : null}
+          {job?.status === 'RUNNING' ? <p role="status">Running…</p> : null}
+          {job?.status === 'SUCCEEDED' ? <ResultsPanel job={job} /> : null}
+        </div>
+      </div>
+    </main>
+  )
+}

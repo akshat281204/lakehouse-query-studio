@@ -3,9 +3,6 @@ package health
 import (
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
@@ -75,28 +72,25 @@ func TestPostgresPings(t *testing.T) {
 	}
 }
 
-func TestMinIOReady(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	addr := strings.TrimPrefix(srv.URL, "http://")
-	m := NewMinIO("minio", addr, false, nil)
+func TestObjectStoreReadyWhenProbeSucceeds(t *testing.T) {
+	m := NewObjectStore("objectstore", func(context.Context) error { return nil })
+	if m.Name() != "objectstore" {
+		t.Fatalf("name = %q", m.Name())
+	}
 	if err := m.Check(context.Background()); err != nil {
 		t.Fatalf("Check() error = %v, want nil", err)
 	}
 }
 
-func TestMinIONotReady(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
-
-	addr := strings.TrimPrefix(srv.URL, "http://")
-	m := NewMinIO("minio", addr, false, nil)
+func TestObjectStoreNotReadyWhenProbeFails(t *testing.T) {
+	m := NewObjectStore("objectstore", func(context.Context) error { return errors.New("bucket missing") })
 	if err := m.Check(context.Background()); err == nil {
-		t.Fatal("Check() expected error for 503 response")
+		t.Fatal("Check() expected an error")
+	}
+}
+
+func TestObjectStoreNotConfigured(t *testing.T) {
+	if err := NewObjectStore("objectstore", nil).Check(context.Background()); err == nil {
+		t.Fatal("a nil probe must report not ready")
 	}
 }
