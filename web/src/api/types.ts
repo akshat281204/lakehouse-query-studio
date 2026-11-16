@@ -139,3 +139,110 @@ export interface InspectResponse {
   rowCount: number
   sample: Record<string, unknown>[]
 }
+
+export type QueryStatus =
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'CANCELLED'
+  | 'TIMED_OUT'
+
+export interface QueryJob {
+  id: string
+  statement: string
+  statementHash: string
+  datasetVersionIds: string[]
+  status: QueryStatus
+  failureReason?: string
+  errorSummary?: string
+  rowsReturned?: number
+  truncated: boolean
+  resultBytes?: number
+  bytesStaged?: number
+  planSummary?: string
+  durationMs?: number
+  attempt: number
+  cancelRequested: boolean
+  createdAt: string
+  startedAt?: string
+  finishedAt?: string
+}
+
+export interface QueryListResponse {
+  queries: QueryJob[]
+  offset: number
+  limit: number
+}
+
+export interface ResultColumn {
+  name: string
+  type: string
+}
+
+export type CellValue = string | number | boolean | null
+
+export interface QueryResults {
+  columns: ResultColumn[]
+  rows: CellValue[][]
+  offset: number
+  returned: number
+  nextOffset: number | null
+  totalRows: number
+  truncated: boolean
+}
+
+export interface QueryTotals {
+  total: number
+  succeeded: number
+  failed: number
+  cancelled: number
+  timedOut: number
+  queued: number
+  running: number
+  rowsReturned: number
+  bytesStaged: number
+  avgMs: number
+  p50Ms: number
+  p95Ms: number
+  p99Ms: number
+  maxMs: number
+}
+
+export interface TimelineBucket {
+  start: string
+  succeeded: number
+  failed: number
+  cancelled: number
+  p50Ms: number
+}
+
+export interface HistogramBucket {
+  /** Upper bound in ms; 0 means "slower than every bound". */
+  leMs: number
+  count: number
+}
+
+export interface ReasonCount {
+  reason: string
+  count: number
+}
+
+export interface Summary {
+  windowSeconds: number
+  generatedAt: string
+  queries: QueryTotals
+  timeline: TimelineBucket[]
+  latencyHistogram: HistogramBucket[]
+  failureReasons: ReasonCount[]
+  ingestions: {
+    total: number
+    succeeded: number
+    failed: number
+    active: number
+  }
+  datasets: number
+  truncated: boolean
+}
+
+export type StatsWindow = '1h' | '6h' | '24h' | '7d'

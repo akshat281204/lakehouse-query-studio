@@ -1,9 +1,50 @@
 # Lakehouse Query Studio — Architecture
 
-> Phase 0 deliverable. Describes component responsibilities, data flow,
-> failure boundaries, security boundaries, and deployment topology for the
-> first (single-node) release. The normative data/query/security contracts are
-> in `docs/design.md`; this document describes how the pieces fit together.
+> This page has two parts. **"As built"** (immediately below) is what the
+> repository implements today and is the part to trust when the two differ.
+> Everything after it is the **Phase 0 design contract**, kept as the record of
+> intent; the normative data/query/security rules are in `docs/design.md`.
+
+## As built (phase 8)
+
+A single-node system: one API process, one worker process (an ingestion pool and
+a query pool), PostgreSQL, an S3-compatible object store, and a React dashboard.
+There is no distributed execution, sharding, or replication.
+
+```
+ browser ──► web (nginx, static React) ──/api──► API (Go) ──► PostgreSQL (catalog, job state)
+                                                  │  ▲
+                              result spool reads  │  │ claim / heartbeat / fenced commit
+                                                  ▼  │
+                                         object store (S3) ◄── worker (Go + DuckDB)
+                                  lake/ uploads/ staging/ exports/
+```
+
+| Area | As built | Where described |
+|---|---|---|
+| Query engine | Single-node DuckDB v1.4.1 behind `internal/query.Engine`, linked via cgo | `docs/queries.md` |
+| Object store | Any S3-compatible store through a hand-written SigV4 client (path-style). The default local store is SeaweedFS, because the community MinIO images are no longer published; config variables keep the historical `MINIO_*` names | `README.md`, `docs/runbook.md` |
+| How DuckDB reads data | The worker downloads a dataset's files to a private scratch directory and DuckDB reads **local files**. DuckDB never holds an object-store credential, and `httpfs` is not loaded | `docs/queries.md` |
+| SQL safety | Statement parsed by DuckDB's own parser, walked against closed allowlists, then executed on a sealed, read-only engine. Re-validated by the worker | `docs/queries.md` |
+| Job durability | `query_jobs` / ingestion jobs in PostgreSQL with leases, heartbeats and fencing tokens; crash recovery requeues, shutdown never records a false terminal state | `docs/queries.md`, `docs/ingestion.md` |
+| Results | Bounded materialization, Parquet spool under `exports/`, paged and CSV-exported by the API, expired by a sweeper | `docs/queries.md`, `docs/security.md` |
+| Credentials | Environment variables of the API and worker only. One deployment credential per service; no per-query STS tokens | `docs/security.md` |
+| Browser protection | Host allowlist, Origin / `Sec-Fetch-Site` checks, CSRF header on every mutation, exact-origin CORS, optional bearer token | `docs/security.md` |
+| Observability | Bounded-cardinality Prometheus metrics on the API and worker, structured logs with request IDs, an opt-in Prometheus + Grafana profile. No distributed tracing | `docs/security.md` |
+| Dashboard | Overview (KPIs, activity, latency, outcomes, failures, health), datasets, upload, SQL workbench, history; light and dark themes | `docs/dashboard.md` |
+| Measured performance | Seeded TPC-H-like workload, reproducible; staging dominates latency; no partitioning benefit measured | `docs/evaluation.md` |
+
+Known gaps against the Phase 0 contract (each is documented where it arises):
+no per-query scoped object-store credentials, no OpenTelemetry tracing,
+abandoned `lake/` attempt prefixes from dead ingestion attempts are not
+reclaimed, uploads are buffered in memory (64 MiB limit), the Parquet writer
+supports only boolean/int64/double/string and no compression, and the
+object-store policies in `ops/minio-policies/` have not been applied to a real
+server.
+
+---
+
+# Part 2 — Phase 0 design contract
 
 ## 1. Overview
 

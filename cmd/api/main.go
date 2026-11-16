@@ -14,12 +14,15 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/akshat281204/lakehouse-query-studio/internal/api"
 	"github.com/akshat281204/lakehouse-query-studio/internal/catalog"
 	"github.com/akshat281204/lakehouse-query-studio/internal/config"
 	"github.com/akshat281204/lakehouse-query-studio/internal/health"
 	"github.com/akshat281204/lakehouse-query-studio/internal/logging"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
+	"github.com/akshat281204/lakehouse-query-studio/internal/query"
 	"github.com/akshat281204/lakehouse-query-studio/internal/server"
+	"github.com/akshat281204/lakehouse-query-studio/internal/telemetry"
 )
 
 func main() {
@@ -46,6 +49,7 @@ func run() error {
 	var db *sql.DB
 	var catalogStore catalog.Store
 	var ingestStore catalog.IngestStore
+	var queryStore catalog.QueryStore
 	if cfg.PostgresURL != "" {
 		db, err = sql.Open("pgx", cfg.PostgresURL)
 		if err != nil {
@@ -59,6 +63,7 @@ func run() error {
 			} else {
 				catalogStore = catalog.NewPostgresStore(db)
 				ingestStore = catalog.NewPostgresIngestStore(db)
+				queryStore = catalog.NewPostgresQueryStore(db)
 			}
 			cancel()
 		}
@@ -73,20 +78,39 @@ func run() error {
 		UseSSL:    cfg.MinIOUseSSL,
 	})
 
-	// Best effort: the bucket may not exist on a clean MinIO. Failure is not
-	// fatal because readiness reports the object store separately.
-	bctx, bcancel := context.WithTimeout(ctx, 10*time.Second)
-	if err := objects.EnsureBucket(bctx); err != nil {
+	// The bucket may not exist on a clean store, and the store may still be
+	// starting. Retry for a bounded time; failure is not fatal because
+	// readiness reports the object store separately.
+	if err := ensureBucket(ctx, objects, time.Minute); err != nil {
 		log.Warn("ensure bucket failed", "error", err.Error())
 	}
-	bcancel()
+
+	// The validator parses SQL with DuckDB's own parser on a private, empty,
+	// in-memory database. It never executes a statement and holds no data.
+	validator, err := query.NewValidator()
+	if err != nil {
+		return fmt.Errorf("sql validator: %w", err)
+	}
+	defer func() { _ = validator.Close() }()
+
+	metrics := telemetry.New(server.Version)
 
 	srv := server.New(cfg, log, server.Deps{
-		Ready:   buildReady(cfg, db),
+		Metrics: metrics,
+		Ready:   buildReady(db, objects),
 		Catalog: catalogStore,
 		Objects: objects,
 		Ingest:  ingestStore,
 		Writer:  objects,
+
+		Queries:   queryStore,
+		Validator: validator,
+		QueryLimits: api.QueryLimits{
+			MaxPageBytes:   cfg.Query.MaxPageBytes,
+			MaxExportBytes: cfg.Query.MaxExportBytes,
+			MaxExportRows:  minInt(cfg.Query.MaxExportRows, cfg.Query.MaxRows),
+			MaxQueued:      cfg.Query.QueueDepth,
+		},
 	})
 	if err := srv.Run(ctx); err != nil {
 		return fmt.Errorf("server: %w", err)
@@ -94,14 +118,44 @@ func run() error {
 	return nil
 }
 
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// ensureBucket creates the bucket, retrying while the store is starting.
+func ensureBucket(ctx context.Context, objects *objectstore.Client, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	for {
+		bctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := objects.EnsureBucket(bctx)
+		cancel()
+		if err == nil || ctx.Err() != nil || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
 // buildReady constructs the aggregate readiness check. Dependencies are probed
 // lazily on every /readyz request; a missing or unreachable dependency is
-// reported as not-ready rather than failing startup.
-func buildReady(cfg *config.Config, db *sql.DB) server.ReadyFunc {
+// reported as not-ready rather than failing startup. The object-store probe is
+// a signed, bounded List call, so it proves connectivity, credentials and the
+// bucket on any S3-compatible store.
+func buildReady(db *sql.DB, objects *objectstore.Client) server.ReadyFunc {
 	postgres := health.NewPostgres("postgres", nil)
 	if db != nil {
 		postgres = health.NewPostgres("postgres", db)
 	}
-	minio := health.NewMinIO("minio", cfg.MinIOEndpoint, cfg.MinIOUseSSL, nil)
-	return health.NewAggregate(postgres, minio).Check
+	store := health.NewObjectStore("objectstore", func(ctx context.Context) error {
+		_, err := objects.List(ctx, objectstore.ListOptions{MaxKeys: 1})
+		return err
+	})
+	return health.NewAggregate(postgres, store).Check
 }

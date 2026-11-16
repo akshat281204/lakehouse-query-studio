@@ -10,6 +10,7 @@ import (
 	"github.com/akshat281204/lakehouse-query-studio/internal/catalog"
 	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
 	"github.com/akshat281204/lakehouse-query-studio/internal/parquet"
+	"github.com/akshat281204/lakehouse-query-studio/internal/telemetry"
 )
 
 // Failure reasons recorded on jobs.
@@ -30,6 +31,8 @@ type Runner struct {
 	Limits  Limits
 	Poll    time.Duration
 	Log     *slog.Logger
+	// Metrics is optional; labels come from closed sets only.
+	Metrics *telemetry.Metrics
 }
 
 // NewRunner returns a Runner with the documented defaults.
@@ -83,6 +86,13 @@ func lakePrefix(job *catalog.Job) string {
 func (r *Runner) process(ctx context.Context, job *catalog.Job) {
 	log := r.Log.With("job_id", job.ID, "dataset", job.DatasetName, "version", job.Version, "attempt", job.Attempt)
 	log.Info("ingestion started")
+	started := time.Now()
+	record := func(outcome string) {
+		if r.Metrics != nil {
+			r.Metrics.IngestJobs.Inc(outcome)
+			r.Metrics.IngestDuration.Observe(time.Since(started).Seconds())
+		}
+	}
 
 	timeout := max(r.Lease-time.Minute, r.Lease/2)
 	jctx, cancel := context.WithTimeout(ctx, timeout)
@@ -97,6 +107,7 @@ func (r *Runner) process(ctx context.Context, job *catalog.Job) {
 		if errors.Is(err, catalog.ErrFenced) {
 			log.Warn("job fenced; discarding attempt output")
 			r.cleanup(ctx, written)
+			record("abandoned")
 			return
 		}
 	}
@@ -104,6 +115,7 @@ func (r *Runner) process(ctx context.Context, job *catalog.Job) {
 		if ctx.Err() != nil {
 			// Shutting down mid-job: leave it RUNNING; lease expiry recovers it.
 			log.Warn("ingestion interrupted by shutdown")
+			record("abandoned")
 			return
 		}
 		// This attempt is the sole writer of its attempt-scoped keys and has
@@ -114,6 +126,7 @@ func (r *Runner) process(ctx context.Context, job *catalog.Job) {
 		if ferr := r.Store.Fail(ctx, job.ID, job.FencingToken, reason, summary, retryable); ferr != nil && !errors.Is(ferr, catalog.ErrFenced) {
 			log.Error("record failure", "error", ferr.Error())
 		}
+		record("failed")
 		return
 	}
 
@@ -124,6 +137,7 @@ func (r *Runner) process(ctx context.Context, job *catalog.Job) {
 			log.Warn("delete original upload", "error", derr.Error())
 		}
 	}
+	record("succeeded")
 	log.Info("ingestion succeeded", "rows", publish.RowCount, "prefix", prefix)
 }
 

@@ -18,6 +18,7 @@ LOG_LEVEL="info"
 # Secrets start empty; they are generated below.
 POSTGRES_PASSWORD=""
 MINIO_ROOT_PASSWORD=""
+GRAFANA_ADMIN_PASSWORD=""
 
 if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
@@ -37,7 +38,17 @@ if [ -z "${MINIO_ROOT_PASSWORD:-}" ]; then
     MINIO_ROOT_PASSWORD="$(openssl rand -hex 32)"
 fi
 
+if [ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]; then
+    GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+fi
+
 umask 077
+# Keep any other settings the user added to an existing .env (ports, limits...).
+MANAGED='POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|MINIO_ROOT_USER|MINIO_ROOT_PASSWORD|MINIO_BUCKET|GRAFANA_ADMIN_PASSWORD|LOG_LEVEL'
+EXTRA=""
+if [ -f "$ENV_FILE" ]; then
+    EXTRA="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" | grep -v -E "^($MANAGED)=" || true)"
+fi
 {
     printf 'POSTGRES_USER=%s\n' "$POSTGRES_USER"
     printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
@@ -45,7 +56,15 @@ umask 077
     printf 'MINIO_ROOT_USER=%s\n' "$MINIO_ROOT_USER"
     printf 'MINIO_ROOT_PASSWORD=%s\n' "$MINIO_ROOT_PASSWORD"
     printf 'MINIO_BUCKET=%s\n' "$MINIO_BUCKET"
+    printf 'GRAFANA_ADMIN_PASSWORD=%s\n' "$GRAFANA_ADMIN_PASSWORD"
     printf 'LOG_LEVEL=%s\n' "$LOG_LEVEL"
+    [ -n "$EXTRA" ] && printf '%s\n' "$EXTRA"
+    true
 } > "$ENV_FILE"
+
+# S3 identity for the local object store (SeaweedFS), derived from the same
+# credentials the apps use. Gitignored; never committed.
+printf '{"identities":[{"name":"lakehouse","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}\n' \
+    "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" > .s3-config.json
 
 echo "Wrote $ENV_FILE with local-only random credentials (gitignored)."

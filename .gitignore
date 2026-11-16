@@ -30,3 +30,6 @@ stack.config.json
 .idea/
 .vscode/
 *.swp
+
+# Generated S3 identity for the local object store (contains credentials)
+.s3-config.json

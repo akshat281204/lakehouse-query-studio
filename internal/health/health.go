@@ -4,9 +4,6 @@ package health
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net/http"
-	"time"
 )
 
 // Result is the outcome of a single dependency check.
@@ -85,45 +82,27 @@ func (p *Postgres) Check(ctx context.Context) error {
 	return p.pinger.PingContext(ctx)
 }
 
-// MinIO probes a MinIO server's readiness endpoint.
-type MinIO struct {
-	name   string
-	client *http.Client
-	url    string
+// ObjectStore probes an S3-compatible object store with a caller-supplied
+// probe. The API passes a signed, bounded List call, which proves connectivity,
+// credentials and the bucket together and works with any S3-compatible server
+// (it does not depend on a vendor-specific health endpoint).
+type ObjectStore struct {
+	name  string
+	probe func(ctx context.Context) error
 }
 
-// NewMinIO builds a MinIO checker that GETs the server's readiness endpoint.
-func NewMinIO(name, endpoint string, useSSL bool, client *http.Client) *MinIO {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second}
-	}
-	scheme := "http"
-	if useSSL {
-		scheme = "https"
-	}
-	return &MinIO{
-		name:   name,
-		client: client,
-		url:    fmt.Sprintf("%s://%s/minio/health/ready", scheme, endpoint),
-	}
+// NewObjectStore builds the checker. A nil probe reports not configured.
+func NewObjectStore(name string, probe func(ctx context.Context) error) *ObjectStore {
+	return &ObjectStore{name: name, probe: probe}
 }
 
 // Name returns the checker's dependency name.
-func (m *MinIO) Name() string { return m.name }
+func (o *ObjectStore) Name() string { return o.name }
 
-// Check probes the MinIO readiness endpoint.
-func (m *MinIO) Check(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.url, nil)
-	if err != nil {
-		return err
+// Check runs the probe.
+func (o *ObjectStore) Check(ctx context.Context) error {
+	if o.probe == nil {
+		return errors.New("object store not configured")
 	}
-	resp, err := m.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("minio health returned status %d", resp.StatusCode)
-	}
-	return nil
+	return o.probe(ctx)
 }
