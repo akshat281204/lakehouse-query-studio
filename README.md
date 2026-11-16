@@ -16,12 +16,12 @@ storage, not a distributed database.
 | Path | Purpose |
 |---|---|
 | `cmd/api` | Go control-plane process (health, readiness, config) |
-| `cmd/worker` | Query/ingestion worker placeholder (phase 1) |
+| `cmd/worker` | Ingestion worker: claims upload jobs and writes versioned Parquet (phase 3) |
 | `internal/` | Shared Go packages: config, logging, health, server |
 | `web/` | React + TypeScript + Vite dashboard with a typed API client |
 | `docker-compose.yml` | Local Postgres, MinIO, API, worker, and web |
 | `Makefile` | `up`, `down`, `run`, `web`, `test`, `verify` targets |
-| `docs/` | Design contract and architecture (phase 0) |
+| `docs/` | Design contract (phase 0), catalog (phase 2), ingestion (phase 3) |
 
 ## Prerequisites
 
@@ -94,7 +94,7 @@ production build. **It does not require a running MinIO or PostgreSQL instance.*
 Individual targets: `make test` (Go + web tests), `make run` (API on the host),
 and `make web` (Vite dev server with hot reload).
 
-## API (phase 1)
+## API
 
 - `GET /` — service metadata (`{ "service": "lakehouse-api", "version": … }`)
 - `GET /api/v1/info` — service metadata for the web app (same payload as `/`);
@@ -103,8 +103,27 @@ and `make web` (Vite dev server with hot reload).
 - `GET /healthz` — liveness (`{ "status": "ok" }`)
 - `GET /readyz` — readiness; reports each dependency (`postgres`, `minio`) and
   returns `200` only when all are healthy, otherwise `503`
+- `POST /api/v1/datasets` — register an existing Parquet prefix
+  (`{ "name": "sales", "prefix": "data/sales" }`)
+- `GET /api/v1/datasets` — paged, searchable dataset list (`offset`, `limit`,
+  `q`)
+- `GET /api/v1/datasets/{id}` — dataset detail with latest version and schema
+- `GET /api/v1/datasets/{id}/schema` — schema columns
+- `GET /api/v1/datasets/{id}/preview` — bounded sample rows
+- `POST /api/v1/ingestions/inspect` — infer the schema of a CSV/JSON/JSONL body
+  without storing it
+- `POST /api/v1/ingestions?name=&filename=&partitionColumns=` — upload a file
+  (raw body, up to 64 MiB) and queue a conversion job (`202`)
+- `GET /api/v1/ingestions`, `GET /api/v1/ingestions/{id}` — list/poll jobs
+- `POST /api/v1/ingestions/{id}/retry` — retry a failed, retryable job
 
-Later phases add the versioned dataset and query API under `/api/v1`.
+See `docs/ingestion.md` for limits, partitioning, recovery, and known
+deviations from the phase-0 contract.
+
+The dataset endpoints return `503 unavailable` when PostgreSQL or MinIO is not
+configured. All non-2xx responses use a single error envelope
+(`{ "error": { "code", "message", "details" } }`); see `docs/design.md` §11 and
+`docs/catalog.md`.
 
 ## CI
 

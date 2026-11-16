@@ -10,7 +10,7 @@ GO_SOURCES := $(shell find cmd internal -type f -name '*.go')
 
 .DEFAULT_GOAL := verify
 
-.PHONY: up down run web genenv test verify \
+.PHONY: up down run web genenv test test-integration verify \
         fmt vet lint go-test web-test go-build web-build typecheck build
 
 # --- Local stack -----------------------------------------------------------
@@ -57,6 +57,9 @@ lint: # Run the Go linter (golangci-lint when available) and web ESLint
 	cd $(WEB_DIR) && $(NPM) run lint
 
 test: go-test web-test # Run Go and web unit tests
+
+test-integration: # Run Postgres-backed integration tests (needs TEST_POSTGRES_URL)
+	$(GO) test -tags integration -count=1 $(GO_PACKAGES)
 
 go-test:
 	$(GO) test -race $(GO_PACKAGES)

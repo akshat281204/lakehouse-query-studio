@@ -10,8 +10,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/akshat281204/lakehouse-query-studio/internal/api"
+	"github.com/akshat281204/lakehouse-query-studio/internal/catalog"
 	"github.com/akshat281204/lakehouse-query-studio/internal/config"
 	"github.com/akshat281204/lakehouse-query-studio/internal/health"
+	"github.com/akshat281204/lakehouse-query-studio/internal/objectstore"
 )
 
 // Version is the reported service version. It may be overridden at build time
@@ -23,17 +26,29 @@ var Version = "dev"
 // fresh.
 type ReadyFunc func(ctx context.Context) map[string]health.Result
 
+// Deps holds the process dependencies injected into the HTTP server.
+type Deps struct {
+	Ready   ReadyFunc
+	Catalog catalog.Store
+	Objects objectstore.Store
+
+	// Ingest and Writer enable the upload/ingestion endpoints. Both are
+	// optional; when either is nil those endpoints report unavailable.
+	Ingest catalog.IngestStore
+	Writer objectstore.ReadWriter
+}
+
 // Server owns the HTTP server and its routes.
 type Server struct {
-	cfg   *config.Config
-	log   *slog.Logger
-	ready ReadyFunc
-	srv   *http.Server
+	cfg  *config.Config
+	log  *slog.Logger
+	deps Deps
+	srv  *http.Server
 }
 
 // New constructs a Server.
-func New(cfg *config.Config, log *slog.Logger, ready ReadyFunc) *Server {
-	s := &Server{cfg: cfg, log: log, ready: ready}
+func New(cfg *config.Config, log *slog.Logger, deps Deps) *Server {
+	s := &Server{cfg: cfg, log: log, deps: deps}
 	s.srv = &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           s.routes(),
@@ -53,6 +68,13 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/info", s.handleServiceInfo)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
+
+	datasets := api.New(s.deps.Catalog, s.deps.Objects,
+		api.WithIngest(api.IngestDeps{Jobs: s.deps.Ingest, Objects: s.deps.Writer}))
+	mux.Handle("/api/v1/datasets", datasets)
+	mux.Handle("/api/v1/datasets/", datasets)
+	mux.Handle("/api/v1/ingestions", datasets)
+	mux.Handle("/api/v1/ingestions/", datasets)
 	return mux
 }
 
@@ -86,7 +108,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	results := s.ready(ctx)
+	results := s.deps.Ready(ctx)
 	body := map[string]any{
 		"status":       "not_ready",
 		"dependencies": results,

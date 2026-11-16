@@ -26,7 +26,7 @@ func testLogger() *slog.Logger {
 }
 
 func TestHealthz(t *testing.T) {
-	srv := New(testConfig(), testLogger(), func(context.Context) map[string]health.Result { return nil })
+	srv := New(testConfig(), testLogger(), Deps{Ready: func(context.Context) map[string]health.Result { return nil }})
 
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -47,7 +47,7 @@ func TestReadyzOK(t *testing.T) {
 	ready := func(context.Context) map[string]health.Result {
 		return map[string]health.Result{"postgres": {OK: true}, "minio": {OK: true}}
 	}
-	srv := New(testConfig(), testLogger(), ready)
+	srv := New(testConfig(), testLogger(), Deps{Ready: ready})
 
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
@@ -74,7 +74,7 @@ func TestReadyzNotReady(t *testing.T) {
 	ready := func(context.Context) map[string]health.Result {
 		return map[string]health.Result{"postgres": {OK: false, Message: "down"}}
 	}
-	srv := New(testConfig(), testLogger(), ready)
+	srv := New(testConfig(), testLogger(), Deps{Ready: ready})
 
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
@@ -98,7 +98,7 @@ func TestReadyzNotReady(t *testing.T) {
 }
 
 func TestRoot(t *testing.T) {
-	srv := New(testConfig(), testLogger(), func(context.Context) map[string]health.Result { return nil })
+	srv := New(testConfig(), testLogger(), Deps{Ready: func(context.Context) map[string]health.Result { return nil }})
 
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -116,7 +116,7 @@ func TestRoot(t *testing.T) {
 }
 
 func TestServiceInfoRoute(t *testing.T) {
-	srv := New(testConfig(), testLogger(), func(context.Context) map[string]health.Result { return nil })
+	srv := New(testConfig(), testLogger(), Deps{Ready: func(context.Context) map[string]health.Result { return nil }})
 
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/info", nil))
@@ -137,7 +137,7 @@ func TestServiceInfoRoute(t *testing.T) {
 }
 
 func TestUnknownPathReturnsNotFound(t *testing.T) {
-	srv := New(testConfig(), testLogger(), func(context.Context) map[string]health.Result { return nil })
+	srv := New(testConfig(), testLogger(), Deps{Ready: func(context.Context) map[string]health.Result { return nil }})
 
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/does-not-exist", nil))
