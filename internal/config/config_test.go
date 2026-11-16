@@ -144,3 +144,114 @@ func TestValidateAllowsEmptyPostgresURL(t *testing.T) {
 		t.Fatalf("Validate() with empty PostgresURL = %v, want nil", err)
 	}
 }
+
+func TestQueryConfigDefaultsMatchDesign(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := cfg.Query
+	if q.Workers != 2 || q.Timeout != 60*time.Second || q.Lease != 120*time.Second || q.Heartbeat != 40*time.Second {
+		t.Errorf("workers/timeout/lease = %d %v %v %v", q.Workers, q.Timeout, q.Lease, q.Heartbeat)
+	}
+	if q.MaxRows != 10_000 || q.MaxResultBytes != 256<<20 || q.MaxRowBytes != 1<<20 ||
+		q.MaxPageBytes != 4<<20 || q.MaxExportBytes != 64<<20 || q.MaxExportRows != 50_000 || q.QueueDepth != 100 {
+		t.Errorf("limits = %+v", q)
+	}
+}
+
+func TestQueryConfigRejectsValuesOutsideHardBounds(t *testing.T) {
+	cases := map[string]string{
+		"QUERY_WORKERS":            "0",
+		"QUERY_WORKERS ":           "17",
+		"QUERY_TIMEOUT":            "301s",
+		"QUERY_LEASE_DURATION":     "601s",
+		"MAX_RESULT_ROWS":          "100001",
+		"MAX_RESULT_BYTES":         "1073741825",
+		"MAX_ROW_BYTES":            "16777217",
+		"MAX_PAGE_BYTES":           "67108865",
+		"MAX_EXPORT_BYTES":         "536870913",
+		"QUERY_HEARTBEAT_INTERVAL": "100s", // 100s + 30s margin >= 120s lease
+		"QUEUE_DEPTH":              "0",
+	}
+	for k, v := range cases {
+		key := strings.TrimSpace(k)
+		t.Run(key+"="+v, func(t *testing.T) {
+			t.Setenv(key, v)
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s=%s accepted", key, v)
+			}
+		})
+	}
+}
+
+func TestQueryConfigRejectsGarbage(t *testing.T) {
+	t.Setenv("QUERY_WORKERS", "many")
+	if _, err := Load(); err == nil {
+		t.Fatal("non-numeric QUERY_WORKERS accepted")
+	}
+}
+
+func TestQueryObjectStoreCredentialMustBeSetAsAPair(t *testing.T) {
+	t.Setenv("QUERY_MINIO_ACCESS_KEY", "only-the-key")
+	if _, err := Load(); err == nil {
+		t.Fatal("half a credential pair accepted")
+	}
+	t.Setenv("QUERY_MINIO_SECRET_KEY", "and-the-secret")
+	cfg, err := Load()
+	if err != nil || cfg.QueryMinIOAccessKey == "" {
+		t.Fatalf("%v %+v", err, cfg)
+	}
+}
+
+func TestAPITokenMustBeLongEnough(t *testing.T) {
+	t.Setenv("API_TOKEN", "short")
+	if _, err := Load(); err == nil {
+		t.Fatal("short API_TOKEN accepted")
+	}
+	t.Setenv("API_TOKEN", "a-sufficiently-long-token")
+	if _, err := Load(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAllowedHostsDefaultFromListenPortAndCanBeOverridden(t *testing.T) {
+	t.Setenv("HTTP_ADDR", "127.0.0.1:9191")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, h := range cfg.AllowedHosts {
+		if h == "localhost:9191" {
+			found = true
+		}
+		if h == "*" || h == "" {
+			t.Fatalf("wildcard host %q", h)
+		}
+	}
+	if !found {
+		t.Fatalf("hosts %v", cfg.AllowedHosts)
+	}
+	t.Setenv("ALLOWED_HOSTS", "dash.internal:8080, api.internal:8080")
+	cfg, _ = Load()
+	if len(cfg.AllowedHosts) != 2 || cfg.AllowedHosts[1] != "api.internal:8080" {
+		t.Fatalf("hosts %v", cfg.AllowedHosts)
+	}
+}
+
+func TestRetentionBounds(t *testing.T) {
+	for k, v := range map[string]string{"EXPORT_TTL": "10s", "STAGING_TTL": "30m", "SWEEP_INTERVAL": "100ms"} {
+		t.Run(k, func(t *testing.T) {
+			t.Setenv(k, v)
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s=%s accepted", k, v)
+			}
+		})
+	}
+	t.Setenv("EXPORT_TTL", "48h")
+	t.Setenv("HISTORY_RETENTION", "24h")
+	if _, err := Load(); err == nil {
+		t.Fatal("history retention shorter than export TTL accepted")
+	}
+}

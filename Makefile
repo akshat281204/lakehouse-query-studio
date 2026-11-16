@@ -77,3 +77,4 @@ go-build:
 
 web-build:
 	cd $(WEB_DIR) && $(NPM) run build
+	sh ./scripts/check-bundle.sh $(WEB_DIR)/dist $(WEB_DIR)/src

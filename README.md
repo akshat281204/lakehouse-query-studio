@@ -16,16 +16,16 @@ storage, not a distributed database.
 | Path | Purpose |
 |---|---|
 | `cmd/api` | Go control-plane process (health, readiness, config) |
-| `cmd/worker` | Ingestion worker: claims upload jobs and writes versioned Parquet (phase 3) |
+| `cmd/worker` | Worker: ingestion jobs (phase 3) and query jobs on DuckDB (phase 4) |
 | `internal/` | Shared Go packages: config, logging, health, server |
 | `web/` | React + TypeScript + Vite dashboard with a typed API client |
 | `docker-compose.yml` | Local Postgres, MinIO, API, worker, and web |
 | `Makefile` | `up`, `down`, `run`, `web`, `test`, `verify` targets |
-| `docs/` | Design contract (phase 0), catalog (phase 2), ingestion (phase 3) |
+| `docs/` | Design contract (phase 0), catalog (phase 2), ingestion (phase 3), queries (phase 4), dashboard (phase 5), security and operations (phase 6) |
 
 ## Prerequisites
 
-- **Go** 1.25 or newer
+- **Go** 1.25 or newer, with **cgo** and a C/C++ compiler (the DuckDB engine is linked in)
 - **Node.js** 22 and **npm** 11
 - **Docker** with the Compose v2 plugin (`docker compose`)
 - **golangci-lint** (optional; `make verify` falls back to `go vet` when absent)
@@ -75,6 +75,19 @@ and the generator fills any blank secret it finds. To pin your own values, copy
 | `MINIO_BUCKET` | `lakehouse` | Object-store bucket |
 | `MINIO_USE_SSL` | `false` | Use HTTPS for the object store |
 | `API_TOKEN` | _(empty)_ | Optional single deployment token |
+| `QUERY_WORKERS` | `2` | Concurrent running queries (1–16) |
+| `QUERY_TIMEOUT` | `60s` | Query execution budget (max 300s) |
+| `QUERY_LEASE_DURATION` | `120s` | Query lease (max 600s); heartbeat is a third of it |
+| `MAX_RESULT_ROWS` / `MAX_RESULT_BYTES` / `MAX_ROW_BYTES` | `10000` / `268435456` / `1048576` | Result bounds; byte values are integer bytes (hard max 100000 / 1 GiB / 16 MiB) |
+| `MAX_PAGE_BYTES` / `MAX_EXPORT_BYTES` / `MAX_EXPORT_ROWS` | `4194304` / `67108864` / `50000` | Paging and CSV export bounds (integer bytes) |
+| `MAX_SCAN_BYTES` | `1073741824` | Dataset bytes a single query may stage (integer bytes) |
+| `QUEUE_DEPTH` | `100` | Combined queued query + ingestion jobs |
+| `DUCKDB_THREADS` / `DUCKDB_MEMORY` | `min(4, cpus)` / `2GiB` | Per-query DuckDB budgets |
+| `QUERY_TMP_DIR` | OS temp dir | Parent of per-query scratch directories |
+| `ALLOWED_HOSTS` / `ALLOWED_ORIGINS` | loopback + dashboard | Closed lists of accepted `Host` and `Origin` values |
+| `QUERY_MINIO_ACCESS_KEY` / `QUERY_MINIO_SECRET_KEY` | _(empty)_ | Optional separate object-store credential for query reads and result spools |
+| `EXPORT_TTL` / `HISTORY_RETENTION` / `STAGING_TTL` / `SWEEP_INTERVAL` | `24h` / `720h` / `24h` / `10m` | Retention and cleanup |
+| `METRICS_ADDR` | `127.0.0.1:9100` | Worker `/metrics` listen address |
 
 Secrets are never committed, logged, or shipped to the browser bundle. Logging
 is structured (`log/slog`) and redacts sensitive fields.
@@ -91,6 +104,10 @@ plus web ESLint, Go unit/race tests (`go test -race ./...`) and web tests
 (Vitest), web typechecking (`tsc`), and Go build (`go build ./...`) plus the web
 production build. **It does not require a running MinIO or PostgreSQL instance.**
 
+`make web-build` also runs `scripts/check-bundle.sh`, which fails if the bundle
+or web source could expose credentials or use browser storage. See
+`docs/dashboard.md`.
+
 Individual targets: `make test` (Go + web tests), `make run` (API on the host),
 and `make web` (Vite dev server with hot reload).
 
@@ -101,6 +118,7 @@ and `make web` (Vite dev server with hot reload).
   the dashboard calls this route because `/` is served as the frontend entry
   point by both the Vite dev server and the nginx SPA fallback
 - `GET /healthz` — liveness (`{ "status": "ok" }`)
+- `GET /metrics` — Prometheus metrics (bounded label sets; see `docs/security.md`)
 - `GET /readyz` — readiness; reports each dependency (`postgres`, `minio`) and
   returns `200` only when all are healthy, otherwise `503`
 - `POST /api/v1/datasets` — register an existing Parquet prefix
@@ -116,6 +134,21 @@ and `make web` (Vite dev server with hot reload).
   (raw body, up to 64 MiB) and queue a conversion job (`202`)
 - `GET /api/v1/ingestions`, `GET /api/v1/ingestions/{id}` — list/poll jobs
 - `POST /api/v1/ingestions/{id}/retry` — retry a failed, retryable job
+
+- `POST /api/v1/queries` — queue one read-only SQL statement (`202`)
+- `GET /api/v1/queries`, `GET /api/v1/queries/{id}` — history and status
+- `POST /api/v1/queries/{id}/cancel` — cancel a queued or running query
+- `GET /api/v1/queries/{id}/results?offset=&limit=` — paged, byte-bounded rows
+- `GET /api/v1/queries/{id}/export` — bounded CSV download
+
+Every request passes the browser-request guard: a `Host` allowlist, `Origin` and
+`Sec-Fetch-Site` checks, and an `X-Lakehouse-CSRF: 1` header on every mutation.
+See `docs/security.md` for the guard, least-privilege object-store policies,
+metrics, retention, and the opt-in operations dashboard
+(`docker compose --profile ops up -d`).
+
+See `docs/queries.md` for the SQL boundary, limits, job lifecycle, and
+deviations from the phase-0 contract.
 
 See `docs/ingestion.md` for limits, partitioning, recovery, and known
 deviations from the phase-0 contract.
