@@ -1,0 +1,605 @@
+{
+  "generated_at": "2026-11-14T17:09:43.74235Z",
+  "environment": {
+    "goos": "darwin",
+    "goarch": "arm64",
+    "cpu_model": "Apple M4",
+    "logical_cpus": 10,
+    "memory_bytes": 17179869184,
+    "go_version": "go1.26.3",
+    "duckdb_version": "v1.4.1",
+    "git_commit": "188671f55a5f7c9cb833f4984cf7bd92fe2ceb86",
+    "git_dirty": true,
+    "os_cache": "not dropped (needs root); 'first' runs are first-after-generation, not guaranteed cold"
+  },
+  "config": {
+    "scale_factor_like": 0.1,
+    "seed": 20240601,
+    "warm_iterations": 15,
+    "concurrency_levels": [
+      1,
+      2,
+      4
+    ],
+    "concurrency_queries_per_level": 24,
+    "ingest_rows": 300000,
+    "object_store": "in-memory object store (no network latency; staging is a memory copy)",
+    "query_limits": {
+      "Timeout": 300000000000,
+      "MaxRows": 10000,
+      "MaxResultBytes": 268435456,
+      "MaxRowBytes": 1048576,
+      "MaxScanBytes": 4294967296,
+      "Threads": 4,
+      "MemoryLimit": "2GiB"
+    },
+    "limits_note": "max rows/result bytes are the product defaults."
+  },
+  "dataset": {
+    "scale": 0.1,
+    "tables": [
+      {
+        "name": "customer",
+        "prefix": "bench/customer",
+        "rows": 15000,
+        "files": 1,
+        "bytes": 555394,
+        "hive_partitioned": false
+      },
+      {
+        "name": "orders",
+        "prefix": "bench/orders",
+        "rows": 150000,
+        "files": 1,
+        "bytes": 7560133,
+        "hive_partitioned": false
+      },
+      {
+        "name": "lineitem",
+        "prefix": "bench/lineitem",
+        "rows": 600277,
+        "files": 3,
+        "bytes": 52827520,
+        "hive_partitioned": false
+      },
+      {
+        "name": "lineitem_part",
+        "prefix": "bench/lineitem_part",
+        "rows": 600277,
+        "files": 21,
+        "bytes": 48041606,
+        "hive_partitioned": true
+      }
+    ]
+  },
+  "queries": [
+    {
+      "id": "q1-selective-filter",
+      "description": "selective filter + aggregate on lineitem (flat)",
+      "sql": "SELECT count(*) AS n, sum(l_extendedprice) AS rev FROM lineitem WHERE l_year = 1994 AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity \u003c 24",
+      "rows_returned": 1,
+      "truncated": false,
+      "bytes_staged": 52827520,
+      "result_bytes": 195,
+      "first_run_ms": 31.569833,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 22.735166,
+        "p50_ms": 24.331666,
+        "p95_ms": 51.731375,
+        "p99_ms": 51.731375,
+        "max_ms": 51.731375,
+        "mean_ms": 27.4076554
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 10.333,
+        "p50_ms": 11.169292,
+        "p95_ms": 15.665166,
+        "p99_ms": 15.665166,
+        "max_ms": 15.665166,
+        "mean_ms": 12.025175133333336
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 11.229417,
+        "p50_ms": 11.956708,
+        "p95_ms": 18.821041,
+        "p99_ms": 18.821041,
+        "max_ms": 18.821041,
+        "mean_ms": 12.379036200000002
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.005333,
+        "p50_ms": 0.00775,
+        "p95_ms": 0.009708,
+        "p99_ms": 0.009708,
+        "max_ms": 0.009708,
+        "mean_ms": 0.007447066666666669
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q2-year-flat",
+      "description": "group by on one year of lineitem (flat layout)",
+      "sql": "SELECT l_returnflag, count(*) AS n FROM lineitem WHERE l_year = 1995 GROUP BY l_returnflag ORDER BY l_returnflag",
+      "rows_returned": 3,
+      "truncated": false,
+      "bytes_staged": 52827520,
+      "result_bytes": 239,
+      "first_run_ms": 23.533125,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 22.252917,
+        "p50_ms": 23.004167,
+        "p95_ms": 53.775709,
+        "p99_ms": 53.775709,
+        "max_ms": 53.775709,
+        "mean_ms": 25.6084474
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 10.001667,
+        "p50_ms": 11.145958,
+        "p95_ms": 13.851042,
+        "p99_ms": 13.851042,
+        "max_ms": 13.851042,
+        "mean_ms": 11.336475133333332
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 10.740084,
+        "p50_ms": 11.16375,
+        "p95_ms": 11.685,
+        "p99_ms": 11.685,
+        "max_ms": 11.685,
+        "mean_ms": 11.162541800000001
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.005708,
+        "p50_ms": 0.008416,
+        "p95_ms": 0.012292,
+        "p99_ms": 0.012292,
+        "max_ms": 0.012292,
+        "mean_ms": 0.008216666666666667
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q2p-year-partitioned",
+      "description": "same as q2 on the hive-partitioned layout (partition pruning)",
+      "sql": "SELECT l_returnflag, count(*) AS n FROM lineitem_part WHERE l_year = 1995 GROUP BY l_returnflag ORDER BY l_returnflag",
+      "rows_returned": 3,
+      "truncated": false,
+      "bytes_staged": 48041606,
+      "result_bytes": 239,
+      "first_run_ms": 25.702,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 22.099375,
+        "p50_ms": 23.04525,
+        "p95_ms": 54.070333,
+        "p99_ms": 54.070333,
+        "max_ms": 54.070333,
+        "mean_ms": 25.244161266666666
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 7.416041,
+        "p50_ms": 7.9755,
+        "p95_ms": 10.437583,
+        "p99_ms": 10.437583,
+        "max_ms": 10.437583,
+        "mean_ms": 8.405252666666666
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 12.615709,
+        "p50_ms": 12.798458,
+        "p95_ms": 13.283917,
+        "p99_ms": 13.283917,
+        "max_ms": 13.283917,
+        "mean_ms": 12.856627800000002
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.005041,
+        "p50_ms": 0.007208,
+        "p95_ms": 0.013291,
+        "p99_ms": 0.013291,
+        "max_ms": 0.013291,
+        "mean_ms": 0.0071054666666666684
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q3-full-aggregate",
+      "description": "full-scan pricing summary grouped by flag and status",
+      "sql": "SELECT l_returnflag, l_linestatus, sum(l_quantity) AS qty, sum(l_extendedprice) AS price, avg(l_discount) AS disc, count(*) AS n FROM lineitem GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus",
+      "rows_returned": 6,
+      "truncated": false,
+      "bytes_staged": 52827520,
+      "result_bytes": 734,
+      "first_run_ms": 27.816417,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 27.206334,
+        "p50_ms": 31.377708,
+        "p95_ms": 38.639625,
+        "p99_ms": 38.639625,
+        "max_ms": 38.639625,
+        "mean_ms": 31.3466806
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 10.407333,
+        "p50_ms": 12.027666,
+        "p95_ms": 21.574,
+        "p99_ms": 21.574,
+        "max_ms": 21.574,
+        "mean_ms": 14.017333400000002
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 15.353125,
+        "p50_ms": 15.786583,
+        "p95_ms": 18.639042,
+        "p99_ms": 18.639042,
+        "max_ms": 18.639042,
+        "mean_ms": 16.0174418
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.007041,
+        "p50_ms": 0.011,
+        "p95_ms": 0.022917,
+        "p99_ms": 0.022917,
+        "max_ms": 0.022917,
+        "mean_ms": 0.010786
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q3p-full-partitioned",
+      "description": "same as q3 on the partitioned layout (no pruning possible)",
+      "sql": "SELECT l_returnflag, l_linestatus, sum(l_quantity) AS qty, sum(l_extendedprice) AS price, avg(l_discount) AS disc, count(*) AS n FROM lineitem_part GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus",
+      "rows_returned": 6,
+      "truncated": false,
+      "bytes_staged": 48041606,
+      "result_bytes": 734,
+      "first_run_ms": 27.818417,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 26.990791,
+        "p50_ms": 31.215791,
+        "p95_ms": 80.032667,
+        "p99_ms": 80.032667,
+        "max_ms": 80.032667,
+        "mean_ms": 38.84751086666667
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 7.576458,
+        "p50_ms": 11.920791,
+        "p95_ms": 60.323792,
+        "p99_ms": 60.323792,
+        "max_ms": 60.323792,
+        "mean_ms": 18.197058333333338
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 17.044125,
+        "p50_ms": 17.424334,
+        "p95_ms": 18.402958,
+        "p99_ms": 18.402958,
+        "max_ms": 18.402958,
+        "mean_ms": 17.495091666666667
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.008583,
+        "p50_ms": 0.01075,
+        "p95_ms": 0.014625,
+        "p99_ms": 0.014625,
+        "max_ms": 0.014625,
+        "mean_ms": 0.0111362
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q4-join",
+      "description": "orders join customer, aggregate by segment",
+      "sql": "SELECT c.c_mktsegment AS seg, count(*) AS n, sum(o.o_totalprice) AS total FROM orders o JOIN customer c ON o.o_custkey = c.c_custkey GROUP BY c.c_mktsegment ORDER BY c.c_mktsegment",
+      "rows_returned": 5,
+      "truncated": false,
+      "bytes_staged": 8115527,
+      "result_bytes": 399,
+      "first_run_ms": 16.677625,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 15.091042,
+        "p50_ms": 15.680791,
+        "p95_ms": 19.269959,
+        "p99_ms": 19.269959,
+        "max_ms": 19.269959,
+        "mean_ms": 15.970552733333333
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 1.606625,
+        "p50_ms": 1.971208,
+        "p95_ms": 5.238375,
+        "p99_ms": 5.238375,
+        "max_ms": 5.238375,
+        "mean_ms": 2.2490026666666667
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 12.668333,
+        "p50_ms": 13.008458,
+        "p95_ms": 13.465333,
+        "p99_ms": 13.465333,
+        "max_ms": 13.465333,
+        "mean_ms": 13.0001054
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.005333,
+        "p50_ms": 0.006667,
+        "p95_ms": 0.010583,
+        "p99_ms": 0.010583,
+        "max_ms": 0.010583,
+        "mean_ms": 0.007183266666666668
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q5-three-way-join",
+      "description": "lineitem join orders join customer, revenue by segment for one year",
+      "sql": "SELECT c.c_mktsegment AS seg, sum(l.l_extendedprice * (1 - l.l_discount)) AS revenue, count(*) AS n FROM lineitem l JOIN orders o ON l.l_orderkey = o.o_orderkey JOIN customer c ON o.o_custkey = c.c_custkey WHERE l.l_year = 1996 GROUP BY c.c_mktsegment ORDER BY c.c_mktsegment",
+      "rows_returned": 5,
+      "truncated": false,
+      "bytes_staged": 60943047,
+      "result_bytes": 403,
+      "first_run_ms": 59.345958,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 31.370125,
+        "p50_ms": 32.248542,
+        "p95_ms": 40.867292,
+        "p99_ms": 40.867292,
+        "max_ms": 40.867292,
+        "mean_ms": 33.204927866666665
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 11.9995,
+        "p50_ms": 12.659167,
+        "p95_ms": 16.717334,
+        "p99_ms": 16.717334,
+        "max_ms": 16.717334,
+        "mean_ms": 13.156319533333333
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 17.386833,
+        "p50_ms": 17.944083,
+        "p95_ms": 25.289125,
+        "p99_ms": 25.289125,
+        "max_ms": 25.289125,
+        "mean_ms": 18.43309726666667
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.0075,
+        "p50_ms": 0.009125,
+        "p95_ms": 0.012208,
+        "p99_ms": 0.012208,
+        "max_ms": 0.012208,
+        "mean_ms": 0.0094804
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q6-point-lookup",
+      "description": "single-order lookup (no index: a scan)",
+      "sql": "SELECT o_orderkey, o_custkey, o_totalprice FROM orders WHERE o_orderkey = 17",
+      "rows_returned": 1,
+      "truncated": false,
+      "bytes_staged": 7560133,
+      "result_bytes": 314,
+      "first_run_ms": 12.94575,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 10.977709,
+        "p50_ms": 11.7955,
+        "p95_ms": 35.612709,
+        "p99_ms": 35.612709,
+        "max_ms": 35.612709,
+        "mean_ms": 13.670899933333333
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 1.364292,
+        "p50_ms": 1.827667,
+        "p95_ms": 3.268416,
+        "p99_ms": 3.268416,
+        "max_ms": 3.268416,
+        "mean_ms": 2.0424446666666665
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 8.996042,
+        "p50_ms": 9.179708,
+        "p95_ms": 11.584875,
+        "p99_ms": 11.584875,
+        "max_ms": 11.584875,
+        "mean_ms": 9.416713866666667
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.004583,
+        "p50_ms": 0.005667,
+        "p95_ms": 0.011959,
+        "p99_ms": 0.011959,
+        "max_ms": 0.011959,
+        "mean_ms": 0.0063556
+      },
+      "result_verified": true
+    },
+    {
+      "id": "q7-large-result",
+      "description": "unfiltered projection, result truncated at the row limit",
+      "sql": "SELECT l_orderkey, l_extendedprice, l_shipdate FROM lineitem",
+      "rows_returned": 10000,
+      "truncated": true,
+      "bytes_staged": 52827520,
+      "result_bytes": 300353,
+      "first_run_ms": 26.23725,
+      "warm_total": {
+        "n": 15,
+        "min_ms": 26.399666,
+        "p50_ms": 27.152584,
+        "p95_ms": 32.44925,
+        "p99_ms": 32.44925,
+        "max_ms": 32.44925,
+        "mean_ms": 27.9776332
+      },
+      "warm_stage": {
+        "n": 15,
+        "min_ms": 10.409958,
+        "p50_ms": 10.897833,
+        "p95_ms": 14.052458,
+        "p99_ms": 14.052458,
+        "max_ms": 14.052458,
+        "mean_ms": 11.398174866666666
+      },
+      "warm_execute": {
+        "n": 15,
+        "min_ms": 14.237125,
+        "p50_ms": 14.624125,
+        "p95_ms": 16.7495,
+        "p99_ms": 16.7495,
+        "max_ms": 16.7495,
+        "mean_ms": 14.893833333333335
+      },
+      "warm_spool": {
+        "n": 15,
+        "min_ms": 0.330292,
+        "p50_ms": 0.363708,
+        "p95_ms": 0.481708,
+        "p99_ms": 0.481708,
+        "max_ms": 0.481708,
+        "mean_ms": 0.37369159999999996
+      },
+      "result_verified": true
+    }
+  ],
+  "concurrency": [
+    {
+      "workers": 1,
+      "queries": 24,
+      "wall_seconds": 0.612859375,
+      "queries_per_second": 39.16069653009714,
+      "latency_submit_to_done": {
+        "n": 24,
+        "min_ms": 26.249,
+        "p50_ms": 301.11,
+        "p95_ms": 600.976,
+        "p99_ms": 612.417,
+        "max_ms": 612.417,
+        "mean_ms": 314.13399999999996
+      },
+      "failed": 0
+    },
+    {
+      "workers": 2,
+      "queries": 24,
+      "wall_seconds": 0.340396584,
+      "queries_per_second": 70.50599544206942,
+      "latency_submit_to_done": {
+        "n": 24,
+        "min_ms": 32.511,
+        "p50_ms": 187.666,
+        "p95_ms": 321.761,
+        "p99_ms": 338.856,
+        "max_ms": 338.856,
+        "mean_ms": 184.90283333333332
+      },
+      "failed": 0
+    },
+    {
+      "workers": 4,
+      "queries": 24,
+      "wall_seconds": 0.358624583,
+      "queries_per_second": 66.92235038444088,
+      "latency_submit_to_done": {
+        "n": 24,
+        "min_ms": 67.293,
+        "p50_ms": 158.82,
+        "p95_ms": 355.635,
+        "p99_ms": 358.278,
+        "max_ms": 358.278,
+        "mean_ms": 184.6497916666667
+      },
+      "failed": 0
+    }
+  ],
+  "ingestion": [
+    {
+      "rows": 300000,
+      "input_bytes": 17424667,
+      "output_parquet_bytes": 26403042,
+      "output_files": 3,
+      "seconds": 0.342727333,
+      "rows_per_second": 875331.4110491443,
+      "input_mib_per_second": 48.485941416967584
+    },
+    {
+      "rows": 300000,
+      "input_bytes": 17424667,
+      "output_parquet_bytes": 26403959,
+      "output_files": 4,
+      "seconds": 0.393561958,
+      "rows_per_second": 762268.7963149121,
+      "input_mib_per_second": 42.22323080787077,
+      "partition_column": "l_returnflag"
+    }
+  ],
+  "partitioning": [
+    {
+      "pair": "filter on partition column (l_year = 1995)",
+      "flat_p50_ms": 23.004167,
+      "partitioned_p50_ms": 23.04525,
+      "flat_execute_p50_ms": 11.16375,
+      "partitioned_execute_p50_ms": 12.798458,
+      "flat_bytes_staged": 52827520,
+      "partitioned_bytes_staged": 48041606,
+      "verdict": "no measurable end-to-end difference (under 10% or 5 ms); INCONCLUSIVE: high variance (p95 \u003e 2x p50)",
+      "execute_only_verdict": "no measurable execute-time difference"
+    },
+    {
+      "pair": "full scan, no pruning possible (control)",
+      "flat_p50_ms": 31.377708,
+      "partitioned_p50_ms": 31.215791,
+      "flat_execute_p50_ms": 15.786583,
+      "partitioned_execute_p50_ms": 17.424334,
+      "flat_bytes_staged": 52827520,
+      "partitioned_bytes_staged": 48041606,
+      "verdict": "no measurable end-to-end difference (under 10% or 5 ms); INCONCLUSIVE: high variance (p95 \u003e 2x p50)",
+      "execute_only_verdict": "no measurable execute-time difference"
+    }
+  ],
+  "limitations": [
+    "Workload is TPC-H-LIKE (seeded, same table shapes and cardinality ratios), not TPC-H: it was not produced by dbgen and must not be reported as TPC-H.",
+    "Single machine, single process; the API, worker and benchmark share one CPU and one memory pool.",
+    "The object store is in memory unless -s3 is used, so staging cost excludes network latency and S3 throughput.",
+    "Every query stages (downloads) all files of every dataset it references before DuckDB runs; there is no cache, so 'warm' means a warm OS page cache and warmed code paths, not a result or data cache.",
+    "The OS page cache was not dropped, so 'first' is first-after-generation, not a guaranteed cold read.",
+    "'Bytes scanned' is not available from the engine; 'bytes staged' is the bytes downloaded for the query and is an upper bound on what DuckDB read.",
+    "Percentiles come from few samples; p95/p99 are at or near the maximum. Median differences under 10% or 5 ms are not reported as differences.",
+    "Dates are ISO strings and money is double because of the in-repo Parquet writer's type support."
+  ]
+}

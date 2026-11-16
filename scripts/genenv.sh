@@ -18,6 +18,7 @@ LOG_LEVEL="info"
 # Secrets start empty; they are generated below.
 POSTGRES_PASSWORD=""
 MINIO_ROOT_PASSWORD=""
+GRAFANA_ADMIN_PASSWORD=""
 
 if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
@@ -37,6 +38,10 @@ if [ -z "${MINIO_ROOT_PASSWORD:-}" ]; then
     MINIO_ROOT_PASSWORD="$(openssl rand -hex 32)"
 fi
 
+if [ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]; then
+    GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+fi
+
 umask 077
 {
     printf 'POSTGRES_USER=%s\n' "$POSTGRES_USER"
@@ -45,6 +50,7 @@ umask 077
     printf 'MINIO_ROOT_USER=%s\n' "$MINIO_ROOT_USER"
     printf 'MINIO_ROOT_PASSWORD=%s\n' "$MINIO_ROOT_PASSWORD"
     printf 'MINIO_BUCKET=%s\n' "$MINIO_BUCKET"
+    printf 'GRAFANA_ADMIN_PASSWORD=%s\n' "$GRAFANA_ADMIN_PASSWORD"
     printf 'LOG_LEVEL=%s\n' "$LOG_LEVEL"
 } > "$ENV_FILE"
 

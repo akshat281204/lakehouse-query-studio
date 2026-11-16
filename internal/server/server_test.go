@@ -18,6 +18,9 @@ func testConfig() *config.Config {
 	return &config.Config{
 		HTTPAddr:        ":0",
 		ShutdownTimeout: time.Second,
+		// httptest requests carry Host example.com.
+		AllowedHosts:   []string{"example.com"},
+		AllowedOrigins: []string{"http://example.com"},
 	}
 }
 
